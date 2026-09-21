@@ -22,6 +22,22 @@ test/smoke.mjs      boots the real server against a fake upstream, twice
 That is what makes the adversarial suite meaningful: it drives the same
 functions the live loop drives, not a reimplementation of them.
 
+## Tool annotations (why the client stops prompting "Allow" on every call)
+
+Every tool in `tools/list` — the 7 custom ones and the 4 allowlisted
+upstream market-data reads — now carries an explicit `annotations` object
+(`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`). Per
+the MCP spec, a client with no hint on a tool has to assume the worst case
+(destructive, open-world) and prompts a human for every call. With honest
+hints declared, a client that respects them can auto-approve the four pure
+reads (`list_watches`, `get_news_calendar`, `get_version`, `get_symbols`,
+`get_spot_prices`, `get_trendbars`) and keep prompting only for the tools
+that actually change state (`register_watch`, `register_trap_watch`,
+`cancel_watch`, `set_news_lockout`, `clear_news_lockout`). These are hints,
+not a security boundary — `MARKET_DATA_TOOL_ALLOWLIST` is still what
+actually keeps account/execution tools unreachable, enforced in code on
+every `tools/list` and `tools/call`.
+
 ## Migrating from v5 (single `index.js`)
 
 This is a **directory**, not a single file. On Railway or any Node host:
