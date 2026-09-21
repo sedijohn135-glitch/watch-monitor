@@ -985,11 +985,28 @@ function startScheduler() {
 // ---------------------------------------------------------------------------
 // §9 Tool surface
 
+// Every tool below declares MCP annotations explicitly. This is not
+// decorative: a client with no readOnlyHint on a tool has to assume the
+// worst case (destructive, open-world) and will prompt the human for
+// every single call, including pure reads. Declaring the hint honestly
+// is what lets a client auto-approve list_watches / get_news_calendar
+// while still gating the two tools that actually arm a watch or toggle
+// the news lockout. These are hints, not a security boundary — the real
+// boundary is MARKET_DATA_TOOL_ALLOWLIST below, which is enforced in
+// code on every tools/list and tools/call regardless of what a client
+// does with these annotations.
 const CUSTOM_TOOLS = [
   {
     name: "register_watch",
     description:
       "Registers a trading setup for live monitoring. The monitor tracks live price, safety levels, market evidence, and independent entry gates before sending a Telegram confirmation. Never places an order.",
+    annotations: {
+      title: "Register setup watch",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -1018,6 +1035,13 @@ const CUSTOM_TOOLS = [
     name: "register_trap_watch",
     description:
       "Registers a TRAP_NOT_CONFIRMED read for live monitoring. There is no entry, stop or target: the monitor watches closed candles on the chosen timeframe and sends one Telegram message when the missing setup conditions actually print (body close beyond trigger_level, by default carried by a displacement candle), and one if invalidation_level breaks first instead. It never produces an entry — the human re-runs the analysis pipeline on that notification.",
+    annotations: {
+      title: "Register trap watch",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -1048,12 +1072,26 @@ const CUSTOM_TOOLS = [
     name: "list_watches",
     description:
       "Returns active setup watches, active trap watches, quarantined watches, bounded recent outcomes with their real status and evidence, and the monitor's own health (restart recovery, undelivered notifications, feed quality).",
+    annotations: {
+      title: "List watches",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     inputSchema: { type: "object", additionalProperties: false, properties: {} },
   },
   {
     name: "cancel_watch",
     description:
       "Cancels an active setup watch or trap watch by id. Idempotent: cancelling an already-resolved watch reports ALREADY_RESOLVED rather than failing.",
+    annotations: {
+      title: "Cancel watch",
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -1065,12 +1103,26 @@ const CUSTOM_TOOLS = [
     name: "get_news_calendar",
     description:
       "Returns the cached scheduled high-impact economic events and current manual news lockout state.",
+    annotations: {
+      title: "Get news calendar",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     inputSchema: { type: "object", additionalProperties: false, properties: {} },
   },
   {
     name: "set_news_lockout",
     description:
       "Blocks new confirmations while a human or upstream workflow reports unscheduled breaking news.",
+    annotations: {
+      title: "Set news lockout",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -1081,6 +1133,13 @@ const CUSTOM_TOOLS = [
   {
     name: "clear_news_lockout",
     description: "Removes the manual breaking-news lockout.",
+    annotations: {
+      title: "Clear news lockout",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
     inputSchema: { type: "object", additionalProperties: false, properties: {} },
   },
 ];
@@ -1099,10 +1158,27 @@ const MARKET_DATA_TOOL_ALLOWLIST = new Set([
   "get_trendbars",
 ]);
 
+// The four allowlisted upstream tools are all pure reads (version, symbol
+// metadata, spot prices, historical bars) — none of them touch the account
+// or place/modify/close anything, that's the whole point of the allowlist.
+// Don't trust the upstream connector to say so itself: stamp the same
+// honest annotations on them here so a client that gates on hints treats
+// them the same way it treats list_watches, instead of prompting for a
+// market-data read just because cTrader's own tools/list left the field out.
+const MARKET_DATA_READ_ANNOTATIONS = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: true, // real upstream market data, not local state
+};
+
 function filterToMarketData(tools) {
-  return (Array.isArray(tools) ? tools : []).filter((tool) =>
-    MARKET_DATA_TOOL_ALLOWLIST.has(tool?.name),
-  );
+  return (Array.isArray(tools) ? tools : [])
+    .filter((tool) => MARKET_DATA_TOOL_ALLOWLIST.has(tool?.name))
+    .map((tool) => ({
+      ...tool,
+      annotations: { ...MARKET_DATA_READ_ANNOTATIONS, ...(tool.annotations || {}) },
+    }));
 }
 
 function createSetupWatch(args) {
