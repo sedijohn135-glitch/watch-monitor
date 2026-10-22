@@ -1431,7 +1431,7 @@ function rejectUnauthorized(req, res) {
   // Where an OAuth client starts (MCP authorization spec).
   res.set(
     "WWW-Authenticate",
-    `Bearer resource_metadata="${req.protocol}://${req.get("host")}/.well-known/oauth-protected-resource"`,
+    `Bearer resource_metadata="${req.protocol}://${req.get("host")}/.well-known/oauth-protected-resource${req.path === "/" ? "" : req.path}"`,
   );
   res.status(401).json({
     error: "Unauthorized",

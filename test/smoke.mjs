@@ -265,13 +265,16 @@ console.log("\n— OAuth, the way the Gemini app connects —");
 const { createHash } = await import("node:crypto");
 const BASE = "http://127.0.0.1:9803";
 const challengeOf = (verifier) => createHash("sha256").update(verifier).digest("base64url");
-assert(
-  /resource_metadata=".*\/\.well-known\/oauth-protected-resource"/.test(unauthorized.headers.get("www-authenticate") || ""),
-  "a 401 points the client at the OAuth metadata",
-);
-const resource = await (await fetch(`${BASE}/.well-known/oauth-protected-resource`)).json();
+const metadataUrl = /resource_metadata="([^"]+)"/.exec(unauthorized.headers.get("www-authenticate") || "")?.[1];
+assert(metadataUrl === `${BASE}/.well-known/oauth-protected-resource/mcp`, `401 names the /mcp-specific metadata (${metadataUrl})`);
+const resource = await (await fetch(metadataUrl)).json();
 const serverMeta = await (await fetch(`${BASE}/.well-known/oauth-authorization-server`)).json();
+assert(resource.resource === `${BASE}/mcp`, "the metadata names exactly the URL the client connected to");
 assert(resource.authorization_servers?.[0] === BASE && serverMeta.code_challenge_methods_supported.includes("S256"), "discovery metadata");
+assert(
+  (await fetch(`${BASE}/.well-known/oauth-authorization-server/mcp`)).ok && (await fetch(`${BASE}/.well-known/openid-configuration/mcp`)).ok,
+  "path-inserted discovery variants answer too",
+);
 const registration = await (
   await fetch(serverMeta.registration_endpoint, {
     method: "POST",
