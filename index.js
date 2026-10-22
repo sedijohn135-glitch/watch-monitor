@@ -212,6 +212,56 @@ app.use(
 );
 app.use(express.urlencoded({ extended: true }));
 
+// What clients actually asked for, newest first, so a connector that
+// fails ("trouble connecting") can be debugged from the outside and the
+// owner can see whether the assistant really called the snapshot and
+// register_watch. Shapes only: no headers' values, no query strings, no
+// codes or tokens; long digit runs (account ids in redirect URIs) masked.
+// /tick and /health are left out as noise. Logged before the handler
+// runs, because on Vercel nothing is guaranteed to run after the response.
+const REQUEST_LOG_KEY = "watch-monitor:requests";
+const requestLog = [];
+const mask = (value) => String(value ?? "").replace(/\d{6,}/g, "…").slice(0, 160);
+app.use(async (req, _res, next) => {
+  if (["/tick", "/health", "/debug/requests", "/favicon.ico"].includes(req.path)) return next();
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  const entry = {
+    at: new Date().toISOString(),
+    method: req.method,
+    path: req.path,
+    auth: req.get("authorization") ? "bearer" : req.query?.token ? "query" : "none",
+    ua: mask(req.get("user-agent")).slice(0, 60),
+    ...(body.method ? { rpc: body.method } : {}),
+    ...(body.params?.name ? { tool: body.params.name } : {}),
+    ...(body.params?.protocolVersion ? { protocol: body.params.protocolVersion } : {}),
+    ...(req.path === "/register"
+      ? {
+          redirect_uris: (body.redirect_uris || []).map(mask),
+          auth_method: body.token_endpoint_auth_method ?? null,
+          grant_types: body.grant_types ?? null,
+        }
+      : {}),
+    ...(req.path === "/token" ? { grant_type: body.grant_type ?? null, has_verifier: Boolean(body.code_verifier) } : {}),
+    ...(req.path === "/authorize" && req.method === "GET"
+      ? { redirect_uri: mask(req.query.redirect_uri), pkce: req.query.code_challenge_method ?? null }
+      : {}),
+  };
+  try {
+    if (kv) await kv.push(REQUEST_LOG_KEY, entry, 50);
+    else requestLog.unshift(entry), requestLog.splice(50);
+  } catch {
+    // never let the debug log cost a real request
+  }
+  next();
+});
+app.get("/debug/requests", async (_req, res) => {
+  try {
+    res.json(kv ? await kv.list(REQUEST_LOG_KEY) : requestLog);
+  } catch (error) {
+    res.status(503).json({ error: error.message });
+  }
+});
+
 // Clients that can only do OAuth (the Gemini app) sign in with the monitor
 // password once and get a token; a static bearer still works for the rest.
 const verifyOAuthAccess = CONFIG.authToken

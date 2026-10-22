@@ -283,6 +283,14 @@ const registration = await (
   })
 ).json();
 assert(Boolean(registration.client_id), "dynamic client registration");
+const secretClient = await (
+  await fetch(serverMeta.registration_endpoint, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ redirect_uris: ["https://oauth-redirect.googleusercontent.com/r/x"], token_endpoint_auth_method: "client_secret_basic" }),
+  })
+).json();
+assert(Boolean(secretClient.client_secret), "a client that asks for a secret gets one");
 const verifier = "smoke-verifier-0123456789-abcdefghijklmnopqrstuvwxyz";
 const authParams = {
   response_type: "code",
@@ -329,6 +337,13 @@ const refreshed = await (
 assert(Boolean(refreshed.access_token), "refresh issues a new access token");
 
 const blocked = await rpc("tools/call", { name: "create_order", arguments: { volume: 1 } });
+const requestLog = await (await fetch(`${BASE}/debug/requests`)).json();
+assert(
+  requestLog.some((entry) => entry.rpc === "tools/call" && entry.tool === "create_order") &&
+    requestLog.some((entry) => entry.path === "/register") &&
+    !/"secret"|Bearer/.test(JSON.stringify(requestLog)),
+  "the request log shows what clients asked, without the password",
+);
 assert(
   blocked.error && /not available to this client/.test(blocked.error.message),
   "an execution tool is refused on tools/call even though it was never listed",
