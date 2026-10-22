@@ -175,6 +175,7 @@ const client = new CTraderMcpClient({
   token: CONFIG.upstreamToken,
   timeoutMs: CONFIG.mcpTimeoutMs,
   protocolVersion: CONFIG.protocolVersion,
+  environment: String(process.env.CTRADER_ENVIRONMENT || "").trim().toLowerCase(),
   log,
 });
 const market = new MarketData({ client, config: CONFIG, log });
@@ -222,11 +223,19 @@ app.use(express.urlencoded({ extended: true }));
 const REQUEST_LOG_KEY = "watch-monitor:requests";
 const requestLog = [];
 const mask = (value) => String(value ?? "").replace(/\d{6,}/g, "…").slice(0, 160);
+async function logRequest(entry) {
+  const stamped = { at: new Date().toISOString(), ...entry };
+  try {
+    if (kv) await kv.push(REQUEST_LOG_KEY, stamped, 50);
+    else requestLog.unshift(stamped), requestLog.splice(50);
+  } catch {
+    // never let the debug log cost a real request
+  }
+}
 app.use(async (req, _res, next) => {
   if (["/tick", "/health", "/debug/requests", "/favicon.ico"].includes(req.path)) return next();
   const body = req.body && typeof req.body === "object" ? req.body : {};
-  const entry = {
-    at: new Date().toISOString(),
+  await logRequest({
     method: req.method,
     path: req.path,
     auth: req.get("authorization") ? "bearer" : req.query?.token ? "query" : "none",
@@ -245,13 +254,7 @@ app.use(async (req, _res, next) => {
     ...(req.path === "/authorize" && req.method === "GET"
       ? { redirect_uri: mask(req.query.redirect_uri), pkce: req.query.code_challenge_method ?? null }
       : {}),
-  };
-  try {
-    if (kv) await kv.push(REQUEST_LOG_KEY, entry, 50);
-    else requestLog.unshift(entry), requestLog.splice(50);
-  } catch {
-    // never let the debug log cost a real request
-  }
+  });
   next();
 });
 app.get("/debug/requests", async (_req, res) => {
@@ -1195,7 +1198,7 @@ const CUSTOM_TOOLS = [
         conviction: { type: "string" },
         session: { type: "string" },
         season: { type: "string" },
-        liquidity: { oneOf: [{ type: "string" }, { type: "object" }, { type: "array" }] },
+        liquidity: { type: "string", description: "e.g. IDM 4405.9 → target PDH 4431.2" },
         sweep_level: {
           type: "number",
           description:
@@ -1521,8 +1524,17 @@ async function getUpstreamTools(force = false) {
   }
 }
 
+// The monitor's own tools never wait on cTrader: a slow cold start or a
+// bad CTRADER_MCP_TOKEN must not stop a client from connecting (the
+// Gemini app gives up on a slow or failed tools/list). The raw cTrader
+// reads are only the snapshot's fallback; they join the list when the
+// upstream answers in time, and get_market_snapshot reports its own
+// upstream errors.
 async function mergedToolList() {
-  const upstream = await getUpstreamTools();
+  const upstream = await Promise.race([
+    getUpstreamTools(),
+    new Promise((resolve) => setTimeout(() => resolve(upstreamToolsCache.tools || []), 4000)),
+  ]);
   const native = filterToMarketData(
     upstream.filter((tool) => !CUSTOM_TOOL_NAMES.has(tool?.name)),
   );
@@ -1591,17 +1603,10 @@ async function handleMcpRequest(req, res) {
 
   if (method === "tools/list") {
     const tools = await mergedToolList();
-    if (tools.length === CUSTOM_TOOLS.length && upstreamToolsCache.lastError) {
-      // Fail loudly. A list containing only the monitor tools means the
-      // native market-data side is unreachable, and returning it silently
-      // is what hid this class of bug in the 4.x build.
-      jsonRpcError(
-        res,
-        id,
-        -32603,
-        `Native cTrader tools unavailable: ${upstreamToolsCache.lastError}`,
-      );
-      return;
+    // Not silent: an unreachable cTrader shows in the request log and in
+    // /health, and the snapshot fails with the reason when it is called.
+    if (upstreamToolsCache.lastError) {
+      await logRequest({ rpc: "tools/list", upstream_error: upstreamToolsCache.lastError, tools: tools.length });
     }
     res.json({ jsonrpc: "2.0", id, result: { tools } });
     return;
@@ -1616,6 +1621,7 @@ async function handleMcpRequest(req, res) {
         const run = () => handleCustomTool(name, args);
         res.json({ jsonrpc: "2.0", id, result: await (name === "get_market_snapshot" ? run() : withState(run)) });
       } catch (error) {
+        await logRequest({ rpc: "tools/call", tool: name, error: error.message.slice(0, 200) });
         jsonRpcError(res, id, -32602, error.message);
       }
       return;

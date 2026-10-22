@@ -90,6 +90,16 @@ const upstream = createServer((req, res) => {
     }
     if (rpc.method === "tools/call") {
       const { name, arguments: args } = rpc.params;
+      // The real proxy (rest-proxy 2.0.4) rejects account-scoped calls
+      // without X-Environment, inside a successful MCP result. This fake
+      // token belongs to a demo account, so "live" is refused too.
+      const environment = req.headers["x-environment"];
+      if (name !== "get_version" && environment !== "demo") {
+        const text = environment
+          ? "HTTP 403: this token belongs to a demo account"
+          : 'HTTP 400: {"error":{"code":"INVALID_REQUEST","message":"X-Environment: must be one of [demo, live]"}}';
+        return reply({ content: [{ type: "text", text }], isError: true });
+      }
       if (name === "get_symbols") {
         return reply({
           content: [
@@ -415,6 +425,10 @@ assert(live.entryTouched === true, `entry touch detected (${live.lastReason})`);
 assert(
   listed.monitor_health.market_data.period_dialect === "underscored",
   "the connector's underscored period dialect is used",
+);
+assert(
+  listed.monitor_health.market_data.environment === "demo",
+  `live was refused, so the monitor settled on X-Environment=demo (${listed.monitor_health.market_data.environment})`,
 );
 assert(
   seenPeriods.has("M_5") && seenPeriods.has("M_1"),
