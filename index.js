@@ -1435,7 +1435,10 @@ function rejectUnauthorized(req, res) {
   );
   res.status(401).json({
     error: "Unauthorized",
-    message: "A valid monitor authorization token is required.",
+    // Which of the two it was is what someone fixing a URL by hand needs.
+    message: parseAuthToken(req)
+      ? "The token does not match WATCH_MONITOR_AUTH_TOKEN."
+      : "No token was sent: add ?token=<WATCH_MONITOR_AUTH_TOKEN> or an Authorization: Bearer header.",
   });
   return true;
 }
