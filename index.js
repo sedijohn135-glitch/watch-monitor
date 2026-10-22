@@ -1404,10 +1404,13 @@ async function handleCustomTool(name, args = {}) {
 // ---------------------------------------------------------------------------
 // §10 HTTP / MCP surface
 
+// `?token=` is for what cannot set a header: a phone browser opening
+// /test-telegram, a cron service calling /tick, an MCP client with no auth
+// option. It lands in access logs, the price of that convenience.
 function parseAuthToken(req) {
   const authorization = String(req.get("authorization") || "");
   if (authorization.startsWith("Bearer ")) return authorization.slice(7).trim();
-  return String(req.get("x-api-key") || "");
+  return String(req.get("x-api-key") || req.query?.token || "");
 }
 
 function tokenMatches(provided, expectedToken) {
@@ -1676,16 +1679,10 @@ app.post("/register_watch", async (req, res) => {
 });
 
 // One scheduler pass. On Vercel this IS the scheduler: point a once-a-minute
-// cron at it (cron-job.org on the Hobby plan, vercel.json crons on Pro,
-// which sends CRON_SECRET as a bearer). `?token=` exists for cron services
-// that cannot set headers.
+// cron at it (cron-job.org on the Hobby plan with ?token=, or vercel.json
+// crons on Pro, which send CRON_SECRET as a bearer).
 app.all("/tick", async (req, res) => {
-  const bearer = parseAuthToken(req);
-  const allowed =
-    authorized(req) ||
-    tokenMatches(bearer, CONFIG.cronSecret) ||
-    tokenMatches(String(req.query.token || ""), CONFIG.authToken);
-  if (!allowed) {
+  if (!authorized(req) && !tokenMatches(parseAuthToken(req), CONFIG.cronSecret)) {
     res.status(401).json({ error: "Unauthorized" });
     return;
   }
