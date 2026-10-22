@@ -8,10 +8,13 @@ cTrader connector is unreachable from this endpoint by construction.
 **No liquidity taken, no trade.** Every watch carries a `sweep_level` — the
 IDM / sell-side low for a buy, the IDM / buy-side high for a sell — and
 `REAL CONFIRMATION — ENTER NOW` is never sent until price has actually run
-those stops. `get_market_snapshot` computes the liquidity map (PDH/PDL,
-session highs/lows, swings, EQH/EQL, what was swept or broken) and the IDM
-with its POIs (supply/demand zone, unfilled FVGs, QM), so the analysis
-reads them from the candles instead of guessing.
+those stops. `get_market_snapshot` computes the liquidity map from the
+candles — PWH/PWL, PDH/PDL, Asia/London/NY AM highs and lows, H1/M15
+swings, EQH/EQL, each ranked 1–5 by how many stops it likely holds; what
+was swept (closed back inside, with Shadow Delta to flag a stop hunt) or
+broken; premium/discount of the current H1 dealing range; unfilled H1
+FVGs — and the IDM with its POIs (supply/demand zone, unfilled FVGs, QM),
+so the analysis reads liquidity as facts instead of guessing.
 
 ## Layout
 

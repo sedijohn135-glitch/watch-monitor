@@ -295,6 +295,7 @@ function confirmWatch(watch, quote, result, gates, mss, rr) {
       `✅ M1 structure shift: body close ${buy ? "above" : "below"} ${fmt(mss.level)}\n` +
       `✅ ${htmlEscape(result.signals.join(" + "))}\n` +
       `✅ ${htmlEscape(gates.zone || "session filter off")} · news clear · spread ${fmt(quote.spread)}\n` +
+      (watch.liquidity && watch.liquidity !== "N/A" ? `<b>Liquidity:</b> ${htmlEscape(watch.liquidity)}\n` : "") +
       `<b>Setup:</b> ${htmlEscape(watch.setup_model)} · conviction ${htmlEscape(watch.conviction)} · ${htmlEscape(result.strength)}\n` +
       `<i>Sent ${nyTime()} New York. Use exactly this SL and TP in MT5.</i>`,
   );
@@ -962,7 +963,7 @@ async function marketSnapshot(args) {
     candles: Object.fromEntries(requested.map((tf) => [tf, packCandles(raw[tf], tf, nowMs)])),
     smt_partners: smtPartners,
     rule:
-      "No liquidity taken, no trade. Reversal: trade away from the pool in liquidity.last_sweep toward the nearest untaken pool on the other side. If nothing was taken, the nearest untaken pool is the draw: trade toward it from a POI between liquidity.inducement.<tf>.<dir>.level and its leg_origin, which price can only reach by taking that IDM. register_watch needs sweep_level = the liquidity that must be taken before entry (the IDM level, or the swept pool with liquidity_taken: true).",
+      "No liquidity taken, no trade. Reversal (Model A): trade away from the pool in liquidity.last_sweep (best when stop_hunt is true) toward the strongest untaken pool on the other side. If nothing was taken (Model B), the untaken pool is the draw — prefer higher strength, EQH/EQL, reachable distance_atr_h1: trade toward it from a POI between liquidity.inducement.<tf>.<dir>.level and its leg_origin, which price can only reach by taking that IDM. Buys from discount, sells from premium (liquidity.dealing_range). h1_imbalances are internal-range draws. register_watch needs sweep_level = the liquidity that must be taken before entry (the IDM level, or the swept pool with liquidity_taken: true).",
   };
 }
 

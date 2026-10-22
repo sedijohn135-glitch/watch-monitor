@@ -35,6 +35,8 @@ import {
   marketRR,
   poolTaken,
   swingPoints,
+  unfilledGaps,
+  weekStart,
   newsBlackout,
   normalizeCandles,
   normalizeSpot,
@@ -717,4 +719,50 @@ test("ENTRY — R:R is measured at the market price the human will actually get"
   assert.equal(chaseLimit(sell, 1), 98);
   assert.equal(marketRR(sell, 98), 1);
   assert.equal(marketRR(watch, 97), -Infinity, "beyond the stop there is no trade");
+});
+
+test("LIQUIDITY MAP — last week's extremes, ranked above intraday pools; stop hunts flagged", () => {
+  const D1 = 86_400_000;
+  const H1 = 3_600_000;
+  const now = Date.UTC(2026, 9, 21, 14, 0); // Wednesday
+  const week = weekStart(now);
+  assert.equal(new Date(week).getUTCDay(), 0, "the trading week starts on Sunday");
+  // Last week ranged 90–110; this week 95–105 so far.
+  const d1 = [
+    bar(week - 5 * D1, 100, 110, 99, 105),
+    bar(week - 4 * D1, 105, 106, 90, 96),
+    bar(week + 1 * D1, 100, 105, 95, 101),
+    bar(week + 2 * D1 - D1, 101, 104, 96, 100),
+  ].sort((a, b) => a.timestampMs - b.timestampMs);
+  // Today on H1: a wick to 94.5 under the 95 PDL that closes back at 96.5,
+  // a long lower wick on a small body.
+  const h1 = Array.from({ length: 6 }, (_, i) => bar(week + 3 * D1 + i * H1, 100, 101, 99, 100));
+  h1[3] = bar(h1[3].timestampMs, 96, 96.8, 94.5, 96.5);
+  const map = liquidityMap({ d1, h1, price: 100, nowMs: now, equalTolerance: 0.1 });
+
+  const pwh = map.buy_side_untaken.find((pool) => pool.sources.includes("PWH"));
+  assert.equal(pwh.level, 110);
+  assert.equal(pwh.strength, 5, "previous week's high holds the most stops");
+  const pdl = map.taken_last_24h.find((pool) => pool.source === "PDL");
+  assert.equal(pdl.how, "sweep");
+  assert.equal(pdl.stop_hunt, true, "wick ≥ 3× body and a close back inside: a stop hunt");
+  assert.ok(map.sell_side_untaken.some((pool) => pool.sources.includes("PWL") && pool.level === 90));
+});
+
+test("LIQUIDITY MAP — premium/discount and the imbalances price is drawn to", () => {
+  const H1 = 3_600_000;
+  const start = Date.UTC(2026, 9, 21, 0, 0);
+  // Swing high 110 (#2), swing low 100 (#5); two bullish gaps left on the
+  // way back up (102→102.6 at #6, 103→105 at #7), neither filled since.
+  const shape = [[106, 107, 105, 106], [106, 108, 105.5, 107], [107, 110, 106, 108], [108, 108.5, 104, 104.5],
+    [104.5, 105, 101, 101.5], [101.5, 102, 100, 101], [101, 103, 100.5, 102.8], [102.8, 106, 102.6, 105.8],
+    [105.8, 107, 105, 106.5], [106.5, 107.2, 105.6, 107]];
+  const h1 = shape.map(([o, h, l, c], i) => bar(start + i * H1, o, h, l, c));
+  const map = liquidityMap({ h1, price: 107, nowMs: start + 11 * H1, equalTolerance: 0.1 });
+  assert.deepEqual(
+    { zone: map.dealing_range.zone, pct: map.dealing_range.position_pct, eq: map.dealing_range.equilibrium },
+    { zone: "premium", pct: 70, eq: 105 },
+  );
+  assert.deepEqual(unfilledGaps(h1).filter((gap) => gap.type === "bullish").map(({ from, to }) => [from, to]), [[102, 102.6], [103, 105]]);
+  assert.equal(map.h1_imbalances.below[0].from, 103, "the nearest unfilled gap below price is the internal-range draw");
 });
