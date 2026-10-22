@@ -5,6 +5,8 @@ deterministic conclusion and notifies a human over Telegram. It never
 places, modifies or closes an order, and the account side of the upstream
 cTrader connector is unreachable from this endpoint by construction.
 
+**ENTER NOW is timed for the push.** On top of liquidity taken, entry touched, an M1 structure shift and held evidence, it waits until the expansion leg is pushing — a displacement candle printed and price beyond the last M1 candle's extreme, no pullback in progress — and R:R to TP1 at the market price is still ≥ 1.
+
 **No liquidity taken, no trade.** Every watch carries a `sweep_level` — the
 IDM / sell-side low for a buy, the IDM / buy-side high for a sell — and
 `REAL CONFIRMATION — ENTER NOW` is never sent until price has actually run
@@ -93,6 +95,11 @@ exactly as a restart did before.
 | `CTRADER_PRICE_SCALE` | `100000` | validated at runtime, never trusted blindly |
 | `SCALE_TOLERANCE` | `0.35` | how far a feed price may sit from a registered level before quarantine |
 | `MIN_CONFIRMATION_HOLD_MS` | `60000` | wall-clock hold before evidence graduates |
+| `MIN_RR_AT_ENTRY` | `1` | R:R to TP1 at the market price below which ENTER NOW waits (do not chase) |
+| `REQUIRE_EXPANSION` | `true` | ENTER NOW only while the expansion leg is pushing, never into a pullback |
+| `EXPANSION_DISPLACEMENT_MULTIPLE` | `1.5` | displacement candle body vs the median of the 10 before the reaction low |
+| `EXPANSION_MAX_RETRACE` | `0.35` | share of the leg price may give back and still count as pushing |
+| `WATCH_DEFAULT_EXPIRY_MIN` | `720` | expiry for a watch registered without one; 0 disables |
 | `REQUIRE_NEW_M1_CANDLE` | `true` | evidence must also survive a bar boundary |
 | `EVIDENCE_FADE_ATR_FRACTION` | `0.25` | pullback (× M5 ATR) that erases a seen signal; v6.0 used the raw quote tolerance, which wiped gold evidence within seconds |
 | `ACCEPTANCE_ATR_FRACTION` | `0.5` | acceptance buffer, capped by `ACCEPTANCE_RISK_FRACTION` |

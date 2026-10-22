@@ -42,6 +42,7 @@ import {
   closedSeries,
   evaluateConfirmation,
   evaluateSafety,
+  expansionState,
   finiteNumber,
   formatLevel,
   inducement,
@@ -113,6 +114,11 @@ const CONFIG = {
   // ENTER NOW means "enter at market when you read this": below this R:R
   // to TP1 at the live price, the move already happened.
   minRrAtEntry: num(process.env.MIN_RR_AT_ENTRY, 1, 0),
+  // ENTER NOW waits for the expansion leg to be pushing (calibration
+  // knobs: how strong the displacement candle, how deep a pullback).
+  requireExpansion: process.env.REQUIRE_EXPANSION !== "false",
+  expansionDisplacement: num(process.env.EXPANSION_DISPLACEMENT_MULTIPLE, 1.5, 1),
+  expansionMaxRetrace: num(process.env.EXPANSION_MAX_RETRACE, 0.35, 0.05),
   // A setup registered without its own expiry stops being a setup after
   // this long; 0 disables.
   defaultExpiryMinutes: num(process.env.WATCH_DEFAULT_EXPIRY_MIN, 720, 0),
@@ -264,7 +270,7 @@ function nyTime(nowMs = Date.now()) {
 
 // Written to be acted on from a phone: everything MT5 needs, the price
 // beyond which not to chase, and why it fired.
-function confirmWatch(watch, quote, result, gates, mss, rr) {
+function confirmWatch(watch, quote, result, gates, mss, rr, expansion) {
   const buy = watch.direction === "buy";
   const fmt = (value) => htmlEscape(formatLevel(value));
   const targets =
@@ -280,6 +286,7 @@ function confirmWatch(watch, quote, result, gates, mss, rr) {
       strength: result.strength,
       rr_at_entry: Number(rr.toFixed(2)),
       structure_shift: mss,
+      expansion,
       gates: gates.summary,
     },
     `<b>🟢 REAL CONFIRMATION — ENTER NOW</b>\n` +
@@ -293,6 +300,9 @@ function confirmWatch(watch, quote, result, gates, mss, rr) {
       `✅ Liquidity ${fmt(watch.sweep_level)} taken\n` +
       `✅ Entry ${fmt(watch.entry)} touched\n` +
       `✅ M1 structure shift: body close ${buy ? "above" : "below"} ${fmt(mss.level)}\n` +
+      `✅ Expansion underway: displacement printed, price pushing ${buy ? "up" : "down"} now` +
+      (expansion ? ` (pullback ${Math.round(expansion.retrace * 100)}% of the leg)` : "") +
+      `\n` +
       `✅ ${htmlEscape(result.signals.join(" + "))}\n` +
       `✅ ${htmlEscape(gates.zone || "session filter off")} · news clear · spread ${fmt(quote.spread)}\n` +
       (watch.liquidity && watch.liquidity !== "N/A" ? `<b>Liquidity:</b> ${htmlEscape(watch.liquidity)}\n` : "") +
@@ -805,6 +815,19 @@ async function tickSetupWatch(watch) {
   watch.lastReason = "awaiting_gates";
 
   const gates = await applyExternalGates(watch, spread);
+  const expansion = expansionState(m1.bars, watch.direction, mid, Date.parse(watch.entryTouchedAt), {
+    displacementMultiple: CONFIG.expansionDisplacement,
+    maxRetrace: CONFIG.expansionMaxRetrace,
+  });
+  watch.expansion = expansion;
+  if (CONFIG.requireExpansion && !expansion.underway) {
+    gates.pass = false;
+    gates.reasons.unshift(
+      expansion.displaced
+        ? "Waiting for the push — price is pulling back; ENTER NOW comes when it expands again, not into the pullback"
+        : "Waiting for displacement — no strong candle away from the entry yet",
+    );
+  }
   const rr = marketRR(watch, executable);
   watch.rrAtMarket = Number(rr.toFixed(2));
   if (rr < CONFIG.minRrAtEntry) {
@@ -817,7 +840,7 @@ async function tickSetupWatch(watch) {
   }
   if (gates.pass) {
     watch.lastReason = "confirming";
-    confirmWatch(watch, { executable, spread }, result, gates, mss, rr);
+    confirmWatch(watch, { executable, spread }, result, gates, mss, rr, expansion);
     return;
   }
   const reasonText = gates.reasons.join(" | ");
