@@ -66,6 +66,7 @@ import { CTraderMcpClient, MarketData, asArray } from "./lib/upstream.mjs";
 import { Notifier } from "./lib/notify.mjs";
 import { WatchStore, publicWatch } from "./lib/store.mjs";
 import { redisFromEnv } from "./lib/kv.mjs";
+import { installOAuth } from "./lib/oauth.mjs";
 
 // ---------------------------------------------------------------------------
 // §1 Configuration
@@ -198,6 +199,9 @@ let newsRefreshInFlight = null;
 const watchSessions = new Map();
 
 const app = express();
+// Behind Vercel's (or Railway's) proxy: req.protocol must say https, or
+// the OAuth metadata would advertise http URLs.
+app.set("trust proxy", true);
 app.use(
   express.json({
     limit: "256kb",
@@ -207,6 +211,12 @@ app.use(
   }),
 );
 app.use(express.urlencoded({ extended: true }));
+
+// Clients that can only do OAuth (the Gemini app) sign in with the monitor
+// password once and get a token; a static bearer still works for the rest.
+const verifyOAuthAccess = CONFIG.authToken
+  ? installOAuth(app, { password: CONFIG.authToken, cors: setupCors })
+  : () => false;
 
 function htmlEscape(value) {
   return String(value ?? "")
@@ -1409,11 +1419,17 @@ function tokenMatches(provided, expectedToken) {
 
 function authorized(req) {
   if (!CONFIG.authToken) return true;
-  return tokenMatches(parseAuthToken(req), CONFIG.authToken);
+  const token = parseAuthToken(req);
+  return tokenMatches(token, CONFIG.authToken) || verifyOAuthAccess(token);
 }
 
 function rejectUnauthorized(req, res) {
   if (authorized(req)) return false;
+  // Where an OAuth client starts (MCP authorization spec).
+  res.set(
+    "WWW-Authenticate",
+    `Bearer resource_metadata="${req.protocol}://${req.get("host")}/.well-known/oauth-protected-resource"`,
+  );
   res.status(401).json({
     error: "Unauthorized",
     message: "A valid monitor authorization token is required.",
@@ -1428,7 +1444,7 @@ function setupCors(res) {
     "Access-Control-Allow-Headers",
     "Content-Type, Accept, Authorization, X-Api-Key, Mcp-Session-Id, MCP-Protocol-Version",
   );
-  res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
+  res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id, WWW-Authenticate");
 }
 
 let upstreamToolsCache = { tools: null, fetchedAt: 0, lastError: null };
@@ -1462,8 +1478,8 @@ function jsonRpcError(res, id, code, message) {
 }
 
 async function handleMcpRequest(req, res) {
-  if (rejectUnauthorized(req, res)) return;
   setupCors(res);
+  if (rejectUnauthorized(req, res)) return;
 
   if (req.method === "GET") {
     if (SERVERLESS) {

@@ -52,6 +52,8 @@ import {
 } from "../lib/core.mjs";
 import { WatchStore } from "../lib/store.mjs";
 import { Notifier } from "../lib/notify.mjs";
+import { pkceMatches, signer, validRedirect } from "../lib/oauth.mjs";
+import { createHash } from "node:crypto";
 
 const M1 = 60_000;
 const M15 = 15 * 60_000;
@@ -790,4 +792,31 @@ test("ENTRY — ENTER NOW lands on the push, never into a pullback", () => {
 
   const noDisplacement = expansionState(bars.slice(0, 11), "buy", 99, touch);
   assert.equal(noDisplacement.displaced, false, "no strong candle away from the low yet");
+});
+
+// ---------------------------------------------------------------------------
+// OAUTH — what lets the Gemini app connect without a static bearer token.
+
+test("OAUTH — tokens are bound to the password, their type and their expiry", () => {
+  const issuer = signer("monitor-password");
+  const access = issuer.sign({ typ: "access", exp: 2_000 });
+  assert.ok(issuer.verify(access, "access", 1_000));
+  assert.equal(issuer.verify(access, "access", 3_000), null, "expired");
+  assert.equal(issuer.verify(access, "refresh", 1_000), null, "an access token is not a refresh token");
+  assert.equal(signer("new-password").verify(access, "access", 1_000), null, "changing the password revokes it");
+  const [body] = access.split(".");
+  const forged = `${Buffer.from(JSON.stringify({ typ: "access" })).toString("base64url")}.${access.split(".")[1]}`;
+  assert.equal(issuer.verify(forged, "access", 1_000), null, "a rewritten payload fails the signature");
+  assert.ok(body);
+});
+
+test("OAUTH — PKCE and redirect rules", () => {
+  const verifier = "a-long-random-code-verifier-0123456789";
+  const challenge = createHash("sha256").update(verifier).digest("base64url");
+  assert.equal(pkceMatches(verifier, challenge), true);
+  assert.equal(pkceMatches("wrong", challenge), false);
+  assert.equal(validRedirect("https://gemini.google.com/oauth/callback"), true);
+  assert.equal(validRedirect("http://localhost:7777/cb"), true, "CLI loopback");
+  assert.equal(validRedirect("http://evil.example/cb"), false, "plain http off this machine");
+  assert.equal(validRedirect("javascript:alert(1)"), false);
 });

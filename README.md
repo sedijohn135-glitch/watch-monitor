@@ -27,6 +27,7 @@ lib/upstream.mjs    managed cTrader MCP client + coalescing market-data layer
 lib/store.mjs       watch registry + durable snapshot (file, or Redis via index.js)
 lib/notify.mjs      Telegram outbox with retry and delivery accounting
 lib/kv.mjs          Upstash Redis over REST, for Vercel
+lib/oauth.mjs       OAuth for clients that cannot send a bearer header (Gemini app)
 test/adversarial.test.mjs   adversarial suite
 test/smoke.mjs      boots the real server against a fake upstream: twice as a
                     process, once in Vercel mode against a fake Redis
@@ -62,8 +63,19 @@ once a minute to run the monitor.
    and set `CRON_SECRET`.
 5. **Check:** open `/health` with the token — `storage: "redis"` and a
    recent `last_tick_at`. `GET /test-telegram` sends a test message.
-6. **MCP URL** for the client: `https://<your-app>.vercel.app/mcp` with
-   header `Authorization: Bearer <WATCH_MONITOR_AUTH_TOKEN>`.
+6. **Connect the client** to `https://<your-app>.vercel.app/mcp`:
+   - **OAuth** (the Gemini app, Claude, ChatGPT): add the URL and choose
+     OAuth. The client discovers everything itself, opens a page that
+     names who is connecting, and asks for the monitor password — your
+     `WATCH_MONITOR_AUTH_TOKEN`. Tokens last 30 days and refresh for a
+     year; changing the password revokes them all. If the client asks
+     for fields instead: Authorization URL `/authorize`, Token URL
+     `/token`, any Client ID, no secret, scope `mcp`, PKCE on.
+   - **Bearer header** (CLI clients, curl): `Authorization: Bearer
+     <WATCH_MONITOR_AUTH_TOKEN>`.
+
+   Use a long random password: it is the one secret guarding the
+   monitor, and the sign-in page has no attempt limit.
 
 Trade-off against a long-lived host: price is checked once a minute
 instead of every 10 s, so an SL/TP touch is reported up to a minute late,
@@ -112,6 +124,9 @@ exactly as a restart did before.
 ## Endpoints
 
 - `POST /mcp`, `/icmarkets/mcp`, `/watch-mcp` — the MCP server.
+- `/.well-known/oauth-protected-resource`, `/.well-known/oauth-authorization-server`,
+  `POST /register`, `GET|POST /authorize`, `POST /token` — OAuth 2.1 with
+  PKCE and dynamic client registration, stateless (signed with the password).
 - `GET|POST /tick` — one scheduler pass (bearer token, `CRON_SECRET`, or `?token=`).
 - `GET /health` — full detail when authenticated, minimal otherwise.
 - `POST /register_watch` — REST mirror sharing the tool's code path.

@@ -261,6 +261,70 @@ assert(
   "market-data tools are labelled read-only, so clients can skip the Allow prompt",
 );
 
+console.log("\n— OAuth, the way the Gemini app connects —");
+const { createHash } = await import("node:crypto");
+const BASE = "http://127.0.0.1:9803";
+const challengeOf = (verifier) => createHash("sha256").update(verifier).digest("base64url");
+assert(
+  /resource_metadata=".*\/\.well-known\/oauth-protected-resource"/.test(unauthorized.headers.get("www-authenticate") || ""),
+  "a 401 points the client at the OAuth metadata",
+);
+const resource = await (await fetch(`${BASE}/.well-known/oauth-protected-resource`)).json();
+const serverMeta = await (await fetch(`${BASE}/.well-known/oauth-authorization-server`)).json();
+assert(resource.authorization_servers?.[0] === BASE && serverMeta.code_challenge_methods_supported.includes("S256"), "discovery metadata");
+const registration = await (
+  await fetch(serverMeta.registration_endpoint, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ client_name: "Gemini", redirect_uris: ["https://gemini.google.com/oauth/callback"] }),
+  })
+).json();
+assert(Boolean(registration.client_id), "dynamic client registration");
+const verifier = "smoke-verifier-0123456789-abcdefghijklmnopqrstuvwxyz";
+const authParams = {
+  response_type: "code",
+  client_id: registration.client_id,
+  redirect_uri: "https://gemini.google.com/oauth/callback",
+  code_challenge: challengeOf(verifier),
+  code_challenge_method: "S256",
+  state: "xyz",
+};
+const page = await fetch(`${serverMeta.authorization_endpoint}?${new URLSearchParams(authParams)}`);
+assert(page.status === 200 && /gemini\.google\.com/.test(await page.text()), "the password page names who is connecting");
+const consent = (password) =>
+  fetch(serverMeta.authorization_endpoint, {
+    method: "POST",
+    redirect: "manual",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ ...authParams, password }),
+  });
+assert((await consent("wrong")).status === 401, "a wrong password gets no code");
+const granted = await consent("secret");
+const callback = new URL(granted.headers.get("location") || "https://x/");
+assert(granted.status === 302 && callback.searchParams.get("state") === "xyz", "the right password redirects back with a code");
+const exchange = (extra) =>
+  fetch(serverMeta.token_endpoint, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ grant_type: "authorization_code", code: callback.searchParams.get("code"), redirect_uri: authParams.redirect_uri, client_id: registration.client_id, ...extra }),
+  });
+assert((await exchange({ code_verifier: "not-the-verifier" })).status === 400, "a stolen code without the PKCE verifier is useless");
+const issued = await (await exchange({ code_verifier: verifier })).json();
+const withToken = await fetch(`${BASE}/mcp`, {
+  method: "POST",
+  headers: { "content-type": "application/json", authorization: `Bearer ${issued.access_token}` },
+  body: JSON.stringify({ jsonrpc: "2.0", id: 9, method: "tools/list" }),
+});
+assert(withToken.status === 200 && (await withToken.json()).result?.tools?.length > 0, "the OAuth access token opens /mcp");
+const refreshed = await (
+  await fetch(serverMeta.token_endpoint, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: issued.refresh_token }),
+  })
+).json();
+assert(Boolean(refreshed.access_token), "refresh issues a new access token");
+
 const blocked = await rpc("tools/call", { name: "create_order", arguments: { volume: 1 } });
 assert(
   blocked.error && /not available to this client/.test(blocked.error.message),
