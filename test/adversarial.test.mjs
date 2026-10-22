@@ -825,6 +825,7 @@ test("OAUTH — PKCE and redirect rules", () => {
 test("VERCEL — Redis credentials are found under any prefix the integration chose", () => {
   assert.ok(redisFromEnv({ KV_REST_API_URL: "https://a", KV_REST_API_TOKEN: "t" }));
   assert.ok(redisFromEnv({ STORAGE_KV_REST_API_URL: "https://a", STORAGE_KV_REST_API_TOKEN: "t" }));
+  assert.ok(redisFromEnv({ STORAGE_REST_API_URL: "https://a", STORAGE_REST_API_TOKEN: "t" }), "prefix replacing KV");
   assert.ok(redisFromEnv({ UPSTASH_REDIS_REST_URL: "https://a", UPSTASH_REDIS_REST_TOKEN: "t" }));
   assert.equal(
     redisFromEnv({ KV_REST_API_URL: "https://a", KV_REST_API_READ_ONLY_TOKEN: "ro" }),
