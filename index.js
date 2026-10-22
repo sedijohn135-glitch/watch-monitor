@@ -1096,11 +1096,15 @@ async function marketSnapshot(args) {
 // layer coalescing shared symbol lookups across all of them.
 
 let schedulerTimer = null;
-let schedulerRunning = false;
+let schedulerRunningSince = 0;
 
 async function runDueWatches() {
-  if (schedulerRunning) return;
-  schedulerRunning = true;
+  // A run that never finished (on Vercel: a request cut off mid-tick, its
+  // promise orphaned on a reused instance) must not silently turn every
+  // later tick on that instance into a no-op. Past 2 minutes it is dead.
+  if (schedulerRunningSince && Date.now() - schedulerRunningSince < 120_000) return;
+  const runStartedAt = Date.now();
+  schedulerRunningSince = runStartedAt;
   const now = Date.now();
   try {
     const due = store.active().filter(
@@ -1129,7 +1133,7 @@ async function runDueWatches() {
     await notifier.drain();
     if (store.dirty) scheduleSave();
   } finally {
-    schedulerRunning = false;
+    if (schedulerRunningSince === runStartedAt) schedulerRunningSince = 0;
   }
 }
 

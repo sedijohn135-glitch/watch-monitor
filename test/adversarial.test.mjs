@@ -948,3 +948,15 @@ test("OPEN API — answers the market-data layer in its raw-integer shape", asyn
   await client.session();
   assert.equal(server.sockets.length, 2, "a socket silent for 30 s is replaced, not trusted");
 });
+
+test("OPEN API — a handshake that never completes fails instead of hanging every later call", async () => {
+  const client = new OpenApiClient({
+    clientId: "app",
+    clientSecret: "secret",
+    accessToken: "fresh",
+    timeoutMs: 50,
+    socketFactory: () => ({ addEventListener() {}, close() {}, send() {} }),
+  });
+  await assert.rejects(client.session(), /did not answer the connection/);
+  assert.equal(client.ready, null, "the next call starts a fresh connection");
+});
