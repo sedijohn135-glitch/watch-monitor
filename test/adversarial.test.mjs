@@ -53,6 +53,7 @@ import {
 import { WatchStore } from "../lib/store.mjs";
 import { Notifier } from "../lib/notify.mjs";
 import { pkceMatches, signer, validRedirect } from "../lib/oauth.mjs";
+import { redisFromEnv } from "../lib/kv.mjs";
 import { createHash } from "node:crypto";
 
 const M1 = 60_000;
@@ -819,4 +820,15 @@ test("OAUTH — PKCE and redirect rules", () => {
   assert.equal(validRedirect("http://localhost:7777/cb"), true, "CLI loopback");
   assert.equal(validRedirect("http://evil.example/cb"), false, "plain http off this machine");
   assert.equal(validRedirect("javascript:alert(1)"), false);
+});
+
+test("VERCEL — Redis credentials are found under any prefix the integration chose", () => {
+  assert.ok(redisFromEnv({ KV_REST_API_URL: "https://a", KV_REST_API_TOKEN: "t" }));
+  assert.ok(redisFromEnv({ STORAGE_KV_REST_API_URL: "https://a", STORAGE_KV_REST_API_TOKEN: "t" }));
+  assert.ok(redisFromEnv({ UPSTASH_REDIS_REST_URL: "https://a", UPSTASH_REDIS_REST_TOKEN: "t" }));
+  assert.equal(
+    redisFromEnv({ KV_REST_API_URL: "https://a", KV_REST_API_READ_ONLY_TOKEN: "ro" }),
+    null,
+    "a read-only token cannot hold the lock or save state",
+  );
 });
