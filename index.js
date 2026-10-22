@@ -1374,7 +1374,7 @@ function createSetupWatch(args) {
 }
 
 function textResult(payload) {
-  return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
+  return { content: [{ type: "text", text: JSON.stringify(payload) }] };
 }
 
 function monitorHealth() {
