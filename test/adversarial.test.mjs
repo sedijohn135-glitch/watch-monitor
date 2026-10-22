@@ -7,7 +7,7 @@
  *   npm test
  */
 
-import test from "node:test";
+import test, { mock } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -959,4 +959,31 @@ test("OPEN API — a handshake that never completes fails instead of hanging eve
   });
   await assert.rejects(client.session(), /did not answer the connection/);
   assert.equal(client.ready, null, "the next call starts a fresh connection");
+});
+
+test("OPEN API — with the market closed the spot wait ends on its timer, even at exactly 3 s", async () => {
+  const server = fakeCtrader({ accounts: [{ ctidTraderAccountId: 9, isLive: true }] });
+  const client = new OpenApiClient({ clientId: "app", clientSecret: "secret", accessToken: "fresh", socketFactory: server.socketFactory });
+  await client.spot(41); // subscribed; the fake sends one quote, then silence (daily break)
+  mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
+  try {
+    mock.timers.tick(6_000); // the quote is no longer fresh
+    const pending = client.spot(41);
+    await new Promise((resolve) => setImmediate(resolve));
+    mock.timers.tick(3_000); // fires at exactly 3000 ms elapsed
+    const quote = await pending;
+    assert.equal(quote.bid, 442050000, "the last quote, under 2 minutes old, is returned");
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test("MARKET DATA — an upstream call that never answers fails the call, not the monitor", async () => {
+  const market = new MarketData({
+    client: { callTool: () => new Promise(() => {}) },
+    config: { priceScale: 100000, symbolIdHints: {}, symbolTtlMs: 600_000, missingSymbolBackoffMs: 900_000, spotCacheMs: 0, callTimeoutMs: 20 },
+    log: () => {},
+  });
+  assert.equal(await market.spot("XAUUSD", 41), null);
+  assert.match(market.stats.lastError, /no answer within 20 ms/);
 });
