@@ -67,6 +67,9 @@ import { Notifier } from "./lib/notify.mjs";
 import { WatchStore, publicWatch } from "./lib/store.mjs";
 import { redisFromEnv } from "./lib/kv.mjs";
 import { installOAuth } from "./lib/oauth.mjs";
+import { OpenApiClient, installOpenApiConnect } from "./lib/openapi.mjs";
+import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { dirname, join } from "node:path";
 
 // ---------------------------------------------------------------------------
 // §1 Configuration
@@ -170,14 +173,43 @@ function log(message, ...args) {
 // ---------------------------------------------------------------------------
 // §2 Wiring
 
-const client = new CTraderMcpClient({
-  url: CONFIG.upstreamUrl,
-  token: CONFIG.upstreamToken,
-  timeoutMs: CONFIG.mcpTimeoutMs,
-  protocolVersion: CONFIG.protocolVersion,
-  environment: String(process.env.CTRADER_ENVIRONMENT || "").trim().toLowerCase(),
-  log,
-});
+const kv = SERVERLESS ? redisFromEnv(process.env) : null;
+const ctraderEnvironment = String(process.env.CTRADER_ENVIRONMENT || "").trim().toLowerCase();
+
+// Market feed: cTrader Open API when an app is configured (CTRADER_CLIENT_ID
+// and _SECRET), else the remote cTrader MCP. Open API rotates its tokens on
+// refresh, so the current pair lives in Redis (or next to the state file),
+// not only in the env vars that seeded it.
+const OPEN_API = Boolean(process.env.CTRADER_CLIENT_ID && process.env.CTRADER_CLIENT_SECRET);
+const CTRADER_TOKENS_KEY = "watch-monitor:ctrader-tokens";
+const tokenFile = join(dirname(CONFIG.statePath), "ctrader-tokens.json");
+const ctraderTokens = {
+  load: async () => (kv ? kv.get(CTRADER_TOKENS_KEY) : JSON.parse(await readFile(tokenFile, "utf8"))),
+  save: async (tokens) => {
+    if (kv) return kv.set(CTRADER_TOKENS_KEY, tokens);
+    await mkdir(dirname(tokenFile), { recursive: true });
+    await writeFile(tokenFile, JSON.stringify(tokens), { mode: 0o600 });
+  },
+};
+const client = OPEN_API
+  ? new OpenApiClient({
+      clientId: process.env.CTRADER_CLIENT_ID.trim(),
+      clientSecret: process.env.CTRADER_CLIENT_SECRET.trim(),
+      accessToken: String(process.env.CTRADER_ACCESS_TOKEN || "").trim(),
+      refreshToken: String(process.env.CTRADER_REFRESH_TOKEN || "").trim(),
+      accountId: process.env.CTRADER_ACCOUNT_ID || null,
+      environment: ctraderEnvironment,
+      tokenStore: ctraderTokens,
+      log,
+    })
+  : new CTraderMcpClient({
+      url: CONFIG.upstreamUrl,
+      token: CONFIG.upstreamToken,
+      timeoutMs: CONFIG.mcpTimeoutMs,
+      protocolVersion: CONFIG.protocolVersion,
+      environment: ctraderEnvironment,
+      log,
+    });
 const market = new MarketData({ client, config: CONFIG, log });
 const notifier = new Notifier({
   token: process.env.TELEGRAM_BOT_TOKEN,
@@ -192,7 +224,6 @@ const store = new WatchStore({
     resolved: CONFIG.resolvedLimit,
   },
 });
-const kv = SERVERLESS ? redisFromEnv(process.env) : null;
 
 let manualNewsLockout = { active: false, reason: null, setAt: null };
 let newsCache = { events: [], fetchedAt: 0, expiresAt: 0, lastError: null };
@@ -270,6 +301,7 @@ app.get("/debug/requests", async (_req, res) => {
 const verifyOAuthAccess = CONFIG.authToken
   ? installOAuth(app, { password: CONFIG.authToken, cors: setupCors })
   : () => false;
+if (OPEN_API) installOpenApiConnect(app, { client, authorized, tokenStore: ctraderTokens });
 
 function htmlEscape(value) {
   return String(value ?? "")
@@ -1692,8 +1724,11 @@ app.get("/health", async (req, res) => {
     quarantined: setups.filter((watch) => watch.lifecycle === "QUARANTINED").length,
     scheduler_tick_ms: SERVERLESS ? "external cron → /tick" : CONFIG.tickMs,
     setup_interval_seconds: CONFIG.setupIntervalMs / 1000,
-    ctrader_token_configured: Boolean(CONFIG.upstreamToken),
-    upstream: CONFIG.upstreamUrl,
+    market_source: OPEN_API ? "ctrader-open-api" : "ctrader-mcp",
+    // Open API tokens may live only in Redis until this instance connects;
+    // market_data.environment and last_error say whether it did.
+    ctrader_token_configured: OPEN_API ? undefined : Boolean(CONFIG.upstreamToken),
+    upstream: OPEN_API ? `wss://${client.host}:5036` : CONFIG.upstreamUrl,
     upstream_tools_cached: upstreamToolsCache.tools ? upstreamToolsCache.tools.length : 0,
     upstream_tools_last_error: upstreamToolsCache.lastError,
     custom_tools: CUSTOM_TOOLS.length,

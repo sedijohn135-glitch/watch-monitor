@@ -54,6 +54,8 @@ import { WatchStore } from "../lib/store.mjs";
 import { Notifier } from "../lib/notify.mjs";
 import { pkceMatches, signer, validRedirect } from "../lib/oauth.mjs";
 import { redisFromEnv } from "../lib/kv.mjs";
+import { OpenApiClient, decodeTrendbar } from "../lib/openapi.mjs";
+import { MarketData } from "../lib/upstream.mjs";
 import { createHash } from "node:crypto";
 
 const M1 = 60_000;
@@ -832,4 +834,117 @@ test("VERCEL — Redis credentials are found under any prefix the integration ch
     null,
     "a read-only token cannot hold the lock or save state",
   );
+});
+
+// -- cTrader Open API ---------------------------------------------------------
+
+/** A cTrader JSON endpoint in memory: answers by payloadType, one socket per connect. */
+function fakeCtrader({ accounts, validToken = "fresh", bars = [] }) {
+  const sockets = [];
+  const socketFactory = (url) => {
+    const handlers = {};
+    const emit = (type, event) => (handlers[type] || []).forEach((fn) => fn(event));
+    const push = (message) => setImmediate(() => emit("message", { data: JSON.stringify(message) }));
+    const socket = {
+      url,
+      sent: [],
+      addEventListener: (type, fn) => (handlers[type] ||= []).push(fn),
+      close() {},
+      send(raw) {
+        const message = JSON.parse(raw);
+        socket.sent.push(message);
+        const reply = (payloadType, payload = {}) => push({ clientMsgId: message.clientMsgId, payloadType, payload });
+        const payload = message.payload;
+        if (message.payloadType === 2100) reply(2101);
+        if (message.payloadType === 2149) {
+          if (payload.accessToken === validToken) reply(2150, { ctidTraderAccount: accounts });
+          else reply(2142, { errorCode: "CH_ACCESS_TOKEN_INVALID" });
+        }
+        if (message.payloadType === 2102) reply(2103);
+        if (message.payloadType === 2114) reply(2115, { symbol: [{ symbolId: 41, symbolName: "XAUUSD", enabled: true }] });
+        if (message.payloadType === 2127) {
+          reply(2128);
+          push({ payloadType: 2131, payload: { symbolId: 41, bid: 442050000, ask: 442080000 } });
+        }
+        if (message.payloadType === 2137) reply(2138, { trendbar: bars });
+      },
+    };
+    sockets.push(socket);
+    setImmediate(() => emit("open"));
+    return socket;
+  };
+  return { sockets, socketFactory };
+}
+
+test("OPEN API — trendbars decode from low + deltas", () => {
+  assert.deepEqual(
+    decodeTrendbar({ low: 442000000, deltaOpen: 10000, deltaHigh: 50000, deltaClose: 30000, utcTimestampInMinutes: 29_000_000, volume: 7 }),
+    { timestamp: 29_000_000 * 60_000, open: 442010000, high: 442050000, low: 442000000, close: 442030000, volume: 7 },
+  );
+});
+
+test("OPEN API — an expired token is refreshed and saved, and a demo account moves to the demo host", async () => {
+  const server = fakeCtrader({ accounts: [{ ctidTraderAccountId: 7, isLive: false }] });
+  const saved = [];
+  const fetched = [];
+  const client = new OpenApiClient({
+    clientId: "app",
+    clientSecret: "secret",
+    accessToken: "stale",
+    refreshToken: "r1",
+    socketFactory: server.socketFactory,
+    tokenStore: { load: async () => null, save: async (tokens) => saved.push(tokens) },
+    fetchImpl: async (url) => {
+      fetched.push(url);
+      return { ok: true, json: async () => ({ accessToken: "fresh", refreshToken: "r2", expiresIn: 2_628_000 }) };
+    },
+  });
+  await client.session();
+  assert.match(fetched[0], /grant_type=refresh_token/);
+  assert.match(fetched[0], /refresh_token=r1/);
+  assert.equal(saved[0].accessToken, "fresh", "the rotated pair is stored where the next instance finds it");
+  assert.equal(saved[0].refreshToken, "r2");
+  assert.equal(server.sockets[0].url, "wss://live.ctraderapi.com:5036");
+  assert.equal(server.sockets.at(-1).url, "wss://demo.ctraderapi.com:5036", "an account is authorised on its own host");
+  assert.equal(client.accountId, 7);
+  assert.equal(client.environment, "demo");
+  assert.equal(client.environmentProven, true);
+});
+
+test("OPEN API — answers the market-data layer in its raw-integer shape", async () => {
+  const bars = [
+    { low: 442000000, deltaOpen: 10000, deltaHigh: 50000, deltaClose: 30000, utcTimestampInMinutes: 29_000_001 },
+    { low: 441900000, deltaOpen: 0, deltaHigh: 40000, deltaClose: 20000, utcTimestampInMinutes: 29_000_000 },
+  ];
+  const server = fakeCtrader({ accounts: [{ ctidTraderAccountId: 9, isLive: true }], bars });
+  const client = new OpenApiClient({ clientId: "app", clientSecret: "secret", accessToken: "fresh", socketFactory: server.socketFactory });
+  const market = new MarketData({
+    client,
+    config: { priceScale: 100000, symbolIdHints: {}, symbolTtlMs: 600_000, missingSymbolBackoffMs: 900_000, spotCacheMs: 0 },
+    log: () => {},
+  });
+  const ids = await market.resolveSymbols(["XAUUSD"]);
+  assert.equal(ids.get("XAUUSD"), 41);
+  const spot = await market.spot("XAUUSD", 41);
+  assert.equal(spot.bid, 4420.5);
+  assert.equal(spot.ask, 4420.8);
+
+  const candles = await client.callTool("get_trendbars", {
+    symbolId: 41,
+    period: "M_1",
+    fromTimestamp: "2025-01-01T00:00:00.000Z",
+    toTimestamp: "2025-01-02T00:00:00.000Z",
+  });
+  const request = server.sockets.at(-1).sent.find((message) => message.payloadType === 2137);
+  assert.equal(request.payload.period, 1, "M_1 is ProtoOATrendbarPeriod M1");
+  assert.equal(request.payload.fromTimestamp, Date.parse("2025-01-01T00:00:00.000Z"));
+  assert.deepEqual(candles.map((bar) => bar.timestamp), [29_000_000 * 60_000, 29_000_001 * 60_000], "oldest first");
+  assert.ok(
+    server.sockets.flatMap((socket) => socket.sent).every((message) => [51, 2100, 2102, 2114, 2127, 2137, 2149].includes(message.payloadType)),
+    "only auth, list, symbols, spots, trendbars and heartbeats are ever sent — no order message",
+  );
+
+  client.lastMessageAt = Date.now() - 31_000;
+  await client.session();
+  assert.equal(server.sockets.length, 2, "a socket silent for 30 s is replaced, not trusted");
 });

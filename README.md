@@ -24,6 +24,7 @@ so the analysis reads liquidity as facts instead of guessing.
 index.js            server, scheduler, setup engine, snapshot, MCP + REST surface
 lib/core.mjs        pure logic — scaling, bar discipline, analytics, evidence, gates, liquidity, IDM
 lib/upstream.mjs    managed cTrader MCP client + coalescing market-data layer
+lib/openapi.mjs     cTrader Open API feed (JSON over WebSocket), read-only
 lib/store.mjs       watch registry + durable snapshot (file, or Redis via index.js)
 lib/notify.mjs      Telegram outbox with retry and delivery accounting
 lib/kv.mjs          Upstash Redis over REST, for Vercel
@@ -51,8 +52,10 @@ once a minute to run the monitor.
 2. **Add storage:** project → Storage → Upstash for Redis (free plan) →
    connect to the project. That injects `KV_REST_API_URL` and
    `KV_REST_API_TOKEN`. (`UPSTASH_REDIS_REST_URL` / `_TOKEN` also work.)
-3. **Environment variables:** `CTRADER_MCP_TOKEN`, `WATCH_MONITOR_AUTH_TOKEN`
-   (any long random string), `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.
+3. **Environment variables:** `WATCH_MONITOR_AUTH_TOKEN` (any long random
+   string), `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and the market feed —
+   preferably cTrader Open API: `CTRADER_CLIENT_ID`, `CTRADER_CLIENT_SECRET`
+   (your app at openapi.ctrader.com). Otherwise `CTRADER_MCP_TOKEN`.
    Recommended on Vercel: `MIN_CONFIRMATION_HOLD_MS=50000`, since ticks
    arrive about every 60 s with some jitter. Redeploy after adding them.
 4. **Cron, every minute:** on the Hobby plan Vercel cron runs only once a
@@ -61,9 +64,16 @@ once a minute to run the monitor.
    every 1 minute. On Pro you can instead add
    `{"crons":[{"path":"/tick","schedule":"* * * * *"}]}` to `vercel.json`
    and set `CRON_SECRET`.
-5. **Check:** open `/health` with the token — `storage: "redis"` and a
+5. **Link the cTrader account (Open API only, once):** in your app at
+   openapi.ctrader.com add the redirect URI
+   `https://<your-app>.vercel.app/ctrader/callback`, then open
+   `https://<your-app>.vercel.app/ctrader/connect?token=<WATCH_MONITOR_AUTH_TOKEN>`
+   and allow access. Tokens are kept in Redis and refreshed by the monitor.
+   (Or paste `CTRADER_ACCESS_TOKEN` / `CTRADER_REFRESH_TOKEN` from the
+   Open API playground instead.)
+6. **Check:** open `/health` with the token — `storage: "redis"` and a
    recent `last_tick_at`. `GET /test-telegram` sends a test message.
-6. **Connect the client** to `https://<your-app>.vercel.app/mcp`:
+7. **Connect the client** to `https://<your-app>.vercel.app/mcp`:
    - **OAuth** (the Gemini app, Claude, ChatGPT): add the URL and choose
      OAuth. The client discovers everything itself, opens a page that
      names who is connecting, and asks for the monitor password — your
@@ -94,8 +104,12 @@ exactly as a restart did before.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `CTRADER_MCP_URL` | `https://mcp.ctrader.com/trading/mcp` | upstream |
-| `CTRADER_MCP_TOKEN` | — | upstream bearer token |
+| `CTRADER_CLIENT_ID` / `CTRADER_CLIENT_SECRET` | — | cTrader Open API app; set → the feed is Open API |
+| `CTRADER_ACCESS_TOKEN` / `CTRADER_REFRESH_TOKEN` | — | optional seed; `/ctrader/connect` does the same |
+| `CTRADER_ACCOUNT_ID` | first account | ctidTraderAccountId to read prices through |
+| `CTRADER_ENVIRONMENT` | from the account | `live` or `demo` |
+| `CTRADER_MCP_URL` | `https://mcp.ctrader.com/trading/mcp` | remote MCP feed, used when no Open API app is set |
+| `CTRADER_MCP_TOKEN` | — | remote MCP bearer token |
 | `WATCH_MONITOR_AUTH_TOKEN` | — | **set this.** Unset leaves the endpoint open |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | — | notifications |
 | `KV_REST_API_URL` / `KV_REST_API_TOKEN` | — | Vercel only: Upstash Redis |
@@ -127,6 +141,7 @@ exactly as a restart did before.
 - `/.well-known/oauth-protected-resource`, `/.well-known/oauth-authorization-server`,
   `POST /register`, `GET|POST /authorize`, `POST /token` — OAuth 2.1 with
   PKCE and dynamic client registration, stateless (signed with the password).
+- `GET /ctrader/connect`, `/ctrader/callback` — one-time Open API account linking (read-only scope).
 - `GET|POST /tick` — one scheduler pass (bearer token, `CRON_SECRET`, or `?token=`).
 - `GET /health` — full detail when authenticated, minimal otherwise.
 - `POST /register_watch` — REST mirror sharing the tool's code path.
