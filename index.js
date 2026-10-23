@@ -48,6 +48,7 @@ import {
   nyClock,
   newsBlackout,
   numericTimestampMs,
+  oteZone,
   periodMs,
   priceTolerance,
   quotesWithGap,
@@ -354,7 +355,7 @@ function nyTime(nowMs = Date.now()) {
 
 // Written to be acted on from a phone: everything MT5 needs, the price
 // beyond which not to chase, and why it fired.
-function confirmWatch(watch, quote, model, gates, rr) {
+function confirmWatch(watch, quote, model, gates, rr, stop) {
   const buy = watch.direction === "buy";
   const fmt = (value) => htmlEscape(formatLevel(value));
   const targets =
@@ -367,16 +368,17 @@ function confirmWatch(watch, quote, model, gates, rr) {
     {
       resolvedPrice: quote.executable,
       model: model.zone,
+      sl_sent: stop.sl,
       rr_at_entry: Number(rr.toFixed(2)),
       structure_shift: model.mss,
       gates: gates.summary,
     },
     `<b>🟢 REAL CONFIRMATION — ENTER NOW</b>\n` +
       `<b>${htmlEscape(watch.symbol)} ${buy ? "BUY" : "SELL"} at market</b> ≈ ${fmt(quote.executable)} (${buy ? "ask" : "bid"})\n` +
-      `<b>SL:</b> ${fmt(watch.sl)} (risk ${fmt(Math.abs(quote.executable - watch.sl))})\n` +
+      `<b>SL:</b> ${fmt(stop.sl)} — ${htmlEscape(stop.reason)} (risk ${fmt(Math.abs(quote.executable - stop.sl))})\n` +
       `${targets}\n` +
       `<b>R:R to TP1 now:</b> ${htmlEscape(rr.toFixed(2))}\n` +
-      `<b>Do not enter ${buy ? "above" : "below"}:</b> ${fmt(chaseLimit(watch, CONFIG.minRrAtEntry))} ` +
+      `<b>Do not enter ${buy ? "above" : "below"}:</b> ${fmt(chaseLimit({ ...watch, sl: stop.sl }, CONFIG.minRrAtEntry))} ` +
       `(R:R under ${htmlEscape(CONFIG.minRrAtEntry)})\n` +
       `<b>Checklist</b>\n` +
       `✅ Liquidity ${fmt(watch.sweep_level)} taken\n` +
@@ -766,12 +768,14 @@ async function tickSetupWatch(watch) {
   }
 
   // -- The entry model -------------------------------------------------------
-  const [m5raw, m1raw] = await Promise.all([
+  const [m5raw, m1raw, h1raw] = await Promise.all([
     market.bars(watch.symbol, mainId, "M5", 60),
     market.bars(watch.symbol, mainId, "M1", 80),
+    market.bars(watch.symbol, mainId, "H1", 60),
   ]);
   const m5 = closedSeries(m5raw || [], "M5", { nowMs: now });
   const m1 = closedSeries(m1raw || [], "M1", { nowMs: now, staleBars: 5 });
+  const h1 = closedSeries(h1raw || [], "H1", { nowMs: now });
   if (m5.status !== "OK" || m1.status !== "OK" || m1.bars.length < 20) {
     watch.lastReason = `candles_${(m5.status !== "OK" ? m5.status : m1.status).toLowerCase()}`;
     noteDataQuality(
@@ -824,7 +828,10 @@ async function tickSetupWatch(watch) {
   }
   // Steps 2–3: MSS, then the zone the displacement left. Read from closed
   // M1 bars only, so a tick a minute late can neither miss nor invent it.
-  const model = entryModel(m1.bars, watch.direction, Date.parse(watch.entryTouchedAt));
+  // OTE needs the H1 dealing range; without H1 candles the other three
+  // models still work.
+  const ote = h1.status === "OK" ? oteZone(h1.bars.slice(-48), watch.direction) : null;
+  const model = entryModel(m1.bars, watch.direction, Date.parse(watch.entryTouchedAt), { ote });
   watch.structureShift = model.mss;
   watch.entryZone = model.zone;
   store.dirty = true;
@@ -837,6 +844,11 @@ async function tickSetupWatch(watch) {
 
   const zone = model.zone;
   const label = zoneLabel(zone);
+  const buy = watch.direction === "buy";
+  // The stop the model gives (beyond the swing, the inversion or the
+  // breaker) plus spread and tolerance, never wider than the registered SL.
+  const buffer = tolerance + spread;
+  const modelStop = buy ? Math.max(zone.stop - buffer, watch.sl) : Math.min(zone.stop + buffer, watch.sl);
   watch.lifecycle = "CONFIRMING";
   // Once per zone: the notifier's dedupe does not outlive a Vercel request.
   const zoneKey = `${zone.model}:${zone.low}:${zone.high}`;
@@ -846,7 +858,7 @@ async function tickSetupWatch(watch) {
       `<b>🟡 MSS + ${htmlEscape(label)} — ENTRY ZONE READY</b>\n` +
         `<b>${htmlEscape(watch.symbol)} ${htmlEscape(watch.direction.toUpperCase())}</b>\n` +
         `<b>Zone:</b> ${htmlEscape(formatLevel(zone.low))} – ${htmlEscape(formatLevel(zone.high))}\n` +
-        `<b>SL:</b> ${htmlEscape(formatLevel(watch.sl))} | <b>TP1:</b> ${htmlEscape(formatLevel(watch.tp1))}\n` +
+        `<b>SL:</b> ${htmlEscape(formatLevel(modelStop))} (${htmlEscape(stopReason(zone, buy))}) | <b>TP1:</b> ${htmlEscape(formatLevel(watch.tp1))}\n` +
         `<i>Not an entry yet. ENTER NOW comes when price retraces into the zone.</i>`,
       );
   }
@@ -858,20 +870,26 @@ async function tickSetupWatch(watch) {
   }
 
   watch.lastReason = "awaiting_gates";
+  // A stop within three spreads of the fill is noise, not a stop.
+  const tooTight = Math.abs(executable - modelStop) < 3 * spread;
+  const stop = {
+    sl: tooTight ? watch.sl : modelStop,
+    reason: tooTight ? "registered SL — the model stop is within 3 spreads" : stopReason(zone, buy),
+  };
   const gates = await applyExternalGates(watch, spread);
-  const rr = marketRR(watch, executable);
+  const rr = marketRR({ ...watch, sl: stop.sl }, executable);
   watch.rrAtMarket = Number(rr.toFixed(2));
   if (rr < CONFIG.minRrAtEntry) {
     gates.pass = false;
     // Stable wording: the block notice is sent once per distinct reason,
     // and a live number in it would resend it every tick.
     gates.reasons.unshift(
-      `R:R at market below ${CONFIG.minRrAtEntry} (price ran past ${formatLevel(chaseLimit(watch, CONFIG.minRrAtEntry))}) — do not chase; waiting for a pullback`,
+      `R:R at market below ${CONFIG.minRrAtEntry} (price ran past ${formatLevel(chaseLimit({ ...watch, sl: stop.sl }, CONFIG.minRrAtEntry))}) — do not chase; waiting for a pullback`,
     );
   }
   if (gates.pass) {
     watch.lastReason = "confirming";
-    confirmWatch(watch, { executable, spread }, model, gates, rr);
+    confirmWatch(watch, { executable, spread }, model, gates, rr, stop);
     return;
   }
   const reasonText = gates.reasons.join(" | ");
@@ -889,8 +907,16 @@ async function tickSetupWatch(watch) {
 }
 
 function zoneLabel(zone) {
-  const name = { FVG: "2022 model · FVG", IFVG: "Inversion · IFVG", Unicorn: "Unicorn · breaker + FVG" }[zone.model];
-  return zone.ote ? `${name} · OTE` : name;
+  const name = { FVG: "2022 model · FVG", IFVG: "Inversion · IFVG", Unicorn: "Unicorn · breaker + FVG", OB: "Order Block" }[
+    zone.model
+  ];
+  return zone.ote ? `OTE 62–79% · ${name}` : name;
+}
+
+function stopReason(zone, buy) {
+  if (zone.model === "IFVG") return buy ? "below the inversion" : "above the inversion";
+  if (zone.model === "Unicorn") return buy ? "below the breaker" : "above the breaker";
+  return buy ? "below the swing low" : "above the swing high";
 }
 
 // ---------------------------------------------------------------------------
@@ -1555,7 +1581,7 @@ async function handleMcpRequest(req, res) {
       result: {
         protocolVersion: body.params?.protocolVersion || CONFIG.protocolVersion,
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.2.1" },
+        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.3.0" },
       },
     });
     return;
@@ -1650,7 +1676,7 @@ app.get("/health", async (req, res) => {
   const base = {
     status: SERVERLESS && !kv ? "storage_missing" : "ok",
     service: "watch-monitor-mcp",
-    version: "6.2.1",
+    version: "6.3.0",
     runtime: SERVERLESS ? "vercel" : "node",
     watches: setups.length,
     last_tick_at: SERVERLESS ? lastTickAt : undefined,

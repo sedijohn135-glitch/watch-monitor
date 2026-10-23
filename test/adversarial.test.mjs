@@ -19,6 +19,7 @@ import {
   chaseLimit,
   closedSeries,
   entryModel,
+  oteZone,
   evaluateSafety,
   inducement,
   killZoneStatus,
@@ -827,7 +828,7 @@ const m1Bars = (rows) => rows.map(([o, h, l, c], i) => bar(T0 + i * M1, o, h, l,
 const TOUCH = T0 + 6 * M1;
 const mirror = (rows) => rows.map(([o, h, l, c]) => [200 - o, 200 - l, 200 - h, 200 - c]);
 
-test("MODEL 2022 — MSS by displacement, then the FVG of the leg; OTE when it sits at 62–79%", () => {
+test("MODEL 2022 — MSS by displacement, then the FVG of the leg; stop beyond the swing low", () => {
   const rows = [
     ...DECLINE,
     [99.6, 103.5, 99.5, 103.3], // displacement
@@ -838,13 +839,13 @@ test("MODEL 2022 — MSS by displacement, then the FVG of the leg; OTE when it s
   assert.equal(model.mss.shifted, true);
   assert.equal(model.mss.level, 107);
   assert.deepEqual(
-    [model.zone.model, model.zone.low, model.zone.high, model.zone.ote],
-    ["FVG", 103.5, 104, true],
-    "the gap a retrace reaches first, inside the 62–79% of the 99 → 112 leg",
+    [model.zone.model, model.zone.low, model.zone.high, model.zone.stop, model.zone.ote],
+    ["FVG", 103.5, 104, 99, false],
+    "the gap a retrace reaches first; the stop goes under the 99 swing low",
   );
 
   const sell = entryModel(m1Bars(mirror(rows)), "sell", TOUCH);
-  assert.deepEqual([sell.zone.model, sell.zone.low, sell.zone.high, sell.zone.ote], ["FVG", 96, 96.5, true], "a sell is the mirror image");
+  assert.deepEqual([sell.zone.model, sell.zone.low, sell.zone.high, sell.zone.stop], ["FVG", 96, 96.5, 101], "a sell is the mirror image");
 });
 
 test("MODEL 2022 — a zone a bar closes through is dead; with none left there is no entry", () => {
@@ -884,16 +885,48 @@ test("MODEL INVERSION — a gap of the move into the low, closed through, flips 
     [107.2, 107.6, 102.4, 106.3],
   ];
   const model = entryModel(m1Bars(rows), "buy", TOUCH);
-  assert.deepEqual([model.zone.model, model.zone.low, model.zone.high], ["IFVG", 105.3, 105.6]);
+  assert.deepEqual([model.zone.model, model.zone.low, model.zone.high, model.zone.stop], ["IFVG", 105.3, 105.6, 105.3], "stop just under the inversion");
 });
 
-test("MODEL UNICORN — the leg's FVG where it overlaps the breaker", () => {
+test("MODEL UNICORN — the leg's FVG where it overlaps the breaker, as the guide draws it", () => {
   const rows = [
     ...DECLINE,
     [99.6, 103.5, 99.5, 103.3],
     [103.3, 107.8, 103.6, 107.5],
-    [107.5, 108, 106, 106.2], // gap 103.5–106 now reaches into the 105.6–107 breaker
+    [107.5, 108, 106, 106.2], // gap 103.5–106 now reaches into the breaker
   ];
+  // Breaker: the up-close run into the 107 high and the down-close candle at
+  // its top, bodies 104.8–106.8; the stop goes under its 104.6 wick.
   const model = entryModel(m1Bars(rows), "buy", TOUCH);
-  assert.deepEqual([model.zone.model, model.zone.low, model.zone.high], ["Unicorn", 105.6, 106]);
+  assert.deepEqual([model.zone.model, model.zone.low, model.zone.high, model.zone.stop], ["Unicorn", 104.8, 106, 104.6]);
+});
+
+test("MODEL OTE — the 62–79% of the H1 dealing range, 0.705 the sweet spot", () => {
+  const h1 = [
+    [110, 111, 100, 101],
+    [101, 120, 100.5, 119],
+    [119, 150, 118, 149],
+    [149, 200, 148, 190],
+    [190, 192, 170, 172],
+  ].map(([o, h, l, c], i) => bar(T0 + i * 3_600_000, o, h, l, c));
+  const band = oteZone(h1, "buy");
+  assert.deepEqual([band.from, band.to, band.low, band.high, band.sweet], [100, 200, 121, 138, 129.5]);
+});
+
+test("MODEL OTE — a low inside the OTE band makes the order block an entry; outside it, it is not", () => {
+  const rows = [
+    ...DECLINE,
+    [99.6, 103.5, 99.5, 103.3],
+    [103.3, 107.8, 103.6, 107.5],
+    [107.5, 112, 104, 106.2],
+    [106.2, 106.3, 103.2, 103.3],
+    [103.3, 103.4, 102.4, 102.5], // both gaps closed through
+  ];
+  const inBand = entryModel(m1Bars(rows), "buy", TOUCH, { ote: { low: 98, high: 100 } });
+  assert.deepEqual(
+    [inBand.zone.model, inBand.zone.low, inBand.zone.high, inBand.zone.stop, inBand.zone.ote],
+    ["OB", 99, 102.9, 99, true],
+    "the down-close candle at the 99 low the displacement left from",
+  );
+  assert.equal(entryModel(m1Bars(rows), "buy", TOUCH, { ote: { low: 101, high: 104 } }).zone, null, "a low outside the band: no OTE, no OB");
 });

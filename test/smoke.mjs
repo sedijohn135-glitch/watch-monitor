@@ -615,6 +615,10 @@ await tick();
 const confirmed = (await scenarioWatch()).resolved;
 assert(confirmed?.status === "CONFIRMED", `retrace into the FVG: REAL CONFIRMATION — ENTER NOW (${confirmed?.status ?? (await scenarioWatch()).active?.lastReason})`);
 assert(confirmed?.rr_at_entry >= 1, `entered in the zone with R:R ${confirmed?.rr_at_entry} to TP1`);
+assert(
+  Math.abs(confirmed?.sl_sent - 4410.7) < 0.01,
+  `the 2022 model's stop: under the 4411 swing low by spread + tolerance, not the registered 4400 (${confirmed?.sl_sent})`,
+);
 
 vercel.kill("SIGTERM");
 await sleep(500);

@@ -1,11 +1,11 @@
-# Watch Monitor MCP — v6.2
+# Watch Monitor MCP — v6.3
 
 Market-data-only MCP server that monitors ICT sniper setups to a
 deterministic conclusion and notifies a human over Telegram. It never
 places, modifies or closes an order, and the account side of the upstream
 cTrader connector is unreachable from this endpoint by construction.
 
-**ENTER NOW is an ICT entry model, nothing else.** From closed M1 candles: the liquidity at `sweep_level` taken → an MSS (body close beyond the last swing into the reaction extreme) → the zone the displacement left: an **FVG** (2022 model), an **IFVG** (Inversion: a gap of the move into the low, closed through), or a **Unicorn** (that FVG where it overlaps the breaker), tagged **OTE** when it sits in the 62–79% of the leg → **price retraces into the zone**. Then R:R to TP1 at the market price ≥ 1, kill zone, news and spread. When the zone appears, Telegram gets "ENTRY ZONE READY" with its range; ENTER NOW comes only on the retrace. A zone a candle closes through is dead. The v6 evidence counters (price pattern, live acceptance, SMT, hold timers) and v6.1's "push" wait are gone.
+**ENTER NOW is an ICT entry model, nothing else** ("Mastering the 4 ICT Entry Models"). From closed M1 candles: the liquidity at `sweep_level` taken → an MSS (body close beyond the last swing into the reaction extreme) → the zone the displacement left: an **FVG** (2022 model), an **IFVG** (Inversion: a gap of the move into the low, closed through), a **Unicorn** (that FVG where it overlaps the breaker — the candles that built the broken high, bodies, as the guide draws it), or, when the low sits in the 62–79% of the H1 dealing range (**OTE**), also the **order block** → **price retraces into the zone**. The SL in the message is the model's: beyond the swing for FVG / OB / OTE, beyond the inversion for IFVG, beyond the breaker for Unicorn, plus spread and tolerance — never wider than the registered SL, and the registered SL when the model's would sit within three spreads. Then R:R to TP1 at the market price ≥ 1 (with that SL), kill zone, news and spread. When the zone appears, Telegram gets "ENTRY ZONE READY" with its range and SL; ENTER NOW comes only on the retrace. A zone a candle closes through is dead. The v6 evidence counters (price pattern, live acceptance, SMT, hold timers) and v6.1's "push" wait are gone.
 
 **No liquidity taken, no trade.** Every watch carries a `sweep_level` — the
 IDM / sell-side low for a buy, the IDM / buy-side high for a sell — and
