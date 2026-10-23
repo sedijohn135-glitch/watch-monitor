@@ -1043,6 +1043,15 @@ test("M5 CONFIRMATION — an engulfing in the trade's direction", () => {
   assert.equal(m5Confirmation(inside, "buy", T0), null, "a candle inside the previous body engulfs nothing");
 });
 
+test("M5 CONFIRMATION — in the prepared zone: the candle must have traded into it", () => {
+  // 23 Oct 16:40–16:45 UTC, BTCUSD: the sweep of 81747.52 and the rejection
+  // in the prepared zone 81670.21–81820.16, two hours before the CISD.
+  const btc = m5Bars([[81643.9, 81682.39, 81605.34, 81655.16], [81654.41, 81756.93, 81606.35, 81665.67]]);
+  const into = (zone) => (bar) => bar.high >= zone.low;
+  assert.deepEqual(m5Confirmation(btc, "sell", T0 + 300_000, 0, into({ low: 81670.21 })), { type: "rejection", at: T0 + 300_000 });
+  assert.equal(m5Confirmation(btc, "sell", T0 + 300_000, 0, into({ low: 81760 })), null, "a rejection below the zone is not in it");
+});
+
 test("M5 CONFIRMATION — a rejection wick; a symmetric doji is not one", () => {
   const hammer = m5Bars([[101, 101.2, 100, 100.2], [100.2, 100.6, 97, 100.5]]);
   assert.deepEqual(m5Confirmation(hammer, "buy", T0 + 300_000), { type: "rejection", at: T0 + 300_000 });

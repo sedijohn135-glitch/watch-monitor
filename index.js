@@ -414,9 +414,11 @@ function confirmWatch(watch, quote, model, gates, rr, stop, tp, walls = []) {
       `<b>Checklist</b>\n` +
       `✅ Liquidity ${fmt(watch.sweep_level)} taken\n` +
       `✅ Entry ${fmt(watch.entry)} touched\n` +
-      `✅ CISD: ${CONFIG.entryTimeframe} body close ${buy ? "above" : "below"} ${fmt(model.mss.level)}` +
-      `${model.displaced ? " with displacement" : ""}\n` +
-      `✅ ${htmlEscape(zoneLabel(model.zone))}: ${fmt(model.zone.low)} – ${fmt(model.zone.high)}\n` +
+      (model.validated
+        ? `✅ CISD: ${CONFIG.entryTimeframe} body close ${buy ? "above" : "below"} ${fmt(model.mss.level)}` +
+          `${model.displaced ? " with displacement" : ""}\n` +
+          `✅ ${htmlEscape(zoneLabel(model.zone))}: ${fmt(model.zone.low)} – ${fmt(model.zone.high)}\n`
+        : "") +
       `✅ ${htmlEscape(model.candleText)}\n` +
       `✅ Price retraced into the entry zone ${htmlEscape(model.zoneText)}\n` +
       `✅ ${htmlEscape(gates.zone || "session filter off")} · news clear · spread ${fmt(quote.spread)}\n` +
@@ -1007,11 +1009,18 @@ async function tickSetupWatch(watch) {
   // OTE needs the H1 dealing range; without H1 candles the other three
   // models still work.
   const ote = h1.status === "OK" ? oteZone(h1.bars.slice(-48), watch.direction) : null;
-  const model = entryModel(series.bars, watch.direction, Date.parse(watch.entryTouchedAt), { ote, span: PERIOD_MS[tf] });
+  const touchMs = Date.parse(watch.entryTouchedAt);
+  const model = entryModel(series.bars, watch.direction, touchMs, { ote, span: PERIOD_MS[tf] });
   watch.structureShift = model.mss;
   watch.entryZone = model.zone;
   store.dirty = true;
-  if (!model.mss.shifted || !model.zone) {
+  const buy = watch.direction === "buy";
+  // The analysis's prepared zone, when it gave one, is where the entry
+  // goes; the model is what validates the setup. Without one, the model's
+  // own zone.
+  const prepared = watch.entry_zone_low !== null && watch.entry_zone_low !== undefined;
+  const validated = Boolean(model.mss.shifted && model.zone);
+  if (!validated && !prepared) {
     watch.lifecycle = "TOUCHED";
     watch.lastGateBlockReason = null;
     watch.lastReason = model.mss.shifted ? "awaiting_fvg" : "awaiting_cisd";
@@ -1020,55 +1029,73 @@ async function tickSetupWatch(watch) {
   // Absolute: at least one strong confirmation, all on M5 (M1 is noise) —
   // an engulfing or rejection candle in the trade's direction from the
   // bar of the turn on, or SMT divergence with the partner at the sweep.
+  // Before a CISD, an engulfing or rejection that traded into the prepared
+  // zone after the sweep is enough on its own (the owner's call, 23 Oct:
+  // the CISD can come long after price has left the zone).
   const hhmm = (ms) => new Date(ms).toISOString().slice(11, 16);
-  const candle = m5Confirmation(
-    m5.bars,
-    watch.direction,
-    Math.floor(model.extremeAt / PERIOD_MS.M5) * PERIOD_MS.M5,
-    tolerance,
-  );
-  const smt = await smtAtSweep(watch, m5.bars, partner, ids.get(partner));
+  const bar5 = (ms) => Math.floor(ms / PERIOD_MS.M5) * PERIOD_MS.M5;
+  const preparedZone = prepared ? { low: watch.entry_zone_low, high: watch.entry_zone_high } : null;
+  const sweptFrom = bar5(Math.max(touchMs, Date.parse(watch.liquidityTakenAt) || touchMs));
+  const candle = validated
+    ? m5Confirmation(m5.bars, watch.direction, bar5(model.extremeAt), tolerance)
+    : m5Confirmation(
+        m5.bars,
+        watch.direction,
+        sweptFrom,
+        tolerance,
+        (bar) => bar.low <= preparedZone.high + tolerance && bar.high >= preparedZone.low - tolerance,
+      );
+  const smt = validated ? await smtAtSweep(watch, m5.bars, partner, ids.get(partner)) : null;
   watch.m5Confirmation = candle;
   watch.smt = smt;
   const confirmations = [
-    candle && `M5 ${candle.type} ${hhmm(candle.at)} UTC`,
+    candle && `M5 ${candle.type} ${hhmm(candle.at)} UTC${validated ? "" : " in the prepared zone"}`,
     smt?.divergent && `SMT divergence vs ${smt.partner} at ${hhmm(smt.at)} UTC`,
   ].filter(Boolean);
   if (!confirmations.length) {
     watch.lifecycle = "TOUCHED";
     watch.lastGateBlockReason = null;
-    watch.lastReason = "awaiting_engulfing_rejection_or_smt";
+    watch.lastReason = validated ? "awaiting_engulfing_rejection_or_smt" : "awaiting_cisd_or_m5_candle_in_zone";
     return;
   }
   const candleText = confirmations.join(" + ");
 
   const zone = model.zone;
-  const label = zoneLabel(zone);
-  // The analysis's prepared zone, when it gave one, is where the entry
-  // goes; the model is what validates the setup. Without one, the model's
-  // own zone.
-  const prepared = watch.entry_zone_low !== null && watch.entry_zone_low !== undefined;
-  const entryZone = prepared ? { low: watch.entry_zone_low, high: watch.entry_zone_high } : zone;
+  const label = validated ? zoneLabel(zone) : `M5 ${candle.type} in the prepared zone`;
+  const entryZone = prepared ? preparedZone : zone;
   const zoneText = `${formatLevel(entryZone.low)} – ${formatLevel(entryZone.high)}${prepared ? " (prepared zone)" : ""}`;
-  const buy = watch.direction === "buy";
-  // The stop beyond the swing the reaction made, plus spread and
-  // tolerance, never wider than the registered SL.
+  const validation = validated ? `${label} ${formatLevel(zone.low)} – ${formatLevel(zone.high)}` : label;
+  // The stop beyond the swing the reaction made — the model's, or without
+  // one the extreme since the sweep, live price included — plus spread
+  // and tolerance, never wider than the registered SL.
+  const since = m5.bars.filter((bar) => bar.timestampMs >= sweptFrom);
+  const swing = validated
+    ? zone.stop
+    : buy
+      ? Math.min(protective, ...since.map((bar) => bar.low))
+      : Math.max(protective, ...since.map((bar) => bar.high));
   const buffer = tolerance + spread;
-  const modelStop = buy ? Math.max(zone.stop - buffer, watch.sl) : Math.min(zone.stop + buffer, watch.sl);
+  const modelStop = buy ? Math.max(swing - buffer, watch.sl) : Math.min(swing + buffer, watch.sl);
   const swingSide = buy ? "below the swing low" : "above the swing high";
   watch.lifecycle = "CONFIRMING";
-  // Once per zone: the notifier's dedupe does not outlive a Vercel request.
-  // The target is looked up here, once, not on every fast check in the zone.
-  const zoneKey = `${zone.model}:${zone.low}:${zone.high}`;
-  if (watch.zoneNotified !== zoneKey) {
-    watch.zoneNotified = zoneKey;
+  // The target is looked up once per zone, not on every fast check in it.
+  // A prepared zone is one zone whatever validates it.
+  const zoneKey = prepared ? "prepared" : `${zone.model}:${zone.low}:${zone.high}`;
+  if (watch.targetKey !== zoneKey) {
+    watch.targetKey = zoneKey;
     watch.target = await targetFor(watch, mainId, mid);
+  }
+  const inZone = executable >= entryZone.low - tolerance && executable <= entryZone.high + tolerance;
+  // Once per zone, and only while there is a retrace to wait for: the
+  // notifier's dedupe does not outlive a Vercel request.
+  if (!inZone && watch.zoneNotified !== zoneKey) {
+    watch.zoneNotified = zoneKey;
     const tp = firstTarget(watch, watch.target, mid);
     notify(
-      `<b>🟡 CISD + ${htmlEscape(label)} — ENTRY ZONE READY</b>\n` +
+      `<b>🟡 ${validated ? `CISD + ${htmlEscape(label)}` : htmlEscape(label)} — ENTRY ZONE READY</b>\n` +
         `<b>${htmlEscape(watch.symbol)} ${htmlEscape(watch.direction.toUpperCase())}</b>\n` +
         `<b>Entry zone:</b> ${htmlEscape(zoneText)}\n` +
-        (prepared ? `<b>Validated by:</b> ${htmlEscape(label)} ${htmlEscape(formatLevel(zone.low))} – ${htmlEscape(formatLevel(zone.high))}\n` : "") +
+        (prepared && validated ? `<b>Validated by:</b> ${htmlEscape(validation)}\n` : "") +
         `<b>Confirmed by:</b> ${htmlEscape(candleText)}\n` +
         `<b>SL:</b> ${htmlEscape(formatLevel(modelStop))} (${swingSide})\n` +
         `<b>TP1:</b> ${htmlEscape(formatLevel(tp.level))} (${htmlEscape(tp.what)})\n` +
@@ -1077,7 +1104,7 @@ async function tickSetupWatch(watch) {
   }
 
   // Step 4: enter on the retrace into the zone — never on the move away.
-  if (executable < entryZone.low - tolerance || executable > entryZone.high + tolerance) {
+  if (!inZone) {
     watch.lastReason = "awaiting_retrace";
     return;
   }
@@ -1108,7 +1135,7 @@ async function tickSetupWatch(watch) {
     watch.lastReason = "confirming";
     const furthest = [tp.level, watch.tp1, watch.tp2, watch.tp3].filter(Number.isFinite);
     const walls = await obstaclesFor(watch, mainId, executable, buy ? Math.max(...furthest) : Math.min(...furthest));
-    confirmWatch(watch, { executable, spread }, { ...model, entryZone, zoneText, candleText }, gates, rr, stop, tp, walls);
+    confirmWatch(watch, { executable, spread }, { ...model, validated, entryZone, zoneText, candleText }, gates, rr, stop, tp, walls);
     return;
   }
   const reasonText = gates.reasons.join(" | ");
@@ -1118,7 +1145,7 @@ async function tickSetupWatch(watch) {
     notify(
       `<b>MODEL CONFIRMED — WAITING ON GATE</b>\n` +
         `<b>${htmlEscape(watch.symbol)}</b> ${htmlEscape(watch.direction.toUpperCase())}\n` +
-        `<b>Model:</b> ${htmlEscape(label)} ${htmlEscape(formatLevel(zone.low))} – ${htmlEscape(formatLevel(zone.high))}\n` +
+        `<b>Model:</b> ${htmlEscape(validation)}\n` +
         `<b>Blocked by:</b> ${htmlEscape(reasonText)}`,
       { dedupeKey: `${watch.id}:gate:${reasonText}` },
     );
@@ -1497,7 +1524,7 @@ const CUSTOM_TOOLS = [
         entry_zone_low: {
           type: "number",
           description:
-            "The prepared entry zone's lower edge (the FVG / OB / breaker range the entry sits in). Send it with entry_zone_high whenever the analysis has a zone: ENTER NOW then comes only when price retraces into this zone, after the monitor has validated the setup (liquidity taken, M5 CISD, an ICT entry model, an M5 engulfing, rejection or SMT divergence). The entry must lie inside the zone and the SL beyond it.",
+            "The prepared entry zone's lower edge (the FVG / OB / breaker range the entry sits in). Send it with entry_zone_high whenever the analysis has a zone: ENTER NOW then comes only when price retraces into this zone, after the monitor has validated the setup: liquidity taken, then either an M5 engulfing or rejection that traded into this zone, or an M5 CISD with an ICT entry model and an M5 engulfing, rejection or SMT divergence. The entry must lie inside the zone and the SL beyond it.",
         },
         entry_zone_high: {
           type: "number",
@@ -1878,7 +1905,7 @@ async function handleMcpRequest(req, res) {
       result: {
         protocolVersion: body.params?.protocolVersion || CONFIG.protocolVersion,
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.9.0" },
+        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.10.0" },
       },
     });
     return;
@@ -1973,7 +2000,7 @@ app.get("/health", async (req, res) => {
   const base = {
     status: SERVERLESS && !kv ? "storage_missing" : "ok",
     service: "watch-monitor-mcp",
-    version: "6.9.0",
+    version: "6.10.0",
     runtime: SERVERLESS ? "vercel" : "node",
     watches: setups.length,
     last_tick_at: SERVERLESS ? lastTickAt : undefined,
