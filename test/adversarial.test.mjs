@@ -21,6 +21,7 @@ import {
   entryModel,
   oteZone,
   lowHangingFruit,
+  manageTrade,
   evaluateSafety,
   inducement,
   killZoneStatus,
@@ -887,7 +888,7 @@ test("MODEL INVERSION — a gap of the move into the low, closed through, flips 
     [107.2, 107.6, 102.4, 106.3],
   ];
   const model = entryModel(m1Bars(rows), "buy", TOUCH);
-  assert.deepEqual([model.zone.model, model.zone.low, model.zone.high, model.zone.stop], ["IFVG", 105.3, 105.6, 105.3], "stop just under the inversion");
+  assert.deepEqual([model.zone.model, model.zone.low, model.zone.high, model.zone.stop], ["IFVG", 105.3, 105.6, 99], "the stop goes under the swing low, not the inversion's edge");
 });
 
 test("MODEL UNICORN — the leg's FVG where it overlaps the breaker, as the guide draws it", () => {
@@ -898,9 +899,9 @@ test("MODEL UNICORN — the leg's FVG where it overlaps the breaker, as the guid
     [107.5, 108, 106, 106.2], // gap 103.5–106 now reaches into the breaker
   ];
   // Breaker: the up-close run into the 107 high and the down-close candle at
-  // its top, bodies 104.8–106.8; the stop goes under its 104.6 wick.
+  // its top, bodies 104.8–106.8. The stop still goes under the 99 swing.
   const model = entryModel(m1Bars(rows), "buy", TOUCH);
-  assert.deepEqual([model.zone.model, model.zone.low, model.zone.high, model.zone.stop], ["Unicorn", 104.8, 106, 104.6]);
+  assert.deepEqual([model.zone.model, model.zone.low, model.zone.high, model.zone.stop], ["Unicorn", 104.8, 106, 99]);
 });
 
 test("MODEL OTE — the 62–79% of the H1 dealing range, 0.705 the sweet spot", () => {
@@ -979,4 +980,46 @@ test("TARGET — low-hanging fruit: the nearest untaken pool, or a nearer H1 gap
   assert.deepEqual(lowHangingFruit({ ...map, h1_imbalances: { above: [], below: [] } }, "buy", 105), { level: 110, what: "M15 swing high" });
   assert.deepEqual(lowHangingFruit(map, "sell", 105), { level: 95, what: "EQL" });
   assert.equal(lowHangingFruit(map, "buy", 120), null, "nothing left above: no made-up target");
+});
+
+// ---------------------------------------------------------------------------
+// After ENTER NOW: the monitor keeps watching the trade the human took.
+
+const SELL_TRADE = { direction: "sell", entry: 100, sl: 104, risk: 4, targets: [90, 85], hit: 0, enteredAt: T0 };
+const RUN_DOWN = [
+  [100, 100.2, 98.4, 98.6],
+  [98.6, 98.7, 97.4, 97.6],
+  [97.6, 98.9, 97.5, 98.7], // lower high 98.9
+  [98.7, 98.8, 96.2, 96.4],
+  [96.4, 96.5, 95.2, 95.4], // best price 95.2: 1.2R in favour
+  [95.4, 97.2, 95.3, 97], // bounces, still under 98.9
+];
+
+test("TRADE — where price stops and turns back, CLOSE NOW", () => {
+  const holding = manageTrade(SELL_TRADE, m1Bars(RUN_DOWN), { mid: 97, protective: 97.1 });
+  assert.deepEqual([holding.action, holding.best], ["HOLD", 95.2]);
+  const turned = manageTrade(SELL_TRADE, m1Bars([...RUN_DOWN, [97, 99.2, 96.9, 99.1]]), { mid: 99.1, protective: 99.2 });
+  assert.deepEqual([turned.action, turned.level, turned.price], ["REVERSAL", 98.9, 99.2], "a body close above the lower high into the low");
+  assert.equal(
+    manageTrade(SELL_TRADE, m1Bars([...RUN_DOWN, [97, 99.2, 96.9, 99.1]]), { mid: 99.1, protective: 99.2 }, { armR: 2 }).action,
+    "HOLD",
+    "before the trade has run far enough, only the stop can close it",
+  );
+});
+
+test("TRADE — stop, targets, and the stop at breakeven after the first one", () => {
+  assert.deepEqual(manageTrade(SELL_TRADE, [], { mid: 103.9, protective: 104 }), { action: "STOP", price: 104, best: 103.9 });
+  assert.equal(manageTrade(SELL_TRADE, [], { mid: 90, protective: 90.1 }).action, "TARGET");
+  assert.equal(manageTrade({ ...SELL_TRADE, hit: 1, sl: 100 }, [], { mid: 85, protective: 85.1 }).action, "FINAL");
+  assert.equal(manageTrade({ ...SELL_TRADE, hit: 1, sl: 100 }, [], { mid: 99.9, protective: 100 }).action, "STOP", "back to the entry after TP1: out at breakeven");
+});
+
+test("ENTRY ZONE — the analysis's prepared zone is kept, and must make sense", () => {
+  const base = { symbol: "XAUUSD", direction: "sell", entry: 4020.3, sl: 4028.8, tp1: 4002.09, sweep_level: 4024.48 };
+  const input = validateWatchInput({ ...base, entry_zone_low: 4019.82, entry_zone_high: 4021.37 });
+  assert.deepEqual([input.entry_zone_low, input.entry_zone_high], [4019.82, 4021.37]);
+  assert.equal(validateWatchInput(base).entry_zone_low, null, "optional");
+  assert.throws(() => validateWatchInput({ ...base, entry_zone_low: 4019.82 }), /go together/);
+  assert.throws(() => validateWatchInput({ ...base, entry_zone_low: 4021, entry_zone_high: 4022 }), /inside the entry zone/);
+  assert.throws(() => validateWatchInput({ ...base, entry_zone_low: 4019, entry_zone_high: 4029 }), /beyond the entry zone/);
 });

@@ -153,7 +153,7 @@ const upstream = createServer((req, res) => {
             ? bars(60, PERIOD_SPAN[args.period], price)
             : args.period === "M_1"
               ? scriptedM1(80)
-              : bars(60, PERIOD_SPAN[args.period], 4420);
+              : bars(60, PERIOD_SPAN[args.period], 4440); // the higher timeframes' pools sit ~4443
         return reply({ content: [{ type: "text", text: JSON.stringify(candles) }] });
       }
       return reply({ content: [{ type: "text", text: "{}" }] });
@@ -612,17 +612,31 @@ assert(!(await scenarioWatch()).resolved, "the move away from the zone is never 
 price = 4421; // the retrace into the FVG
 await sleep(3000); // past the spot cache and the fast checks
 await tick();
-const confirmed = (await scenarioWatch()).resolved;
-assert(confirmed?.status === "CONFIRMED", `retrace into the FVG: REAL CONFIRMATION — ENTER NOW (${confirmed?.status ?? (await scenarioWatch()).active?.lastReason})`);
-assert(confirmed?.rr_at_entry >= 1, `entered in the zone with R:R ${confirmed?.rr_at_entry} to TP1`);
+const open = (await scenarioWatch()).active;
+const trade = open?.trade;
+assert(open?.lifecycle === "IN_TRADE", `retrace into the FVG: REAL CONFIRMATION — ENTER NOW, and the trade stays watched (${open?.lifecycle ?? (await scenarioWatch()).resolved?.status})`);
+assert(trade?.rr_at_entry >= 1, `entered in the zone with R:R ${trade?.rr_at_entry} to TP1`);
 assert(
-  Math.abs(confirmed?.sl_sent - 4410.7) < 0.01,
-  `the 2022 model's stop: under the 4411 swing low by spread + tolerance, not the registered 4400 (${confirmed?.sl_sent})`,
+  Math.abs(trade?.sl - 4410.7) < 0.01,
+  `the stop: under the 4411 swing low by spread + tolerance, not the registered 4400 (${trade?.sl})`,
 );
 assert(
-  confirmed?.low_hanging_fruit?.level > confirmed?.resolvedPrice && confirmed.low_hanging_fruit.level < 4425,
-  `low-hanging fruit: the nearest untaken buy-side pool above the fill (${JSON.stringify(confirmed?.low_hanging_fruit)})`,
+  trade?.low_hanging_fruit?.level > trade?.entry && trade.low_hanging_fruit.level < 4451 && trade.targets[0] === trade.low_hanging_fruit.level,
+  `TP1 is the low-hanging fruit, the nearest untaken pool before the registered 4451 (${JSON.stringify(trade?.low_hanging_fruit)}, targets ${trade?.targets})`,
 );
+
+console.log("\n— managing the trade —");
+price = trade.targets[0] + 0.5; // TP1
+await sleep(3000);
+await tick();
+const afterTp1 = (await scenarioWatch()).active?.trade;
+assert(afterTp1?.hit === 1 && afterTp1.sl === afterTp1.entry, `TP1 hit: the stop moves to breakeven (${afterTp1?.hit}, SL ${afterTp1?.sl})`);
+
+price = trade.entry - 0.3; // back to the entry
+await sleep(3000);
+await tick();
+const closed = (await scenarioWatch()).resolved;
+assert(closed?.status === "BREAKEVEN" && closed.exit_reason === "STOP", `back at the entry after TP1: out at breakeven (${closed?.status} ${closed?.exit_reason})`);
 
 vercel.kill("SIGTERM");
 await sleep(500);

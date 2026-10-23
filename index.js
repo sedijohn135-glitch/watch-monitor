@@ -45,6 +45,7 @@ import {
   liquidityMap,
   liquidityTaken,
   lowHangingFruit,
+  manageTrade,
   marketRR,
   nyClock,
   newsBlackout,
@@ -92,6 +93,9 @@ const CONFIG = {
   // so a retrace into the zone between two minutes is not missed.
   fastIntervalMs: num(process.env.FAST_MODE_INTERVAL_MS, 15_000, 1000),
   fastWindowMs: num(process.env.FAST_MODE_WINDOW_MS, 50_000, 0),
+  // After ENTER NOW: how far in R the trade must have run before an M1
+  // structure shift against it triggers CLOSE NOW.
+  exitArmR: num(process.env.EXIT_ARM_R, 1, 0),
 
   priceScale: num(process.env.CTRADER_PRICE_SCALE, 100000, 1),
   scaleTolerance: num(process.env.SCALE_TOLERANCE, 0.35, 0.05),
@@ -355,37 +359,46 @@ function nyTime(nowMs = Date.now()) {
 }
 
 // Written to be acted on from a phone: everything MT5 needs, the price
-// beyond which not to chase, and why it fired.
-function confirmWatch(watch, quote, model, gates, rr, stop, fruit) {
+// beyond which not to chase, and why it fired. The watch is not resolved
+// here: from now on it is the trade the human took, managed tick by tick.
+function confirmWatch(watch, quote, model, gates, rr, stop, tp) {
   const buy = watch.direction === "buy";
   const fmt = (value) => htmlEscape(formatLevel(value));
+  // TP1 is the low-hanging fruit when there is one; the registered
+  // targets follow as the runners.
+  const runners = (tp.fruit ? [watch.tp1, watch.tp2, watch.tp3] : [watch.tp2, watch.tp3]).filter(Boolean);
   const targets =
-    `<b>TP1:</b> ${fmt(watch.tp1)}` +
-    (watch.tp2 ? ` | <b>TP2:</b> ${fmt(watch.tp2)}` : "") +
-    (watch.tp3 ? ` | <b>TP3:</b> ${fmt(watch.tp3)}` : "");
-  return resolveWatch(
-    watch,
-    "CONFIRMED",
-    {
-      resolvedPrice: quote.executable,
-      model: model.zone,
-      sl_sent: stop.sl,
-      low_hanging_fruit: fruit,
-      rr_at_entry: Number(rr.toFixed(2)),
-      structure_shift: model.mss,
-      gates: gates.summary,
-    },
+    `<b>TP1:</b> ${fmt(tp.level)} (${htmlEscape(tp.what)})` +
+    runners.map((level, index) => ` | <b>TP${index + 2}:</b> ${fmt(level)}`).join("");
+  watch.lifecycle = "IN_TRADE";
+  watch.status = "IN_TRADE";
+  watch.lastReason = "in_trade";
+  watch.lastGateBlockReason = null;
+  watch.trade = {
+    direction: watch.direction,
+    entry: quote.executable,
+    sl: stop.sl,
+    risk: Math.abs(quote.executable - stop.sl),
+    targets: [tp.level, ...runners],
+    hit: 0,
+    best: quote.executable,
+    enteredAt: Date.now(),
+    rr_at_entry: Number(rr.toFixed(2)),
+    model: model.zone,
+    entry_zone: model.entryZone,
+    low_hanging_fruit: tp.fruit ? watch.target : null,
+    structure_shift: model.mss,
+    gates: gates.summary,
+  };
+  store.dirty = true;
+  scheduleSave(true);
+  notify(
     `<b>🟢 REAL CONFIRMATION — ENTER NOW</b>\n` +
       `<b>${htmlEscape(watch.symbol)} ${buy ? "BUY" : "SELL"} at market</b> ≈ ${fmt(quote.executable)} (${buy ? "ask" : "bid"})\n` +
-      `<b>SL:</b> ${fmt(stop.sl)} — ${htmlEscape(stop.reason)} (risk ${fmt(Math.abs(quote.executable - stop.sl))})\n` +
+      `<b>SL:</b> ${fmt(stop.sl)} — ${htmlEscape(stop.reason)} (risk ${fmt(watch.trade.risk)})\n` +
       `${targets}\n` +
-      (fruit
-        ? `<b>Low-hanging fruit:</b> ${fmt(fruit.level)} (${htmlEscape(fruit.what)}) · R:R ${htmlEscape(
-            marketRR({ ...watch, sl: stop.sl, tp1: fruit.level }, quote.executable).toFixed(2),
-          )}\n`
-        : "") +
       `<b>R:R to TP1 now:</b> ${htmlEscape(rr.toFixed(2))}\n` +
-      `<b>Do not enter ${buy ? "above" : "below"}:</b> ${fmt(chaseLimit({ ...watch, sl: stop.sl }, CONFIG.minRrAtEntry))} ` +
+      `<b>Do not enter ${buy ? "above" : "below"}:</b> ${fmt(chaseLimit({ ...watch, sl: stop.sl, tp1: tp.level }, CONFIG.minRrAtEntry))} ` +
       `(R:R under ${htmlEscape(CONFIG.minRrAtEntry)})\n` +
       `<b>Checklist</b>\n` +
       `✅ Liquidity ${fmt(watch.sweep_level)} taken\n` +
@@ -393,11 +406,78 @@ function confirmWatch(watch, quote, model, gates, rr, stop, fruit) {
       `✅ MSS: M1 body close ${buy ? "above" : "below"} ${fmt(model.mss.level)}` +
       `${model.mss.via === "cisd" ? " (CISD)" : model.displaced ? " with displacement" : ""}\n` +
       `✅ ${htmlEscape(zoneLabel(model.zone))}: ${fmt(model.zone.low)} – ${fmt(model.zone.high)}\n` +
-      `✅ Price retraced into the zone\n` +
+      `✅ Price retraced into the entry zone ${htmlEscape(model.zoneText)}\n` +
       `✅ ${htmlEscape(gates.zone || "session filter off")} · news clear · spread ${fmt(quote.spread)}\n` +
       (watch.liquidity && watch.liquidity !== "N/A" ? `<b>Liquidity:</b> ${htmlEscape(watch.liquidity)}\n` : "") +
       `<b>Setup:</b> ${htmlEscape(watch.setup_model)} · conviction ${htmlEscape(watch.conviction)}\n` +
-      `<i>Sent ${nyTime()} New York. Use exactly this SL and TP in MT5.</i>`,
+      `<i>Sent ${nyTime()} New York. Use exactly this SL and TP in MT5. The monitor now manages the trade: ` +
+      `TP alerts, SL to breakeven after TP1, and CLOSE NOW if price stops and turns back.</i>`,
+    { dedupeKey: `${watch.id}:enter`, priority: "critical" },
+  );
+  return true;
+}
+
+// The trade after ENTER NOW, on every tick (fast mode keeps it at ~15 s):
+// the stop, each target, the stop at breakeven after the first, and the
+// exit where price stopped and turned back.
+async function manageOpenTrade(watch, { mainId, mid, executable, protective, now }) {
+  const trade = watch.trade;
+  const buy = trade.direction === "buy";
+  const raw = await market.bars(watch.symbol, mainId, "M1", 80);
+  const bars = closedSeries(raw || [], "M1", { nowMs: now, staleBars: Infinity }).bars;
+  const sinceMs = Math.max(trade.enteredAt, watch.lastTickAt ? Date.parse(watch.lastTickAt) : 0);
+  const seen = quotesWithGap(watch.direction, { mid, executable, protective }, bars, sinceMs);
+  const result = manageTrade(trade, bars, seen, { armR: CONFIG.exitArmR });
+  trade.best = result.best;
+  store.dirty = true;
+  noteDataQuality(watch, true);
+
+  const fmt = (value) => htmlEscape(formatLevel(value));
+  const inR = (price) => (buy ? price - trade.entry : trade.entry - price) / trade.risk;
+  const signedR = (price) => `${inR(price) >= 0 ? "+" : ""}${inR(price).toFixed(2)}R`;
+  const head = `<b>${htmlEscape(watch.symbol)} ${buy ? "BUY" : "SELL"}</b> from ${fmt(trade.entry)}`;
+
+  if (result.action === "HOLD") {
+    watch.lastReason = "in_trade";
+    return;
+  }
+  if (result.action === "TARGET") {
+    trade.hit += 1;
+    const first = trade.hit === 1;
+    if (first) trade.sl = trade.entry;
+    watch.lastReason = `tp${trade.hit}_hit`;
+    notify(
+      `<b>🎯 TP${trade.hit} HIT</b>\n${head}\n` +
+        `<b>At:</b> ${fmt(result.price)} (${signedR(result.price)})\n` +
+        (first
+          ? `<b>Close 50–80% and move the SL to breakeven ${fmt(trade.entry)}.</b>\n`
+          : `<b>Close part; the SL stays at breakeven.</b>\n`) +
+        `<i>Next: TP${trade.hit + 1} ${fmt(trade.targets[trade.hit])}</i>`,
+      { dedupeKey: `${watch.id}:tp${trade.hit}`, priority: "critical" },
+    );
+    return;
+  }
+
+  // STOP, FINAL or REVERSAL: the trade is over.
+  const exit = result.price;
+  const r = inR(exit);
+  const status = result.action === "STOP" && trade.hit > 0 ? "BREAKEVEN" : r > 0 ? "WIN" : r < 0 ? "LOSS" : "BREAKEVEN";
+  const title = {
+    STOP: trade.hit > 0 ? "⚪ STOPPED AT BREAKEVEN" : "❌ SL HIT",
+    FINAL: "🏁 FINAL TARGET HIT — CLOSE ALL",
+    REVERSAL: "🔴 CLOSE NOW — PRICE TURNED BACK",
+  }[result.action];
+  resolveWatch(
+    watch,
+    status,
+    { resolvedPrice: exit, exit_reason: result.action, result_r: Number(r.toFixed(2)), trade },
+    `<b>${title}</b>\n${head}\n` +
+      (result.action === "REVERSAL"
+        ? `<b>Close at market</b> ≈ ${fmt(exit)} — price stopped at ${fmt(result.best)} and an M1 candle closed back ` +
+          `${buy ? "below" : "above"} ${fmt(result.level)}\n`
+        : `<b>At:</b> ${fmt(exit)}\n`) +
+      `<b>Result:</b> ${signedR(exit)} on what is still open` +
+      (trade.hit ? ` (after TP${trade.hit}; SL was at breakeven)` : ""),
   );
 }
 
@@ -670,7 +750,7 @@ async function tickSetupWatch(watch) {
 
   // Expiry is checked before anything that can fail, so an unreachable
   // upstream can never keep a watch alive past its own deadline.
-  if (watch.expiresAt && now >= watch.expiresAt) {
+  if (watch.lifecycle !== "IN_TRADE" && watch.expiresAt && now >= watch.expiresAt) {
     watch.lastReason = "expired";
     expireWatch(watch, "Watch expiration reached");
     return;
@@ -720,6 +800,12 @@ async function tickSetupWatch(watch) {
     capOverride: finiteNumber(process.env[`SPREAD_CAP_${watch.symbol}`]),
   });
   watch.spreadSamples = spreadHealth.spreadSamples;
+
+  // After ENTER NOW the watch is the trade: its own stop, targets and exit.
+  if (watch.lifecycle === "IN_TRADE") {
+    await manageOpenTrade(watch, { mainId, mid, executable, protective, now });
+    return;
+  }
 
   // -- Safety first, in every lifecycle state -------------------------------
   //
@@ -852,29 +938,39 @@ async function tickSetupWatch(watch) {
 
   const zone = model.zone;
   const label = zoneLabel(zone);
+  // The analysis's prepared zone, when it gave one, is where the entry
+  // goes; the model is what validates the setup. Without one, the model's
+  // own zone.
+  const prepared = watch.entry_zone_low !== null && watch.entry_zone_low !== undefined;
+  const entryZone = prepared ? { low: watch.entry_zone_low, high: watch.entry_zone_high } : zone;
+  const zoneText = `${formatLevel(entryZone.low)} – ${formatLevel(entryZone.high)}${prepared ? " (prepared zone)" : ""}`;
   const buy = watch.direction === "buy";
-  // The stop the model gives (beyond the swing, the inversion or the
-  // breaker) plus spread and tolerance, never wider than the registered SL.
+  // The stop beyond the swing the reaction made, plus spread and
+  // tolerance, never wider than the registered SL.
   const buffer = tolerance + spread;
   const modelStop = buy ? Math.max(zone.stop - buffer, watch.sl) : Math.min(zone.stop + buffer, watch.sl);
+  const swingSide = buy ? "below the swing low" : "above the swing high";
   watch.lifecycle = "CONFIRMING";
   // Once per zone: the notifier's dedupe does not outlive a Vercel request.
+  // The target is looked up here, once, not on every fast check in the zone.
   const zoneKey = `${zone.model}:${zone.low}:${zone.high}`;
   if (watch.zoneNotified !== zoneKey) {
     watch.zoneNotified = zoneKey;
-    const fruit = await targetFor(watch, mainId, mid);
+    watch.target = await targetFor(watch, mainId, mid);
+    const tp = firstTarget(watch, watch.target, mid);
     notify(
       `<b>🟡 MSS + ${htmlEscape(label)} — ENTRY ZONE READY</b>\n` +
         `<b>${htmlEscape(watch.symbol)} ${htmlEscape(watch.direction.toUpperCase())}</b>\n` +
-        `<b>Zone:</b> ${htmlEscape(formatLevel(zone.low))} – ${htmlEscape(formatLevel(zone.high))}\n` +
-        `<b>SL:</b> ${htmlEscape(formatLevel(modelStop))} (${htmlEscape(stopReason(zone, buy))}) | <b>TP1:</b> ${htmlEscape(formatLevel(watch.tp1))}\n` +
-        (fruit ? `<b>Low-hanging fruit:</b> ${htmlEscape(formatLevel(fruit.level))} (${htmlEscape(fruit.what)})\n` : "") +
+        `<b>Entry zone:</b> ${htmlEscape(zoneText)}\n` +
+        (prepared ? `<b>Validated by:</b> ${htmlEscape(label)} ${htmlEscape(formatLevel(zone.low))} – ${htmlEscape(formatLevel(zone.high))}\n` : "") +
+        `<b>SL:</b> ${htmlEscape(formatLevel(modelStop))} (${swingSide})\n` +
+        `<b>TP1:</b> ${htmlEscape(formatLevel(tp.level))} (${htmlEscape(tp.what)})\n` +
         `<i>Not an entry yet. ENTER NOW comes when price retraces into the zone.</i>`,
-      );
+    );
   }
 
   // Step 4: enter on the retrace into the zone — never on the move away.
-  if (executable < zone.low - tolerance || executable > zone.high + tolerance) {
+  if (executable < entryZone.low - tolerance || executable > entryZone.high + tolerance) {
     watch.lastReason = "awaiting_retrace";
     return;
   }
@@ -884,22 +980,26 @@ async function tickSetupWatch(watch) {
   const tooTight = Math.abs(executable - modelStop) < 3 * spread;
   const stop = {
     sl: tooTight ? watch.sl : modelStop,
-    reason: tooTight ? "registered SL — the model stop is within 3 spreads" : stopReason(zone, buy),
+    reason: tooTight ? "registered SL — the swing stop is within 3 spreads" : swingSide,
   };
+  // TP1 is the guide's low-hanging fruit; R:R and the do-not-chase price
+  // are measured to it and to the stop actually sent.
+  const tp = firstTarget(watch, watch.target, executable);
+  const plan = { ...watch, sl: stop.sl, tp1: tp.level };
   const gates = await applyExternalGates(watch, spread);
-  const rr = marketRR({ ...watch, sl: stop.sl }, executable);
+  const rr = marketRR(plan, executable);
   watch.rrAtMarket = Number(rr.toFixed(2));
   if (rr < CONFIG.minRrAtEntry) {
     gates.pass = false;
     // Stable wording: the block notice is sent once per distinct reason,
     // and a live number in it would resend it every tick.
     gates.reasons.unshift(
-      `R:R at market below ${CONFIG.minRrAtEntry} (price ran past ${formatLevel(chaseLimit({ ...watch, sl: stop.sl }, CONFIG.minRrAtEntry))}) — do not chase; waiting for a pullback`,
+      `R:R to TP1 below ${CONFIG.minRrAtEntry} (price is past ${formatLevel(chaseLimit(plan, CONFIG.minRrAtEntry))}) — do not chase; waiting for a better price in the zone`,
     );
   }
   if (gates.pass) {
     watch.lastReason = "confirming";
-    confirmWatch(watch, { executable, spread }, model, gates, rr, stop, await targetFor(watch, mainId, executable));
+    confirmWatch(watch, { executable, spread }, { ...model, entryZone, zoneText }, gates, rr, stop, tp);
     return;
   }
   const reasonText = gates.reasons.join(" | ");
@@ -943,17 +1043,21 @@ async function targetFor(watch, symbolId, price) {
   }
 }
 
+// The low-hanging fruit when it lies between the price and the registered
+// TP1 (the nearer target comes first); otherwise the registered TP1.
+function firstTarget(watch, fruit, price) {
+  const buy = watch.direction === "buy";
+  const usable = fruit && (buy ? fruit.level > price && fruit.level < watch.tp1 : fruit.level < price && fruit.level > watch.tp1);
+  return usable
+    ? { level: fruit.level, what: `low-hanging fruit · ${fruit.what}`, fruit: true }
+    : { level: watch.tp1, what: "registered TP1", fruit: false };
+}
+
 function zoneLabel(zone) {
   const name = { FVG: "2022 model · FVG", IFVG: "Inversion · IFVG", Unicorn: "Unicorn · breaker + FVG", OB: "Order Block" }[
     zone.model
   ];
   return zone.ote ? `OTE 62–79% · ${name}` : name;
-}
-
-function stopReason(zone, buy) {
-  if (zone.model === "IFVG") return buy ? "below the inversion" : "above the inversion";
-  if (zone.model === "Unicorn") return buy ? "below the breaker" : "above the breaker";
-  return buy ? "below the swing low" : "above the swing high";
 }
 
 // ---------------------------------------------------------------------------
@@ -1242,6 +1346,15 @@ const CUSTOM_TOOLS = [
           type: "number",
           description:
             "REQUIRED. The liquidity whose stops must be taken before this entry may confirm: the IDM / sell-side low for a buy, the IDM / buy-side high for a sell. Must sit between sl and tp1. No liquidity taken, no ENTER NOW.",
+        },
+        entry_zone_low: {
+          type: "number",
+          description:
+            "The prepared entry zone's lower edge (the FVG / OB / breaker range the entry sits in). Send it with entry_zone_high whenever the analysis has a zone: ENTER NOW then comes only when price retraces into this zone, after the monitor has validated the setup (liquidity taken, M1 MSS, an ICT entry model). The entry must lie inside the zone and the SL beyond it.",
+        },
+        entry_zone_high: {
+          type: "number",
+          description: "The prepared entry zone's upper edge. Goes together with entry_zone_low.",
         },
         liquidity_taken: {
           type: "boolean",
@@ -1618,7 +1731,7 @@ async function handleMcpRequest(req, res) {
       result: {
         protocolVersion: body.params?.protocolVersion || CONFIG.protocolVersion,
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.4.0" },
+        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.5.0" },
       },
     });
     return;
@@ -1713,7 +1826,7 @@ app.get("/health", async (req, res) => {
   const base = {
     status: SERVERLESS && !kv ? "storage_missing" : "ok",
     service: "watch-monitor-mcp",
-    version: "6.4.0",
+    version: "6.5.0",
     runtime: SERVERLESS ? "vercel" : "node",
     watches: setups.length,
     last_tick_at: SERVERLESS ? lastTickAt : undefined,
@@ -1797,9 +1910,13 @@ app.all("/tick", async (req, res) => {
 
 async function runTick() {
   await runDueWatches();
-  // A ready zone makes the watch hot: the retrace into it is the one step
-  // a once-a-minute check can miss.
-  return { watches: store.setups.size, hot: store.active().some((watch) => watch.lifecycle === "CONFIRMING") };
+  // A ready zone or an open trade makes the watch hot: the retrace into
+  // the zone and the turn that closes the trade are what a once-a-minute
+  // check can miss.
+  return {
+    watches: store.setups.size,
+    hot: store.active().some((watch) => watch.lifecycle === "CONFIRMING" || watch.lifecycle === "IN_TRADE"),
+  };
 }
 
 // Fast mode. The cron must be answered within its 30 s timeout, so the
