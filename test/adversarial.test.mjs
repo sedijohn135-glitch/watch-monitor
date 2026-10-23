@@ -20,6 +20,7 @@ import {
   closedSeries,
   entryModel,
   oteZone,
+  lowHangingFruit,
   evaluateSafety,
   inducement,
   killZoneStatus,
@@ -546,7 +547,7 @@ test("ENTRY — structure shift needs a body close beyond the last swing into th
   ];
   const bars = shape.map(([o, h, l, c], i) => bar(start + i * M1, o, h, l, c));
   const touch = start + 4 * M1;
-  assert.deepEqual(structureShift(bars.slice(0, 7), "buy", touch), { shifted: false, level: 101, at: null }, "a wick is not a shift");
+  assert.deepEqual(structureShift(bars.slice(0, 7), "buy", touch), { shifted: false, level: 101, at: null, via: "swing" }, "a wick is not a shift");
   const shift = structureShift(bars, "buy", touch);
   assert.equal(shift.shifted, true);
   assert.equal(shift.at, start + 7 * M1);
@@ -560,6 +561,7 @@ test("ENTRY — structure shift needs a body close beyond the last swing into th
   const cisd = structureShift(straight, "buy", start + 2 * M1);
   assert.equal(cisd.level, 103);
   assert.equal(cisd.shifted, true);
+  assert.equal(cisd.via, "cisd");
 });
 
 test("ENTRY — R:R is measured at the market price the human will actually get", () => {
@@ -929,4 +931,52 @@ test("MODEL OTE — a low inside the OTE band makes the order block an entry; ou
     "the down-close candle at the 99 low the displacement left from",
   );
   assert.equal(entryModel(m1Bars(rows), "buy", TOUCH, { ote: { low: 101, high: 104 } }).zone, null, "a low outside the band: no OTE, no OB");
+});
+
+test("MODEL 2022 — an MSS without a displacement candle is not the 2022 model", () => {
+  // Up into the 107 swing in small candles that still leave gaps.
+  const rows = [
+    ...DECLINE,
+    [99.8, 101.2, 99.7, 101],
+    [102, 103.4, 101.9, 103.2],
+    [104.2, 105.5, 104.1, 105.3],
+    [105.4, 107.6, 104.5, 107.4], // closes above 107: an MSS, but every body is under 2× the average
+  ];
+  const model = entryModel(m1Bars(rows), "buy", TOUCH);
+  assert.equal(model.mss.via, "swing");
+  assert.equal(model.displaced, false);
+  assert.equal(model.zone, null, "gaps 101.2–104.1 and 103.4–104.5 exist, but no 2022 entry without displacement");
+});
+
+test("MODEL 2022 — a CISD is not the 2022 model's MSS; under OTE it is enough", () => {
+  // A straight drop to 98 with no swing high, then displacement and a gap.
+  const rows = [
+    [103, 103.2, 101.8, 102],
+    [102, 102.9, 100.4, 100.6],
+    [100.6, 101.9, 98, 98.2],
+    [98.2, 101.5, 98.1, 101.3],
+    [101.3, 104, 102, 103.8], // closes above the 103 CISD level, gap 101.9–102
+  ];
+  const touch = T0 + 2 * M1;
+  const plain = entryModel(m1Bars(rows), "buy", touch);
+  assert.equal(plain.mss.via, "cisd");
+  assert.equal(plain.displaced, true);
+  assert.equal(plain.zone, null, "the 2022 model breaks a swing; a CISD alone does not qualify");
+  const inOte = entryModel(m1Bars(rows), "buy", touch, { ote: { low: 97, high: 99 } });
+  assert.deepEqual([inOte.zone.model, inOte.zone.low, inOte.zone.high, inOte.zone.ote], ["FVG", 101.9, 102, true], "OTE: MSS/CISD and the FVG");
+});
+
+test("TARGET — low-hanging fruit: the nearest untaken pool, or a nearer H1 gap", () => {
+  const map = {
+    buy_side_untaken: [
+      { level: 110, sources: ["M15 swing high"] },
+      { level: 115, sources: ["H1 swing high", "M15 swing high"], equal: "EQH" },
+    ],
+    sell_side_untaken: [{ level: 95, sources: ["Asia low"], equal: "EQL" }],
+    h1_imbalances: { above: [{ from: 108, to: 109 }], below: [] },
+  };
+  assert.deepEqual(lowHangingFruit(map, "buy", 105), { level: 108, what: "H1 FVG" });
+  assert.deepEqual(lowHangingFruit({ ...map, h1_imbalances: { above: [], below: [] } }, "buy", 105), { level: 110, what: "M15 swing high" });
+  assert.deepEqual(lowHangingFruit(map, "sell", 105), { level: 95, what: "EQL" });
+  assert.equal(lowHangingFruit(map, "buy", 120), null, "nothing left above: no made-up target");
 });

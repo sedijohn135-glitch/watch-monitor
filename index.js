@@ -44,6 +44,7 @@ import {
   killZoneStatus,
   liquidityMap,
   liquidityTaken,
+  lowHangingFruit,
   marketRR,
   nyClock,
   newsBlackout,
@@ -355,7 +356,7 @@ function nyTime(nowMs = Date.now()) {
 
 // Written to be acted on from a phone: everything MT5 needs, the price
 // beyond which not to chase, and why it fired.
-function confirmWatch(watch, quote, model, gates, rr, stop) {
+function confirmWatch(watch, quote, model, gates, rr, stop, fruit) {
   const buy = watch.direction === "buy";
   const fmt = (value) => htmlEscape(formatLevel(value));
   const targets =
@@ -369,6 +370,7 @@ function confirmWatch(watch, quote, model, gates, rr, stop) {
       resolvedPrice: quote.executable,
       model: model.zone,
       sl_sent: stop.sl,
+      low_hanging_fruit: fruit,
       rr_at_entry: Number(rr.toFixed(2)),
       structure_shift: model.mss,
       gates: gates.summary,
@@ -377,13 +379,19 @@ function confirmWatch(watch, quote, model, gates, rr, stop) {
       `<b>${htmlEscape(watch.symbol)} ${buy ? "BUY" : "SELL"} at market</b> ≈ ${fmt(quote.executable)} (${buy ? "ask" : "bid"})\n` +
       `<b>SL:</b> ${fmt(stop.sl)} — ${htmlEscape(stop.reason)} (risk ${fmt(Math.abs(quote.executable - stop.sl))})\n` +
       `${targets}\n` +
+      (fruit
+        ? `<b>Low-hanging fruit:</b> ${fmt(fruit.level)} (${htmlEscape(fruit.what)}) · R:R ${htmlEscape(
+            marketRR({ ...watch, sl: stop.sl, tp1: fruit.level }, quote.executable).toFixed(2),
+          )}\n`
+        : "") +
       `<b>R:R to TP1 now:</b> ${htmlEscape(rr.toFixed(2))}\n` +
       `<b>Do not enter ${buy ? "above" : "below"}:</b> ${fmt(chaseLimit({ ...watch, sl: stop.sl }, CONFIG.minRrAtEntry))} ` +
       `(R:R under ${htmlEscape(CONFIG.minRrAtEntry)})\n` +
       `<b>Checklist</b>\n` +
       `✅ Liquidity ${fmt(watch.sweep_level)} taken\n` +
       `✅ Entry ${fmt(watch.entry)} touched\n` +
-      `✅ MSS: M1 body close ${buy ? "above" : "below"} ${fmt(model.mss.level)}\n` +
+      `✅ MSS: M1 body close ${buy ? "above" : "below"} ${fmt(model.mss.level)}` +
+      `${model.mss.via === "cisd" ? " (CISD)" : model.displaced ? " with displacement" : ""}\n` +
       `✅ ${htmlEscape(zoneLabel(model.zone))}: ${fmt(model.zone.low)} – ${fmt(model.zone.high)}\n` +
       `✅ Price retraced into the zone\n` +
       `✅ ${htmlEscape(gates.zone || "session filter off")} · news clear · spread ${fmt(quote.spread)}\n` +
@@ -854,11 +862,13 @@ async function tickSetupWatch(watch) {
   const zoneKey = `${zone.model}:${zone.low}:${zone.high}`;
   if (watch.zoneNotified !== zoneKey) {
     watch.zoneNotified = zoneKey;
+    const fruit = await targetFor(watch, mainId, mid);
     notify(
       `<b>🟡 MSS + ${htmlEscape(label)} — ENTRY ZONE READY</b>\n` +
         `<b>${htmlEscape(watch.symbol)} ${htmlEscape(watch.direction.toUpperCase())}</b>\n` +
         `<b>Zone:</b> ${htmlEscape(formatLevel(zone.low))} – ${htmlEscape(formatLevel(zone.high))}\n` +
         `<b>SL:</b> ${htmlEscape(formatLevel(modelStop))} (${htmlEscape(stopReason(zone, buy))}) | <b>TP1:</b> ${htmlEscape(formatLevel(watch.tp1))}\n` +
+        (fruit ? `<b>Low-hanging fruit:</b> ${htmlEscape(formatLevel(fruit.level))} (${htmlEscape(fruit.what)})\n` : "") +
         `<i>Not an entry yet. ENTER NOW comes when price retraces into the zone.</i>`,
       );
   }
@@ -889,7 +899,7 @@ async function tickSetupWatch(watch) {
   }
   if (gates.pass) {
     watch.lastReason = "confirming";
-    confirmWatch(watch, { executable, spread }, model, gates, rr, stop);
+    confirmWatch(watch, { executable, spread }, model, gates, rr, stop, await targetFor(watch, mainId, executable));
     return;
   }
   const reasonText = gates.reasons.join(" | ");
@@ -903,6 +913,33 @@ async function tickSetupWatch(watch) {
         `<b>Blocked by:</b> ${htmlEscape(reasonText)}`,
       { dedupeKey: `${watch.id}:gate:${reasonText}` },
     );
+  }
+}
+
+// The guide's target from the same liquidity map the analysis reads. Only
+// fetched when a zone appears and on ENTER NOW, so it costs next to
+// nothing; a failure leaves the line out rather than delaying the entry.
+async function targetFor(watch, symbolId, price) {
+  try {
+    const nowMs = Date.now();
+    const raw = Object.fromEntries(
+      await Promise.all(
+        ["D1", "H1", "M15"].map(async (tf) => [tf, await market.history(watch.symbol, symbolId, tf, SNAPSHOT_BARS[tf])]),
+      ),
+    );
+    const closedOf = (tf) => closedSeries(raw[tf] || [], tf, { nowMs, staleBars: Infinity }).bars;
+    const map = liquidityMap({
+      d1: closedOf("D1"),
+      h1: closedOf("H1"),
+      m15: closedOf("M15"),
+      price,
+      nowMs,
+      equalTolerance: Math.max(priceTolerance(watch.symbol, price), calcATR(closedOf("H1"), 14) * 0.1),
+    });
+    return lowHangingFruit(map, watch.direction, price);
+  } catch (error) {
+    log(`low-hanging fruit for ${watch.id} unavailable: ${error.message}`);
+    return null;
   }
 }
 
@@ -1581,7 +1618,7 @@ async function handleMcpRequest(req, res) {
       result: {
         protocolVersion: body.params?.protocolVersion || CONFIG.protocolVersion,
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.3.0" },
+        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.4.0" },
       },
     });
     return;
@@ -1676,7 +1713,7 @@ app.get("/health", async (req, res) => {
   const base = {
     status: SERVERLESS && !kv ? "storage_missing" : "ok",
     service: "watch-monitor-mcp",
-    version: "6.3.0",
+    version: "6.4.0",
     runtime: SERVERLESS ? "vercel" : "node",
     watches: setups.length,
     last_tick_at: SERVERLESS ? lastTickAt : undefined,

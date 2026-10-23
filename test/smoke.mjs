@@ -619,6 +619,10 @@ assert(
   Math.abs(confirmed?.sl_sent - 4410.7) < 0.01,
   `the 2022 model's stop: under the 4411 swing low by spread + tolerance, not the registered 4400 (${confirmed?.sl_sent})`,
 );
+assert(
+  confirmed?.low_hanging_fruit?.level > confirmed?.resolvedPrice && confirmed.low_hanging_fruit.level < 4425,
+  `low-hanging fruit: the nearest untaken buy-side pool above the fill (${JSON.stringify(confirmed?.low_hanging_fruit)})`,
+);
 
 vercel.kill("SIGTERM");
 await sleep(500);
