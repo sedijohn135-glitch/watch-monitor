@@ -1555,7 +1555,7 @@ async function handleMcpRequest(req, res) {
       result: {
         protocolVersion: body.params?.protocolVersion || CONFIG.protocolVersion,
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.2.0" },
+        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.2.1" },
       },
     });
     return;
@@ -1650,7 +1650,7 @@ app.get("/health", async (req, res) => {
   const base = {
     status: SERVERLESS && !kv ? "storage_missing" : "ok",
     service: "watch-monitor-mcp",
-    version: "6.2.0",
+    version: "6.2.1",
     runtime: SERVERLESS ? "vercel" : "node",
     watches: setups.length,
     last_tick_at: SERVERLESS ? lastTickAt : undefined,
