@@ -30,17 +30,11 @@ import { randomUUID, timingSafeEqual } from "node:crypto";
 
 import {
   PERIOD_MS,
-  advanceGeneration,
   barIsClosed,
   calcATR,
-  checkAcceptance,
-  checkCISD,
   chaseLimit,
-  checkSMT,
-  classifyEngulfing,
-  classifyWick,
   closedSeries,
-  evaluateConfirmation,
+  entryModel,
   evaluateSafety,
   finiteNumber,
   formatLevel,
@@ -55,7 +49,6 @@ import {
   periodMs,
   priceTolerance,
   quotesWithGap,
-  structureShift,
   symbolCurrencies,
   updateSpreadHealth,
   validateWatchInput,
@@ -88,7 +81,7 @@ const CONFIG = {
   tickMs: num(process.env.SCHEDULER_TICK_MS, 2500, 1000),
   setupIntervalMs: num(process.env.WATCH_INTERVAL_MS, 10000, 3000),
   // Vercel only: a tick gap longer than this means the external cron
-  // stopped, so evidence is discarded as it is after a restart.
+  // stopped; the watches restart from live data as after a restart.
   maxTickGapMs: num(process.env.MAX_TICK_GAP_MS, 5 * 60_000, 90_000),
 
   priceScale: num(process.env.CTRADER_PRICE_SCALE, 100000, 1),
@@ -109,11 +102,6 @@ const CONFIG = {
     ETHUSD: 10029,
   },
 
-  minConfirmationHoldMs: num(process.env.MIN_CONFIRMATION_HOLD_MS, 60000, 0),
-  requireNewBar: process.env.REQUIRE_NEW_M1_CANDLE !== "false",
-  acceptanceAtrFraction: num(process.env.ACCEPTANCE_ATR_FRACTION, 0.5, 0.05),
-  acceptanceRiskFraction: num(process.env.ACCEPTANCE_RISK_FRACTION, 0.35, 0.05),
-  evidenceFadeAtrFraction: num(process.env.EVIDENCE_FADE_ATR_FRACTION, 0.25, 0),
   // ENTER NOW means "enter at market when you read this": below this R:R
   // to TP1 at the live price, the move already happened.
   minRrAtEntry: num(process.env.MIN_RR_AT_ENTRY, 1, 0),
@@ -359,7 +347,7 @@ function nyTime(nowMs = Date.now()) {
 
 // Written to be acted on from a phone: everything MT5 needs, the price
 // beyond which not to chase, and why it fired.
-function confirmWatch(watch, quote, result, gates, mss, rr) {
+function confirmWatch(watch, quote, model, gates, rr) {
   const buy = watch.direction === "buy";
   const fmt = (value) => htmlEscape(formatLevel(value));
   const targets =
@@ -371,10 +359,9 @@ function confirmWatch(watch, quote, result, gates, mss, rr) {
     "CONFIRMED",
     {
       resolvedPrice: quote.executable,
-      signals: result.signals,
-      strength: result.strength,
+      model: model.zone,
       rr_at_entry: Number(rr.toFixed(2)),
-      structure_shift: mss,
+      structure_shift: model.mss,
       gates: gates.summary,
     },
     `<b>🟢 REAL CONFIRMATION — ENTER NOW</b>\n` +
@@ -387,11 +374,12 @@ function confirmWatch(watch, quote, result, gates, mss, rr) {
       `<b>Checklist</b>\n` +
       `✅ Liquidity ${fmt(watch.sweep_level)} taken\n` +
       `✅ Entry ${fmt(watch.entry)} touched\n` +
-      `✅ M1 structure shift: body close ${buy ? "above" : "below"} ${fmt(mss.level)}\n` +
-      `✅ ${htmlEscape(result.signals.join(" + "))}\n` +
+      `✅ MSS: M1 body close ${buy ? "above" : "below"} ${fmt(model.mss.level)}\n` +
+      `✅ ${htmlEscape(zoneLabel(model.zone))}: ${fmt(model.zone.low)} – ${fmt(model.zone.high)}\n` +
+      `✅ Price retraced into the zone\n` +
       `✅ ${htmlEscape(gates.zone || "session filter off")} · news clear · spread ${fmt(quote.spread)}\n` +
       (watch.liquidity && watch.liquidity !== "N/A" ? `<b>Liquidity:</b> ${htmlEscape(watch.liquidity)}\n` : "") +
-      `<b>Setup:</b> ${htmlEscape(watch.setup_model)} · conviction ${htmlEscape(watch.conviction)} · ${htmlEscape(result.strength)}\n` +
+      `<b>Setup:</b> ${htmlEscape(watch.setup_model)} · conviction ${htmlEscape(watch.conviction)}\n` +
       `<i>Sent ${nyTime()} New York. Use exactly this SL and TP in MT5.</i>`,
   );
 }
@@ -671,9 +659,7 @@ async function tickSetupWatch(watch) {
     return;
   }
 
-  const bundle = SMT_BUNDLES[watch.symbol] || [];
-  const wanted = [watch.symbol, ...bundle.map((item) => item.symbol)];
-  const ids = await market.resolveSymbols(wanted);
+  const ids = await market.resolveSymbols([watch.symbol]);
   const mainId = ids.get(watch.symbol);
   if (mainId === undefined) {
     watch.lastReason = "symbol_unavailable";
@@ -723,7 +709,7 @@ async function tickSetupWatch(watch) {
   // v5 gated the entire tick on lifecycle ∈ {ARMED, TOUCHED}, so a watch
   // that reached CONFIRMING and was held by a gate stopped checking its
   // own stop loss, its invalidation, and its expiry — permanently. Safety
-  // now runs before evidence, on every tick, in ARMED, TOUCHED and
+  // now runs before the entry model, on every tick, in ARMED, TOUCHED and
   // CONFIRMING alike, and it runs even when the spread is abnormal: a bad
   // quote must not make the service ignore an adverse move.
   const sinceMs = watch.lastTickAt ? Date.parse(watch.lastTickAt) : watch.armedAtMs;
@@ -763,7 +749,7 @@ async function tickSetupWatch(watch) {
       `<b>ENTRY TOUCHED</b>\n` +
         `<b>${htmlEscape(watch.symbol)}</b> ${htmlEscape(watch.direction.toUpperCase())}\n` +
         `<b>Entry:</b> ${htmlEscape(formatLevel(watch.entry))} | <b>Price:</b> ${htmlEscape(formatLevel(safety.price))}\n` +
-        `<i>Waiting for persistent live confirmation.</i>`,
+        `<i>Next: liquidity taken → M1 MSS → FVG / IFVG / Unicorn → ENTER NOW on the retrace into it.</i>`,
       { dedupeKey: `${watch.id}:touched` },
     );
   } else if (safety.action === "WAIT") {
@@ -772,14 +758,14 @@ async function tickSetupWatch(watch) {
     return;
   }
 
-  // -- Evidence -------------------------------------------------------------
+  // -- The entry model -------------------------------------------------------
   const [m5raw, m1raw] = await Promise.all([
     market.bars(watch.symbol, mainId, "M5", 60),
     market.bars(watch.symbol, mainId, "M1", 80),
   ]);
   const m5 = closedSeries(m5raw || [], "M5", { nowMs: now });
   const m1 = closedSeries(m1raw || [], "M1", { nowMs: now, staleBars: 5 });
-  if (m5.status !== "OK" || m1.status !== "OK" || m5.bars.length < 20 || m1.bars.length < 20) {
+  if (m5.status !== "OK" || m1.status !== "OK" || m1.bars.length < 20) {
     watch.lastReason = `candles_${(m5.status !== "OK" ? m5.status : m1.status).toLowerCase()}`;
     noteDataQuality(
       watch,
@@ -792,28 +778,15 @@ async function tickSetupWatch(watch) {
   }
 
   // Candle bodies and the live quote must describe the same instrument.
-  // Disagreement here means one of the two feeds is wrong and neither can
-  // be used as evidence.
-  const barVsSpot = market.checkScale(m5.bars.at(-1).close, mid);
+  const barVsSpot = market.checkScale(m1.bars.at(-1).close, mid);
   if (!barVsSpot.ok) {
     watch.lastReason = "candle_spot_divergence";
     noteDataQuality(
       watch,
       false,
-      `candle close ${formatLevel(m5.bars.at(-1).close)} disagrees with live mid ${formatLevel(mid)}`,
+      `candle close ${formatLevel(m1.bars.at(-1).close)} disagrees with live mid ${formatLevel(mid)}`,
     );
     return;
-  }
-
-  const partners = [];
-  for (const item of bundle) {
-    const partnerId = ids.get(item.symbol);
-    if (partnerId === undefined) continue;
-    const bars = await market.bars(item.symbol, partnerId, "M5", 45);
-    const series = closedSeries(bars || [], "M5", { nowMs: now });
-    if (series.status === "OK" && series.bars.length >= 20) {
-      partners.push({ symbol: item.symbol, bars: series.bars, inverse: item.inverse === true });
-    }
   }
 
   // Only stops run after registration count, unless the caller said the
@@ -829,76 +802,55 @@ async function tickSetupWatch(watch) {
     );
   }
 
-  watch.generation = advanceGeneration(watch.generation || { generation: 0 }, m1.latestCloseMs);
-  const atrM5 = calcATR(m5.bars, 14);
-  // How far price may pull back before a seen signal counts as faded. The
-  // raw quote tolerance (0.10 on gold) is noise inside the 60s hold, so in
-  // v6.0 gold evidence was wiped before it could ever graduate.
-  const fadeBand = Math.max(tolerance, atrM5 * CONFIG.evidenceFadeAtrFraction);
-
-  const signals = {
-    cisd: checkCISD(m1.bars, watch.direction),
-    smt: checkSMT(m5.bars, partners, watch.direction),
-    engulfM5: classifyEngulfing(m5.bars, watch.direction, "M5"),
-    engulfM1: classifyEngulfing(m1.bars, watch.direction, "M1"),
-    wick: classifyWick(m5.bars.at(-1), atrM5, watch.direction),
-    acceptance: checkAcceptance(watch, mid, protective, atrM5, tolerance, {
-      atrFraction: CONFIG.acceptanceAtrFraction,
-      riskFraction: CONFIG.acceptanceRiskFraction,
-    }),
-  };
-
   if (spreadHealth.abnormal) {
-    // Evidence is not advanced on a bad quote — the acceptance term is
-    // derived from bid/ask and would be measuring the spread, not the
-    // market.
     watch.lastReason = "spread_abnormal";
     noteDataQuality(watch, false, `spread ${formatLevel(spread)} exceeds cap ${formatLevel(spreadHealth.cap)}`);
     return;
   }
   noteDataQuality(watch, true);
 
-  const result = evaluateConfirmation(watch, signals, {
-    mid,
-    tolerance: fadeBand,
-    nowMs: now,
-    generation: watch.generation.generation,
-    hasBarTime: watch.generation.hasBarTime,
-    minHoldMs: CONFIG.minConfirmationHoldMs,
-    requireNewBar: CONFIG.requireNewBar,
-  });
-  watch.evidence = result.evidence;
-  watch.lastSignals = result.signals;
-  const mss = structureShift(m1.bars, watch.direction, Date.parse(watch.entryTouchedAt));
-  watch.structureShift = mss;
+  // Step 1, liquidity grab: no stops run, no trade.
+  if (!watch.liquidityTaken) {
+    watch.lifecycle = "TOUCHED";
+    watch.lastReason = "awaiting_liquidity_sweep";
+    return;
+  }
+  // Steps 2–3: MSS, then the zone the displacement left. Read from closed
+  // M1 bars only, so a tick a minute late can neither miss nor invent it.
+  const model = entryModel(m1.bars, watch.direction, Date.parse(watch.entryTouchedAt));
+  watch.structureShift = model.mss;
+  watch.entryZone = model.zone;
   store.dirty = true;
-
-  if (!result.enter) {
-    // Evidence that had graduated and then decayed must walk the
-    // lifecycle backwards, visibly, rather than leaving the watch parked
-    // in CONFIRMING with nothing behind it.
-    if (watch.lifecycle === "CONFIRMING") {
-      watch.lifecycle = "TOUCHED";
-      watch.lastReason = "evidence_decayed";
-      watch.lastGateBlockReason = null;
-    } else {
-      watch.lastReason = "evidence_pending";
-    }
+  if (!model.mss.shifted || !model.zone) {
+    watch.lifecycle = "TOUCHED";
+    watch.lastGateBlockReason = null;
+    watch.lastReason = model.mss.shifted ? "awaiting_fvg" : "awaiting_structure_shift";
     return;
   }
 
-  // The two facts no evidence counter can stand in for: the stops were
-  // run, and order flow turned on a closed M1 body. Without both there is
-  // nothing to tell the human yet.
-  if (!watch.liquidityTaken || !mss.shifted) {
-    if (watch.lifecycle === "CONFIRMING") watch.lifecycle = "TOUCHED";
-    watch.lastReason = !watch.liquidityTaken ? "awaiting_liquidity_sweep" : "awaiting_structure_shift";
-    return;
-  }
-
+  const zone = model.zone;
+  const label = zoneLabel(zone);
   watch.lifecycle = "CONFIRMING";
-  watch.lastReason = "awaiting_gates";
+  // Once per zone: the notifier's dedupe does not outlive a Vercel request.
+  const zoneKey = `${zone.model}:${zone.low}:${zone.high}`;
+  if (watch.zoneNotified !== zoneKey) {
+    watch.zoneNotified = zoneKey;
+    notify(
+      `<b>🟡 MSS + ${htmlEscape(label)} — ENTRY ZONE READY</b>\n` +
+        `<b>${htmlEscape(watch.symbol)} ${htmlEscape(watch.direction.toUpperCase())}</b>\n` +
+        `<b>Zone:</b> ${htmlEscape(formatLevel(zone.low))} – ${htmlEscape(formatLevel(zone.high))}\n` +
+        `<b>SL:</b> ${htmlEscape(formatLevel(watch.sl))} | <b>TP1:</b> ${htmlEscape(formatLevel(watch.tp1))}\n` +
+        `<i>Not an entry yet. ENTER NOW comes when price retraces into the zone.</i>`,
+      );
+  }
 
+  // Step 4: enter on the retrace into the zone — never on the move away.
+  if (executable < zone.low - tolerance || executable > zone.high + tolerance) {
+    watch.lastReason = "awaiting_retrace";
+    return;
+  }
+
+  watch.lastReason = "awaiting_gates";
   const gates = await applyExternalGates(watch, spread);
   const rr = marketRR(watch, executable);
   watch.rrAtMarket = Number(rr.toFixed(2));
@@ -912,7 +864,7 @@ async function tickSetupWatch(watch) {
   }
   if (gates.pass) {
     watch.lastReason = "confirming";
-    confirmWatch(watch, { executable, spread }, result, gates, mss, rr);
+    confirmWatch(watch, { executable, spread }, model, gates, rr);
     return;
   }
   const reasonText = gates.reasons.join(" | ");
@@ -920,13 +872,18 @@ async function tickSetupWatch(watch) {
     watch.lastGateBlockReason = reasonText;
     watch.lastReason = "gate_blocked";
     notify(
-      `<b>TECHNICALLY CONFIRMED — WAITING ON GATE</b>\n` +
+      `<b>MODEL CONFIRMED — WAITING ON GATE</b>\n` +
         `<b>${htmlEscape(watch.symbol)}</b> ${htmlEscape(watch.direction.toUpperCase())}\n` +
-        `<b>Evidence:</b> ${htmlEscape(result.signals.join(" + "))}\n` +
+        `<b>Model:</b> ${htmlEscape(label)} ${htmlEscape(formatLevel(zone.low))} – ${htmlEscape(formatLevel(zone.high))}\n` +
         `<b>Blocked by:</b> ${htmlEscape(reasonText)}`,
       { dedupeKey: `${watch.id}:gate:${reasonText}` },
     );
   }
+}
+
+function zoneLabel(zone) {
+  const name = { FVG: "2022 model · FVG", IFVG: "Inversion · IFVG", Unicorn: "Unicorn · breaker + FVG" }[zone.model];
+  return zone.ote ? `${name} · OTE` : name;
 }
 
 // ---------------------------------------------------------------------------
@@ -1147,9 +1104,8 @@ async function withState(fn, { tick = false } = {}) {
   try {
     const parsed = await kv.get(STATE_KEY);
     const now = Date.now();
-    // Evidence means "held under continuous observation". If the cron
-    // stopped for longer than MAX_TICK_GAP_MS that is no longer true, so
-    // the tick treats the gap exactly like a restart of the old server.
+    // If the cron stopped for longer than MAX_TICK_GAP_MS the watches went
+    // unobserved, so the tick treats the gap exactly like a restart.
     const gapMs = parsed?.lastTickAt ? now - parsed.lastTickAt : null;
     const keepEvidence = !tick || gapMs === null || gapMs <= CONFIG.maxTickGapMs;
     const recovery = store.restore(parsed, { nowMs: now, keepEvidence });
@@ -1162,7 +1118,7 @@ async function withState(fn, { tick = false } = {}) {
           `<b>No /tick for:</b> ${Math.round(gapMs / 60000)} min\n` +
           `<b>Watches:</b> ${recovery.setups} active` +
           (recovery.expired ? ` · ${recovery.expired} expired during the gap` : "") +
-          `\n<i>Evidence was discarded and must re-accumulate. Check that the cron calling /tick is running.</i>`,
+          `\n<i>Nothing was checked during the gap; watches resume from live data now. Check that the cron calling /tick is running.</i>`,
         { priority: "critical" },
       );
     }
@@ -1192,7 +1148,7 @@ const CUSTOM_TOOLS = [
   {
     name: "register_watch",
     description:
-      "Registers a trading setup for live monitoring. The monitor tracks live price, safety levels, market evidence, and independent entry gates before sending a Telegram confirmation. Never places an order.",
+      "Registers a trading setup for live monitoring. The monitor waits for the ICT entry model on live M1 candles — liquidity taken, MSS, an FVG / IFVG / Unicorn zone, then the retrace into it — plus R:R, kill zone, news and spread, before sending a Telegram confirmation. Never places an order.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -1252,7 +1208,7 @@ const CUSTOM_TOOLS = [
   {
     name: "list_watches",
     description:
-      "Returns active setup watches, quarantined watches, bounded recent outcomes with their real status and evidence, and the monitor's own health (restart recovery, undelivered notifications, feed quality).",
+      "Returns active setup watches, quarantined watches, bounded recent outcomes with their real status, entry model and zone, and the monitor's own health (restart recovery, undelivered notifications, feed quality).",
     inputSchema: { type: "object", additionalProperties: false, properties: {} },
     annotations: { readOnlyHint: true, openWorldHint: false },
   },
@@ -1334,8 +1290,6 @@ function createSetupWatch(args) {
     entryTouchedAt: null,
     liquidityTaken: false,
     liquidityTakenAt: null,
-    evidence: {},
-    generation: { lastBarTimeMs: null, generation: 0, hasBarTime: false },
     spreadSamples: [],
     lastGoodUpdateAt: null,
     degradedSince: null,
@@ -1594,7 +1548,7 @@ async function handleMcpRequest(req, res) {
       result: {
         protocolVersion: body.params?.protocolVersion || CONFIG.protocolVersion,
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.1.0" },
+        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.2.0" },
       },
     });
     return;
@@ -1689,7 +1643,7 @@ app.get("/health", async (req, res) => {
   const base = {
     status: SERVERLESS && !kv ? "storage_missing" : "ok",
     service: "watch-monitor-mcp",
-    version: "6.1.0",
+    version: "6.2.0",
     runtime: SERVERLESS ? "vercel" : "node",
     watches: setups.length,
     last_tick_at: SERVERLESS ? lastTickAt : undefined,
@@ -1820,8 +1774,8 @@ function boot() {
         `<b>Recovered:</b> ${recovery.setups} setup watch(es)\n` +
         (recovery.expired ? `<b>Expired while offline:</b> ${recovery.expired}\n` : "") +
         `<b>Gap:</b> ${htmlEscape(offlineFor)}\n` +
-        `<i>Evidence was discarded and must re-accumulate under live observation. ` +
-        `Anything that happened during the gap was not seen — re-check any position manually.</i>`,
+        `<i>Watches resume from live candles. Anything that happened during the gap was not seen — ` +
+        `re-check any position manually.</i>`,
       { priority: "critical" },
     );
   }

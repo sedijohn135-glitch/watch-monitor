@@ -38,7 +38,9 @@ function bars(count, span, base) {
 // A scripted M1 path around minute `scenarioMinute` (bar A): a pullback
 // with one lower high (4419.60) into the POI, then bar A wicks to 4411 —
 // through the entry and the 4412 sell-side liquidity — and closes 4419.80,
-// above that lower high: sweep + structure shift + engulfing in one bar.
+// above that lower high: liquidity grab + MSS. Minute 1 is the
+// displacement, minute 2 leaves its low above bar A's high: the 2022
+// model's FVG, 4420–4421.5.
 let scenarioMinute = null;
 const SCRIPT = {
   "-6": [4419, 4419.2, 4418, 4418.3],
@@ -48,6 +50,8 @@ const SCRIPT = {
   "-2": [4416.4, 4416.6, 4415.2, 4415.5],
   "-1": [4415.5, 4415.6, 4414.6, 4414.8],
   0: [4414.6, 4420, 4411, 4419.8],
+  1: [4419.8, 4426, 4419.6, 4425.5],
+  2: [4425.5, 4428, 4421.5, 4427],
 };
 function scriptedM1(count) {
   const lastOpen = Math.floor(NOW() / 60_000) * 60_000;
@@ -217,7 +221,6 @@ const env = {
   TELEGRAM_CHAT_ID: "1",
   SCHEDULER_TICK_MS: "1000",
   WATCH_INTERVAL_MS: "3000",
-  MIN_CONFIRMATION_HOLD_MS: "0",
   KILL_ZONE_FILTER_ENABLED: "false",
   NEWS_FILTER_ENABLED: "false",
 };
@@ -537,12 +540,12 @@ assert((await tick("?token=secret", {})).status === 200, "a cron service without
 const vListed = JSON.parse((await rpc("tools/call", { name: "list_watches" }, 1, 9804)).result.content[0].text);
 const vWatch = vListed.active[0];
 assert(vWatch?.entryTouched === true, `the /tick evaluated the watch (${vWatch?.lastReason})`);
-assert(!vWatch?.recovered, "back-to-back ticks keep evidence instead of treating each request as a restart");
+assert(!vWatch?.recovered, "back-to-back ticks keep the watch as saved instead of treating each request as a restart");
 
 const health = await (await fetch("http://127.0.0.1:9804/health", { headers: { authorization: "Bearer secret" } })).json();
 assert(health.storage === "redis" && health.last_tick_at, `health reports Redis and the last tick (${health.storage})`);
 
-console.log("\n— a real ENTER NOW, end to end on M1 time (about 2.5 minutes) —");
+console.log("\n— a real ENTER NOW, end to end on M1 time (about 3 minutes) —");
 const nextMinute = (offsetMs) => sleep(60_000 - (Date.now() % 60_000) + offsetMs);
 const scenarioWatch = async () => {
   const listed = JSON.parse((await rpc("tools/call", { name: "list_watches" }, 1, 9804)).result.content[0].text);
@@ -568,7 +571,7 @@ await rpc(
       tp2: 4460,
       sweep_level: 4412,
       liquidity_taken: true,
-      setup_model: "Sweep + MSS",
+      setup_model: "2022 model",
       conviction: "A",
     },
   },
@@ -578,20 +581,32 @@ await rpc(
 await tick();
 assert((await scenarioWatch()).active?.entryTouched === true, "minute A: entry touched live");
 
-price = 4419; // acceptance: well beyond entry, far from the stop
+price = 4425; // the displacement, away from every zone
 await nextMinute(3000);
 await tick();
 const midway = (await scenarioWatch()).active;
 assert(midway?.liquidityTaken === true, "bar A closed: its wick took the 4412 liquidity");
-assert(midway?.structureShift?.shifted === true, `bar A closed above the 4419.60 lower high: structure shift (${midway?.lastReason})`);
-assert(!(await scenarioWatch()).resolved, "but one observation is not a confirmation: evidence must survive a new M1 bar");
+assert(midway?.structureShift?.shifted === true, `bar A closed above the 4419.60 lower high: MSS (${midway?.lastReason})`);
+assert(midway?.lastReason === "awaiting_retrace", `a zone exists, price is away from it: no entry (${midway?.lastReason})`);
 
-price = 4419; // no new high, not "pushing": v6.1 waited here and missed the move
+price = 4427; // price has not come back
 await nextMinute(3000);
+await tick(); // minute 1 closed: still no gap above bar A
+await nextMinute(3000);
+await tick(); // minute 2 closed: its low leaves the FVG
+const ready = (await scenarioWatch()).active;
+assert(
+  ready?.entryZone?.model === "FVG" && ready.entryZone.low === 4420 && ready.entryZone.high === 4421.5,
+  `the displacement left the FVG 4420–4421.5 (${JSON.stringify(ready?.entryZone)})`,
+);
+assert(!(await scenarioWatch()).resolved, "the move away from the zone is never an entry");
+
+price = 4421; // the retrace into the FVG
+await sleep(2500); // past the spot cache
 await tick();
 const confirmed = (await scenarioWatch()).resolved;
-assert(confirmed?.status === "CONFIRMED", `a new M1 bar later: REAL CONFIRMATION — ENTER NOW (${confirmed?.status ?? (await scenarioWatch()).active?.lastReason})`);
-assert(confirmed?.rr_at_entry >= 1, `entered at market with R:R ${confirmed?.rr_at_entry} to TP1`);
+assert(confirmed?.status === "CONFIRMED", `retrace into the FVG: REAL CONFIRMATION — ENTER NOW (${confirmed?.status ?? (await scenarioWatch()).active?.lastReason})`);
+assert(confirmed?.rr_at_entry >= 1, `entered in the zone with R:R ${confirmed?.rr_at_entry} to TP1`);
 
 vercel.kill("SIGTERM");
 await sleep(500);

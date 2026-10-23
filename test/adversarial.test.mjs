@@ -14,19 +14,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
-  advanceContinuous,
-  advanceDiscrete,
-  advanceGeneration,
-  alignSeries,
   apiPeriod,
   barIsClosed,
   chaseLimit,
-  checkAcceptance,
-  checkCISD,
-  checkSMT,
-  classifyEngulfing,
   closedSeries,
-  evaluateConfirmation,
+  entryModel,
   evaluateSafety,
   inducement,
   killZoneStatus,
@@ -70,16 +62,6 @@ function series(count, { start = 0, span = M1, price = 100, spread = 1 } = {}) {
   );
 }
 
-const CTX = (over = {}) => ({
-  nowMs: 1_000_000,
-  generation: 1,
-  hasBarTime: true,
-  minHoldMs: 60_000,
-  requireNewBar: true,
-  mid: 100,
-  tolerance: 0.01,
-  ...over,
-});
 
 // ---------------------------------------------------------------------------
 // 1. Entry touched then immediately invalidated.
@@ -100,20 +82,6 @@ test("1 — invalidation beats a fresh touch on the same tick", () => {
 
 // ---------------------------------------------------------------------------
 // 5. Confirmation then immediate reversal — evidence must decay, not latch.
-
-test("5 — graduated evidence resets once price fades back through it", () => {
-  const ctx = CTX();
-  let slot = advanceDiscrete(null, true, "strong", 100, "buy", 0.01, ctx);
-  slot = advanceDiscrete(slot, true, "strong", 100, "buy", 0.01, {
-    ...ctx,
-    nowMs: ctx.nowMs + 120_000,
-    generation: 3,
-  });
-  assert.equal(slot.graduated, true);
-  const faded = advanceDiscrete(slot, true, "strong", 95, "buy", 0.01, ctx);
-  assert.equal(faded.graduated, false);
-  assert.equal(faded.pending, false);
-});
 
 // ---------------------------------------------------------------------------
 // 7. Upstream returns stale candles.
@@ -226,7 +194,7 @@ test("14/18 — resolution is single-winner under racing paths", () => {
 // ---------------------------------------------------------------------------
 // 16. Process restarts while watches are active.
 
-test("16 — watches survive a restart, and evidence does not", () => {
+test("16 — watches survive a restart and re-earn CONFIRMING from live data", () => {
   const dir = mkdtempSync(join(tmpdir(), "wm-"));
   const path = join(dir, "state.json");
   const first = new WatchStore({ path, log: () => {} });
@@ -240,7 +208,6 @@ test("16 — watches survive a restart, and evidence does not", () => {
     sl: 4400,
     tp1: 4450,
     entryTouched: true,
-    evidence: { acceptance: { graduated: true, firstSeenAt: 1 } },
     expiresAt: null,
     dedupeKey: "k",
   });
@@ -263,7 +230,6 @@ test("16 — watches survive a restart, and evidence does not", () => {
   const recovered = second.get("W1");
   assert.equal(recovered.recovered, true);
   assert.equal(recovered.entryTouched, true, "market facts survive");
-  assert.deepEqual(recovered.evidence, {}, "observation-dependent state does not");
   assert.equal(
     recovered.lifecycle,
     "TOUCHED",
@@ -367,87 +333,14 @@ test("21b — a bar with no timestamp is never assumed closed", () => {
   assert.equal(barIsClosed(bars[0], M1, 1_000_000), false);
 });
 
-test("22 — the generation counter advances only on a genuinely new bar", () => {
-  let state = { lastBarTimeMs: null, generation: 0 };
-  state = advanceGeneration(state, 1000);
-  assert.equal(state.generation, 0, "first observation establishes the baseline");
-  state = advanceGeneration(state, 1000);
-  assert.equal(state.generation, 0, "a repeated bar is not a new generation");
-  state = advanceGeneration(state, 1060);
-  assert.equal(state.generation, 1);
-  // A feed that stops supplying bar times must flag it rather than
-  // silently freezing the counter at a passing value.
-  assert.equal(advanceGeneration(state, null).hasBarTime, false);
-});
-
 // ---------------------------------------------------------------------------
 // 23. A live tick says the trigger crossed but the closed bar does not.
-
-test("23 — poll frequency cannot substitute for market time", () => {
-  const ctx = CTX({ nowMs: 0, generation: 5 });
-  let slot = advanceDiscrete(null, true, "strong", 100, "buy", 0.01, ctx);
-  // Hammer the same generation for ten minutes of wall clock.
-  for (let i = 1; i <= 20; i += 1) {
-    slot = advanceDiscrete(slot, true, "strong", 100, "buy", 0.01, {
-      ...ctx,
-      nowMs: i * 30_000,
-      generation: 5,
-    });
-  }
-  assert.equal(slot.graduated, false, "no new bar, no graduation, regardless of poll count");
-  const withNewBar = advanceDiscrete(slot, true, "strong", 100, "buy", 0.01, {
-    ...ctx,
-    nowMs: 700_000,
-    generation: 6,
-  });
-  assert.equal(withNewBar.graduated, true);
-});
 
 // ---------------------------------------------------------------------------
 // 24. Evidence appears, disappears, reappears.
 
-test("24 — continuous evidence restarts its hold after a gap", () => {
-  const ctx = CTX({ nowMs: 0 });
-  let slot = advanceContinuous(null, true, ctx);
-  slot = advanceContinuous(slot, false, { ...ctx, nowMs: 10_000 });
-  assert.equal(slot.pending, false);
-  slot = advanceContinuous(slot, true, { ...ctx, nowMs: 20_000, generation: 2 });
-  slot = advanceContinuous(slot, true, { ...ctx, nowMs: 50_000, generation: 3 });
-  assert.equal(slot.graduated, false, "hold restarted from the reappearance, not the first sighting");
-  slot = advanceContinuous(slot, true, { ...ctx, nowMs: 100_000, generation: 4 });
-  assert.equal(slot.graduated, true);
-});
-
 // ---------------------------------------------------------------------------
 // 25. Correlated-market data unavailable.
-
-test("25 — a missing partner is UNAVAILABLE, not an absence of divergence", () => {
-  const main = series(25, { span: 5 * M1 });
-  assert.equal(checkSMT(main, [], "buy"), null);
-  assert.equal(checkSMT(main, [{ symbol: "X", bars: series(3) }], "buy"), null);
-});
-
-test("25b — partner series are aligned on bar time, never on array position", () => {
-  const a = series(25, { span: 5 * M1, start: 0 });
-  const b = series(25, { span: 5 * M1, start: 5 * M1 }); // shifted by one bar
-  const aligned = alignSeries(a, b, 20);
-  assert.ok(aligned);
-  assert.equal(aligned.left.length, aligned.right.length);
-  for (let i = 0; i < aligned.left.length; i += 1) {
-    assert.equal(aligned.left[i].timestampMs, aligned.right[i].timestampMs);
-  }
-  assert.equal(alignSeries(a, series(25, { span: 5 * M1, start: 10_000_000 }), 20), null);
-});
-
-test("25c — unavailable evidence holds its slot instead of decaying it", () => {
-  const ctx = CTX();
-  let slot = advanceDiscrete(null, true, "strong", 100, "buy", 0.01, ctx);
-  const held = advanceDiscrete(slot, null, "strong", 100, "buy", 0.01, {
-    ...ctx,
-    nowMs: ctx.nowMs + 1000,
-  });
-  assert.equal(held.pending, true);
-});
 
 // ---------------------------------------------------------------------------
 // Scale integrity — the failure mode with no v5 defence at all.
@@ -508,52 +401,6 @@ test("REGRESSION — a sub-1R setup is rejected at registration", () => {
   );
 });
 
-test("REGRESSION — CISD and SMT distinguish 'no' from 'cannot tell'", () => {
-  assert.equal(checkCISD(series(5), "buy"), null, "too little history is not a false");
-  const enough = series(25);
-  assert.equal(typeof checkCISD(enough, "buy"), "boolean");
-});
-
-test("REGRESSION — a symmetric doji is not a rejection; a hammer still is", async () => {
-  const { classifyWick } = await import("../lib/core.mjs");
-  // Wicks on both sides, close mid-range: indecision, not rejection.
-  // v5 divided the wick by the body, so a near-zero body produced an
-  // unbounded ratio and classified this as a strong signal.
-  const doji = bar(0, 100, 103, 97, 100.0001);
-  assert.equal(classifyWick(doji, 1, "buy"), "none");
-  // A genuine hammer has a small body BY DEFINITION; a body-size floor
-  // would throw away the pattern the check exists to find.
-  const hammer = bar(0, 100, 100.4, 97, 100.3);
-  assert.equal(classifyWick(hammer, 1, "buy"), "strong");
-});
-
-test("REGRESSION — engulfing requires the bar to close in the trade direction", () => {
-  const previous = bar(0, 100, 101, 99, 99.5);
-  const bearishBody = bar(M1, 100.5, 101, 98, 98.5);
-  assert.equal(classifyEngulfing([previous, bearishBody], "buy", "M5"), "none");
-});
-
-test("ACCEPTANCE — the buffer is capped by the trade's own risk", () => {
-  const watch = { direction: "buy", entry: 100, sl: 99, invalidation: 99, tp1: 104 };
-  // ATR of 5 on a 1-point risk: an uncapped 0.5×ATR would demand price
-  // travel 2.5 points before accepting a trade whose stop is 1 point away.
-  assert.equal(checkAcceptance(watch, 100.4, 100.3, 5, 0.01), true);
-  assert.equal(checkAcceptance(watch, 100.1, 100.05, 5, 0.01), false);
-});
-
-test("CONFIRMATION — acceptance alone is never enough", () => {
-  const watch = { direction: "buy", entry: 100, sl: 99, tp1: 104, evidence: {} };
-  const ctx = CTX({ nowMs: 0 });
-  const signals = { cisd: false, smt: null, engulfM5: "none", engulfM1: "none", wick: "none", acceptance: true };
-  let state = { ...watch };
-  for (const nowMs of [0, 70_000, 140_000]) {
-    const result = evaluateConfirmation(state, signals, CTX({ nowMs, generation: nowMs / 70_000 + 1 }));
-    state = { ...state, evidence: result.evidence };
-    assert.equal(result.enter, false);
-    if (result.strength !== "PENDING_ACCEPTANCE") assert.equal(result.strength, "PENDING_REASON");
-  }
-});
-
 // ---------------------------------------------------------------------------
 // LIQUIDITY — no liquidity taken, no trade.
 
@@ -612,7 +459,7 @@ test("LIQUIDITY MAP — swept lows, untaken equal highs, nearest first", () => {
 // ---------------------------------------------------------------------------
 // VERCEL — state round-trips through Redis between requests.
 
-test("VERCEL — evidence survives a request round-trip, but not a tick gap", () => {
+test("VERCEL — a watch survives a request round-trip as saved, and a tick gap as a restart", () => {
   const store = new WatchStore({ path: null, log: () => {} });
   store.add({
     id: "W1",
@@ -620,7 +467,7 @@ test("VERCEL — evidence survives a request round-trip, but not a tick gap", ()
     lifecycle: "CONFIRMING",
     symbol: "XAUUSD",
     entryTouched: true,
-    evidence: { acceptance: { graduated: true, firstSeenAt: 1 } },
+    zoneNotified: "FVG:1:2",
     dedupeKey: "k",
   });
   const snapshot = JSON.parse(JSON.stringify(store.snapshot()));
@@ -628,10 +475,9 @@ test("VERCEL — evidence survives a request round-trip, but not a tick gap", ()
   const next = new WatchStore({ path: null, log: () => {} });
   next.restore(snapshot, { keepEvidence: true });
   assert.equal(next.get("W1").lifecycle, "CONFIRMING");
-  assert.equal(next.get("W1").evidence.acceptance.graduated, true, "observation never stopped");
+  assert.equal(next.get("W1").zoneNotified, "FVG:1:2", "observation never stopped: nothing re-sent");
 
   next.restore(snapshot, { keepEvidence: false });
-  assert.deepEqual(next.get("W1").evidence, {}, "after a gap nothing was observed, so nothing is kept");
   assert.equal(next.get("W1").lifecycle, "TOUCHED");
 });
 
@@ -961,4 +807,93 @@ test("MARKET DATA — an upstream call that never answers fails the call, not th
   });
   assert.equal(await market.spot("XAUUSD", 41), null);
   assert.match(market.stats.lastError, /no answer within 20 ms/);
+});
+
+// ---------------------------------------------------------------------------
+// The four ICT entry models. A buy: a lower high at 107, a decline into the
+// 99 low (the liquidity grab), then the displacement back up.
+
+const DECLINE = [
+  [105, 105.5, 104.5, 105],
+  [105, 106, 104.8, 105.8],
+  [105.8, 107, 105.6, 106.8], // swing high 107; up-close: the breaker
+  [106.8, 106.9, 104.6, 104.8],
+  [104.8, 105.7, 102.8, 103],
+  [103, 104.7, 100.8, 101],
+  [101, 102.9, 99, 99.6], // the sweep low
+];
+const T0 = Date.UTC(2026, 9, 23, 13, 0);
+const m1Bars = (rows) => rows.map(([o, h, l, c], i) => bar(T0 + i * M1, o, h, l, c));
+const TOUCH = T0 + 6 * M1;
+const mirror = (rows) => rows.map(([o, h, l, c]) => [200 - o, 200 - l, 200 - h, 200 - c]);
+
+test("MODEL 2022 — MSS by displacement, then the FVG of the leg; OTE when it sits at 62–79%", () => {
+  const rows = [
+    ...DECLINE,
+    [99.6, 103.5, 99.5, 103.3], // displacement
+    [103.3, 107.8, 103.6, 107.5], // closes above 107: MSS
+    [107.5, 112, 104, 106.2],
+  ];
+  const model = entryModel(m1Bars(rows), "buy", TOUCH);
+  assert.equal(model.mss.shifted, true);
+  assert.equal(model.mss.level, 107);
+  assert.deepEqual(
+    [model.zone.model, model.zone.low, model.zone.high, model.zone.ote],
+    ["FVG", 103.5, 104, true],
+    "the gap a retrace reaches first, inside the 62–79% of the 99 → 112 leg",
+  );
+
+  const sell = entryModel(m1Bars(mirror(rows)), "sell", TOUCH);
+  assert.deepEqual([sell.zone.model, sell.zone.low, sell.zone.high, sell.zone.ote], ["FVG", 96, 96.5, true], "a sell is the mirror image");
+});
+
+test("MODEL 2022 — a zone a bar closes through is dead; with none left there is no entry", () => {
+  const rows = [
+    ...DECLINE,
+    [99.6, 103.5, 99.5, 103.3],
+    [103.3, 107.8, 103.6, 107.5],
+    [107.5, 112, 104, 106.2],
+    [106.2, 106.3, 103.2, 103.3], // closes below 103.5: the upper gap failed
+  ];
+  const model = entryModel(m1Bars(rows), "buy", TOUCH);
+  assert.deepEqual([model.zone.low, model.zone.high], [102.9, 103.6], "the next gap down takes over");
+  const none = entryModel(m1Bars([...rows, [103.3, 103.4, 102.4, 102.5]]), "buy", TOUCH);
+  assert.equal(none.mss.shifted, true);
+  assert.equal(none.zone, null, "every gap failed: wait, do not enter");
+});
+
+test("MODEL — an MSS without displacement leaves no gap and gives no entry", () => {
+  const rows = [...DECLINE, [99.6, 102, 99.5, 101.8], [101.8, 107.6, 101.5, 107.3], [107.3, 107.5, 101.9, 106]];
+  const model = entryModel(m1Bars(rows), "buy", TOUCH);
+  assert.equal(model.mss.shifted, true);
+  assert.equal(model.zone, null);
+  assert.equal(entryModel(m1Bars(DECLINE), "buy", TOUCH).mss.shifted, false, "no MSS, no model");
+});
+
+test("MODEL INVERSION — a gap of the move into the low, closed through, flips to support", () => {
+  const rows = [
+    [105, 105.5, 104.5, 105],
+    [105, 106, 104.8, 105.8],
+    [105.8, 107, 105.6, 106.8],
+    [106.8, 106.9, 105, 105.2],
+    [105.2, 105.3, 102.8, 103], // leaves a bearish gap 105.3–105.6 under the 105.6 low two bars back
+    [103, 105.1, 100.8, 101],
+    [101, 103, 99, 99.6],
+    [99.6, 102.5, 99.5, 102.3],
+    [102.3, 107.5, 102.2, 107.2], // closes above it: inverted, and the MSS
+    [107.2, 107.6, 102.4, 106.3],
+  ];
+  const model = entryModel(m1Bars(rows), "buy", TOUCH);
+  assert.deepEqual([model.zone.model, model.zone.low, model.zone.high], ["IFVG", 105.3, 105.6]);
+});
+
+test("MODEL UNICORN — the leg's FVG where it overlaps the breaker", () => {
+  const rows = [
+    ...DECLINE,
+    [99.6, 103.5, 99.5, 103.3],
+    [103.3, 107.8, 103.6, 107.5],
+    [107.5, 108, 106, 106.2], // gap 103.5–106 now reaches into the 105.6–107 breaker
+  ];
+  const model = entryModel(m1Bars(rows), "buy", TOUCH);
+  assert.deepEqual([model.zone.model, model.zone.low, model.zone.high], ["Unicorn", 105.6, 106]);
 });

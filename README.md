@@ -1,11 +1,11 @@
-# Watch Monitor MCP — v6.1
+# Watch Monitor MCP — v6.2
 
 Market-data-only MCP server that monitors ICT sniper setups to a
 deterministic conclusion and notifies a human over Telegram. It never
 places, modifies or closes an order, and the account side of the upstream
 cTrader connector is unreachable from this endpoint by construction.
 
-**ENTER NOW fires on the structure shift, not after the move.** Liquidity taken, entry touched, an M1 body closed beyond the last swing, evidence held over a new M1 bar, and R:R to TP1 at the market price still ≥ 1 (otherwise it says "do not chase"). v6.1's extra wait for the expansion to be "pushing" is gone: sampled once a minute it kept missing the move — a BTCUSD sell confirmed at 1.44R and ran to TP1 while it waited.
+**ENTER NOW is an ICT entry model, nothing else.** From closed M1 candles: the liquidity at `sweep_level` taken → an MSS (body close beyond the last swing into the reaction extreme) → the zone the displacement left: an **FVG** (2022 model), an **IFVG** (Inversion: a gap of the move into the low, closed through), or a **Unicorn** (that FVG where it overlaps the breaker), tagged **OTE** when it sits in the 62–79% of the leg → **price retraces into the zone**. Then R:R to TP1 at the market price ≥ 1, kill zone, news and spread. When the zone appears, Telegram gets "ENTRY ZONE READY" with its range; ENTER NOW comes only on the retrace. A zone a candle closes through is dead. The v6 evidence counters (price pattern, live acceptance, SMT, hold timers) and v6.1's "push" wait are gone.
 
 **No liquidity taken, no trade.** Every watch carries a `sweep_level` — the
 IDM / sell-side low for a buy, the IDM / buy-side high for a sell — and
@@ -22,7 +22,7 @@ so the analysis reads liquidity as facts instead of guessing.
 
 ```
 index.js            server, scheduler, setup engine, snapshot, MCP + REST surface
-lib/core.mjs        pure logic — scaling, bar discipline, analytics, evidence, gates, liquidity, IDM
+lib/core.mjs        pure logic — scaling, bar discipline, gates, liquidity, IDM, the ICT entry models
 lib/upstream.mjs    managed cTrader MCP client + coalescing market-data layer
 lib/openapi.mjs     cTrader Open API feed (JSON over WebSocket), read-only
 lib/store.mjs       watch registry + durable snapshot (file, or Redis via index.js)
@@ -56,8 +56,7 @@ once a minute to run the monitor.
    string), `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and the market feed —
    preferably cTrader Open API: `CTRADER_CLIENT_ID`, `CTRADER_CLIENT_SECRET`
    (your app at openapi.ctrader.com). Otherwise `CTRADER_MCP_TOKEN`.
-   Recommended on Vercel: `MIN_CONFIRMATION_HOLD_MS=50000`, since ticks
-   arrive about every 60 s with some jitter. Redeploy after adding them.
+   Redeploy after adding them.
 4. **Cron, every minute:** on the Hobby plan Vercel cron runs only once a
    day, so use cron-job.org (free): URL
    `https://<your-app>.vercel.app/tick?token=<WATCH_MONITOR_AUTH_TOKEN>`,
@@ -89,10 +88,10 @@ once a minute to run the monitor.
 
 Trade-off against a long-lived host: price is checked once a minute
 instead of every 10 s, so an SL/TP touch is reported up to a minute late,
-and confirmation needs at least two ticks. Wicks between ticks are still
-seen through the closed M1 bars. If the cron stops for more than
-`MAX_TICK_GAP_MS`, the next tick sends `MONITOR GAP` and discards evidence,
-exactly as a restart did before.
+and a retrace into the zone is seen only if price is still in it at a
+tick. Wicks between ticks are still seen through the closed M1 bars. If
+the cron stops for more than `MAX_TICK_GAP_MS`, the next tick sends
+`MONITOR GAP` and the watches resume as after a restart.
 
 ## Running as a process (Railway, VPS)
 
@@ -114,19 +113,14 @@ exactly as a restart did before.
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | — | notifications |
 | `KV_REST_API_URL` / `KV_REST_API_TOKEN` | — | Vercel only: Upstash Redis |
 | `CRON_SECRET` | — | Vercel Pro cron only: accepted as a bearer on `/tick` |
-| `MAX_TICK_GAP_MS` | `300000` | Vercel only: a longer gap between ticks discards evidence |
+| `MAX_TICK_GAP_MS` | `300000` | Vercel only: a longer gap between ticks is reported and treated as a restart |
 | `STATE_FILE` | `./data/watch-state.json` | process mode only |
 | `SCHEDULER_TICK_MS` | `2500` | process mode only |
 | `WATCH_INTERVAL_MS` | `10000` | per-watch cadence in process mode |
 | `CTRADER_PRICE_SCALE` | `100000` | validated at runtime, never trusted blindly |
 | `SCALE_TOLERANCE` | `0.35` | how far a feed price may sit from a registered level before quarantine |
-| `MIN_CONFIRMATION_HOLD_MS` | `60000` | wall-clock hold before evidence graduates |
 | `MIN_RR_AT_ENTRY` | `1` | R:R to TP1 at the market price below which ENTER NOW waits (do not chase) |
 | `WATCH_DEFAULT_EXPIRY_MIN` | `720` | expiry for a watch registered without one; 0 disables |
-| `REQUIRE_NEW_M1_CANDLE` | `true` | evidence must also survive a bar boundary |
-| `EVIDENCE_FADE_ATR_FRACTION` | `0.25` | pullback (× M5 ATR) that erases a seen signal; v6.0 used the raw quote tolerance, which wiped gold evidence within seconds |
-| `ACCEPTANCE_ATR_FRACTION` | `0.5` | acceptance buffer, capped by `ACCEPTANCE_RISK_FRACTION` |
-| `ACCEPTANCE_RISK_FRACTION` | `0.35` | ceiling as a fraction of entry-to-invalidation |
 | `NEWS_FAIL_CLOSED` | `true` | blocks only when no calendar covering today is cached |
 | `MAX_ACTIVE_WATCHES` | `25` | registration refuses beyond this |
 | `KILL_ZONE_FILTER_ENABLED` / `SPREAD_CHECK_ENABLED` / `NEWS_FILTER_ENABLED` | `true` | entry gates |
