@@ -78,7 +78,7 @@ function scriptedM5(count) {
   return [...byBar.values()].slice(-count);
 }
 
-const PERIOD_SPAN = { M_1: 60_000, M_5: 300_000, M_15: 900_000, H_1: 3_600_000, H_4: 14_400_000, D_1: 86_400_000 };
+const PERIOD_SPAN = { M_1: 60_000, M_5: 300_000, M_15: 900_000, M_30: 1_800_000, H_1: 3_600_000, H_4: 14_400_000, D_1: 86_400_000 };
 
 const upstream = createServer((req, res) => {
   let body = "";
@@ -646,6 +646,8 @@ assert(
   trade?.low_hanging_fruit?.level > trade?.entry && trade.low_hanging_fruit.level < 4451 && trade.targets[0] === trade.low_hanging_fruit.level,
   `TP1 is the low-hanging fruit, the nearest untaken pool before the registered 4451 (${JSON.stringify(trade?.low_hanging_fruit)}, targets ${trade?.targets})`,
 );
+
+assert(Array.isArray(trade?.obstacles), `the zones in the way to the target were mapped on M5–H4 (${JSON.stringify(trade?.obstacles)})`);
 
 console.log("\n— managing the trade —");
 price = trade.targets[0] + 0.5; // TP1

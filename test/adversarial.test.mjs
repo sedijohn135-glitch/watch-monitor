@@ -23,6 +23,8 @@ import {
   lowHangingFruit,
   manageTrade,
   m5Confirmation,
+  obstacles,
+  zoneVerdict,
   smtDivergence,
   evaluateSafety,
   inducement,
@@ -1047,6 +1049,61 @@ test("M5 CONFIRMATION — a rejection wick; a symmetric doji is not one", () => 
   const doji = m5Bars([[100, 102, 98, 100.05]]);
   assert.equal(m5Confirmation(doji, "buy", T0), null);
   assert.equal(m5Confirmation(hammer, "buy", T0 + 600_000), null, "only from the turn on");
+});
+
+// ---------------------------------------------------------------------------
+// Obstacles: the zones between the entry and the target, and whether price
+// holds at one.
+
+// Quiet bars, then a base (99.5–101.5) and the displacement up from it
+// that leaves a gap: the demand. The candle before the base rose: RBR.
+const QUIET = Array(9).fill([101, 101.3, 100.8, 101.2]);
+const DEMAND = [...QUIET, [101, 101.5, 99.5, 100], [100, 104, 99.8, 103.8], [103.8, 105, 102, 104.5], [104.5, 106, 103.9, 105.8]];
+
+test("OBSTACLES — the demand a sell runs into: the base of a displacement", () => {
+  const rbr = [{ kind: "demand", pattern: "RBR", low: 99.5, high: 101.5 }];
+  assert.deepEqual(obstacles(m5Bars(DEMAND), "sell", 110, 95), rbr);
+  assert.deepEqual(obstacles(m5Bars(DEMAND), "sell", 101, 95), [], "a zone at the entry is not in the way");
+  assert.deepEqual(obstacles(m5Bars(DEMAND), "sell", 110, 102), [], "nor one past the target");
+  assert.deepEqual(obstacles(m5Bars([...DEMAND, [105, 105.2, 100, 104]]), "sell", 110, 95), rbr, "a wick into it is a test");
+  assert.deepEqual(obstacles(m5Bars([...DEMAND, [105, 105.2, 99, 99.2]]), "sell", 110, 95), [], "a close below breaks it");
+  assert.deepEqual(obstacles(m5Bars(DEMAND), "buy", 90, 120), [], "a buy only meets supply");
+  const dbr = [...QUIET.slice(1), [101.2, 101.3, 100.9, 101], ...DEMAND.slice(9)];
+  assert.equal(obstacles(m5Bars(dbr), "sell", 110, 95)[0]?.pattern, "DBR", "after a drop: DBR");
+  const greenBase = [...QUIET, [100, 101.5, 99.5, 100.8], ...DEMAND.slice(10)];
+  assert.equal(obstacles(m5Bars(greenBase), "sell", 110, 95).length, 1, "the base may close either way");
+  const noBase = [...QUIET, [98, 101.5, 97.9, 101.4], [101.4, 105, 101.3, 104.8], [104.8, 106, 102, 105.5]];
+  assert.deepEqual(obstacles(m5Bars(noBase), "sell", 110, 95), [], "a rally without a pause has no base");
+  // 23 Oct, M30: a gap, but the candle that left it is no displacement.
+  const drift = [...QUIET, [101, 101.5, 99.5, 100], [100, 102.2, 99.8, 100.4], [102.1, 102.5, 101.8, 102.3]];
+  assert.deepEqual(obstacles(m5Bars(drift), "sell", 110, 95), [], "a gap alone is not demand");
+});
+
+test("OBSTACLES — an M5 reversal candle at the zone holds it", () => {
+  const zone = { low: 99.5, high: 102 };
+  const check = (rows, direction = "sell", at = zone) => zoneVerdict(m5Bars(rows), m5Bars(rows), 300_000, direction, at, T0);
+  assert.deepEqual(check([[103, 103.2, 101.5, 101.8], [101.8, 102, 99.8, 101.9]]), { verdict: "HELD", type: "rejection", at: T0 + 600_000 });
+  assert.equal(check([[102.5, 102.6, 100.5, 100.8], [100.7, 103, 100.6, 102.8]])?.type, "engulfing");
+  assert.equal(check([[99, 99.2, 96, 99.1]])?.verdict, "BROKEN", "a hammer that closes below an M5 zone broke it");
+  assert.equal(check([[106, 106.2, 104.5, 106.1]]), null, "a hammer away from the zone is not the zone");
+  assert.equal(check([[109, 111, 108.9, 109.1]], "buy", { low: 110, high: 112 })?.verdict, "HELD", "supply, mirrored");
+});
+
+test("OBSTACLES — an M15 zone breaks only on an M15 close, not on an M5 one", () => {
+  const zone = { low: 99.5, high: 102 };
+  const dip = m5Bars([[100.5, 100.6, 99, 99.2], [99.2, 101, 99.1, 100.8], [100.8, 101.5, 100.5, 101.2]]);
+  assert.equal(zoneVerdict(dip, dip, 300_000, "sell", zone, T0)?.verdict, "BROKEN", "as an M5 zone, the first close below broke it");
+  assert.deepEqual(
+    zoneVerdict(dip, [bar(T0, 100.5, 101.5, 99, 101.2)], M15, "sell", zone, T0),
+    { verdict: "HELD", type: "engulfing", at: T0 + 600_000 },
+    "as an M15 zone it stands, and the M5 engulfing back into it holds it",
+  );
+  const through = m5Bars([[100.5, 100.6, 99, 99.2], [99.2, 99.3, 98.5, 98.6], [98.6, 98.7, 98, 98.2], [98.2, 100.5, 98.1, 100.2]]);
+  assert.deepEqual(
+    zoneVerdict(through, [bar(T0, 100.5, 100.6, 98, 98.2)], M15, "sell", zone, T0),
+    { verdict: "BROKEN", at: T0 + M15 },
+    "the M15 closed below it first; an M5 engulfing after that is too late",
+  );
 });
 
 test("MODEL on M5 — the touch's own M5 bar is part of the reaction, wherever in it the touch fell", () => {

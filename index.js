@@ -46,6 +46,8 @@ import {
   liquidityTaken,
   lowHangingFruit,
   m5Confirmation,
+  obstacles,
+  zoneVerdict,
   smtDivergence,
   manageTrade,
   marketRR,
@@ -369,7 +371,7 @@ function nyTime(nowMs = Date.now()) {
 // Written to be acted on from a phone: everything MT5 needs, the price
 // beyond which not to chase, and why it fired. The watch is not resolved
 // here: from now on it is the trade the human took, managed tick by tick.
-function confirmWatch(watch, quote, model, gates, rr, stop, tp) {
+function confirmWatch(watch, quote, model, gates, rr, stop, tp, walls = []) {
   const buy = watch.direction === "buy";
   const fmt = (value) => htmlEscape(formatLevel(value));
   // TP1 is the low-hanging fruit when there is one; the registered
@@ -397,6 +399,7 @@ function confirmWatch(watch, quote, model, gates, rr, stop, tp) {
     low_hanging_fruit: tp.fruit ? watch.target : null,
     structure_shift: model.mss,
     gates: gates.summary,
+    obstacles: walls,
   };
   store.dirty = true;
   scheduleSave(true);
@@ -419,8 +422,14 @@ function confirmWatch(watch, quote, model, gates, rr, stop, tp) {
       `✅ ${htmlEscape(gates.zone || "session filter off")} · news clear · spread ${fmt(quote.spread)}\n` +
       (watch.liquidity && watch.liquidity !== "N/A" ? `<b>Liquidity:</b> ${htmlEscape(watch.liquidity)}\n` : "") +
       `<b>Setup:</b> ${htmlEscape(watch.setup_model)} · conviction ${htmlEscape(watch.conviction)}\n` +
+      (walls.length
+        ? `<b>Obstacles to target:</b>\n` +
+          walls.map((zone) => `🧱 ${zone.tf} ${zone.kind} (${zone.pattern}) ${fmt(zone.low)} – ${fmt(zone.high)}`).join("\n") +
+          "\n"
+        : `<b>Obstacles to target:</b> none on M5–H4\n`) +
       `<i>Sent ${nyTime()} New York. Use exactly this SL and TP in MT5. The monitor now manages the trade: ` +
-      `TP alerts, SL to breakeven after TP1, and CLOSE NOW if price stops and turns back.</i>`,
+      `TP alerts, SL to breakeven after TP1, and CLOSE NOW if price stops and turns back ` +
+      `or an obstacle holds.</i>`,
     { dedupeKey: `${watch.id}:enter`, priority: "critical" },
   );
   return true;
@@ -455,6 +464,19 @@ async function manageOpenTrade(watch, { mainId, mid, executable, protective, now
 
   if (result.action === "HOLD") {
     watch.lastReason = "in_trade";
+    const held = await checkObstacles(watch, { mainId, mid, seen, sinceMs, now, head, fmt });
+    if (!held) return;
+    const r = inR(protective);
+    resolveWatch(
+      watch,
+      r > 0 ? "WIN" : r < 0 ? "LOSS" : "BREAKEVEN",
+      { resolvedPrice: protective, exit_reason: "OBSTACLE", result_r: Number(r.toFixed(2)), trade },
+      `<b>🔴 CLOSE NOW — ${htmlEscape(held.tf)} ${htmlEscape(held.kind.toUpperCase())} HELD</b>\n${head}\n` +
+        `<b>Close at market</b> ≈ ${fmt(protective)} — price reached the ${htmlEscape(held.tf)} ${htmlEscape(held.kind)} ` +
+        `${fmt(held.low)} – ${fmt(held.high)} and an M5 ${htmlEscape(held.type)} held it\n` +
+        `<b>Result:</b> ${signedR(protective)} on what is still open` +
+        (trade.hit ? ` (after TP${trade.hit}; SL was at breakeven)` : ""),
+    );
     return;
   }
   if (result.action === "TARGET") {
@@ -495,6 +517,46 @@ async function manageOpenTrade(watch, { mainId, mid, executable, protective, now
       `<b>Result:</b> ${signedR(exit)} on what is still open` +
       (trade.hit ? ` (after TP${trade.hit}; SL was at breakeven)` : ""),
   );
+}
+
+// The zones mapped at ENTER NOW. Reaching one is seen on the live price
+// (with the M1 wicks between ticks); the hold is M5 price action, the
+// break only a closed candle of the zone's own timeframe (zoneVerdict).
+// Returns the zone that held, or null.
+async function checkObstacles(watch, { mainId, mid, seen, sinceMs, now, head, fmt }) {
+  const buy = watch.direction === "buy";
+  const live = (watch.trade.obstacles || []).filter((zone) => !zone.done);
+  const reached = live.filter((zone) => !zone.reachedAt && (buy ? seen.mid >= zone.low : seen.mid <= zone.high));
+  for (const zone of reached) zone.reachedAt = sinceMs;
+  if (reached.length) {
+    store.dirty = true;
+    notify(
+      `<b>⚠️ PRICE AT ${reached.map((zone) => `${htmlEscape(zone.tf)} ${htmlEscape(zone.kind.toUpperCase())}`).join(" + ")}</b>\n${head}\n` +
+        reached.map((zone) => `🧱 ${htmlEscape(zone.tf)} ${htmlEscape(zone.kind)} (${htmlEscape(zone.pattern)}) ${fmt(zone.low)} – ${fmt(zone.high)}`).join("\n") +
+        `\n<i>Watching M5: an engulfing or rejection that holds it → CLOSE NOW. Broken only when a candle of the ` +
+        `zone's own timeframe closes ${buy ? "above" : "below"} it → the trade goes on.</i>`,
+      { dedupeKey: `${watch.id}:at:${reached.map((zone) => `${zone.tf}:${zone.low}`).join(",")}`, priority: "critical" },
+    );
+  }
+  const watching = live.filter((item) => item.reachedAt);
+  if (!watching.length) return null;
+  const tolerance = priceTolerance(watch.symbol, mid);
+  const closedOf = async (tf) => closedSeries((await market.bars(watch.symbol, mainId, tf, 100)) || [], tf, { nowMs: now, staleBars: Infinity }).bars;
+  const m5 = await closedOf("M5");
+  for (const zone of watching) {
+    const own = zone.tf === "M5" ? m5 : await closedOf(zone.tf);
+    const verdict = zoneVerdict(m5, own, PERIOD_MS[zone.tf], watch.direction, zone, zone.reachedAt, tolerance);
+    if (!verdict) continue;
+    zone.done = verdict.verdict;
+    store.dirty = true;
+    if (verdict.verdict === "HELD") return { ...zone, type: verdict.type };
+    notify(
+      `<b>✅ ${htmlEscape(zone.tf)} ${htmlEscape(zone.kind.toUpperCase())} BROKEN</b>\n${head}\n` +
+        `A closed ${htmlEscape(zone.tf)} candle went through ${fmt(zone.low)} – ${fmt(zone.high)}. The trade goes on.`,
+      { dedupeKey: `${watch.id}:broken:${zone.tf}:${zone.low}` },
+    );
+  }
+  return null;
 }
 
 function failWatch(watch, price, reason) {
@@ -1044,7 +1106,9 @@ async function tickSetupWatch(watch) {
   }
   if (gates.pass) {
     watch.lastReason = "confirming";
-    confirmWatch(watch, { executable, spread }, { ...model, entryZone, zoneText, candleText }, gates, rr, stop, tp);
+    const furthest = [tp.level, watch.tp1, watch.tp2, watch.tp3].filter(Number.isFinite);
+    const walls = await obstaclesFor(watch, mainId, executable, buy ? Math.max(...furthest) : Math.min(...furthest));
+    confirmWatch(watch, { executable, spread }, { ...model, entryZone, zoneText, candleText }, gates, rr, stop, tp, walls);
     return;
   }
   const reasonText = gates.reasons.join(" | ");
@@ -1102,6 +1166,28 @@ async function smtAtSweep(watch, m5bars, partner, partnerId) {
   const partnerBars = closedSeries(raw || [], "M5", { nowMs: Date.now(), staleBars: Infinity }).bars;
   const divergent = smtDivergence(m5bars, partnerBars, watch.direction, sweep.timestampMs);
   return divergent === null ? null : { divergent, partner, at: sweep.timestampMs };
+}
+
+// The zones that can stop the trade on its way to the furthest target, on
+// every timeframe from M5 to H4, nearest first. A failure leaves them out
+// rather than delaying the entry.
+const OBSTACLE_TIMEFRAMES = ["M5", "M15", "M30", "H1", "H4"];
+async function obstaclesFor(watch, symbolId, entry, target) {
+  try {
+    const nowMs = Date.now();
+    const perTf = await Promise.all(
+      OBSTACLE_TIMEFRAMES.map(async (tf) => {
+        const raw = await market.bars(watch.symbol, symbolId, tf, 100);
+        const bars = closedSeries(raw || [], tf, { nowMs, staleBars: Infinity }).bars;
+        return obstacles(bars, watch.direction, entry, target).map((zone) => ({ tf, ...zone, reachedAt: null, done: null }));
+      }),
+    );
+    const buy = watch.direction === "buy";
+    return perTf.flat().sort((a, b) => (buy ? a.low - b.low : b.high - a.high));
+  } catch (error) {
+    log(`obstacles for ${watch.id} unavailable: ${error.message}`);
+    return [];
+  }
 }
 
 // The low-hanging fruit when it lies between the price and the registered
@@ -1383,7 +1469,7 @@ const CUSTOM_TOOLS = [
   {
     name: "register_watch",
     description:
-      "Registers a trading setup for live monitoring. The monitor validates it on live M5 candles — liquidity taken, CISD, an ICT entry model (FVG / IFVG / Unicorn / OTE order block), an M5 engulfing, rejection or SMT divergence — and sends ENTER NOW on Telegram when price retraces into the entry zone, with R:R, kill zone, news and spread clear. Then it manages the trade: TP alerts, SL to breakeven after TP1, CLOSE NOW where price turns back. Never places an order.",
+      "Registers a trading setup for live monitoring. The monitor validates it on live M5 candles — liquidity taken, CISD, an ICT entry model (FVG / IFVG / Unicorn / OTE order block), an M5 engulfing, rejection or SMT divergence — and sends ENTER NOW on Telegram when price retraces into the entry zone, with R:R, kill zone, news and spread clear. Then it manages the trade: TP alerts, SL to breakeven after TP1, CLOSE NOW where price turns back or an M5–H4 zone in the way holds. Never places an order.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -1792,7 +1878,7 @@ async function handleMcpRequest(req, res) {
       result: {
         protocolVersion: body.params?.protocolVersion || CONFIG.protocolVersion,
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.8.0" },
+        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.9.0" },
       },
     });
     return;
@@ -1887,7 +1973,7 @@ app.get("/health", async (req, res) => {
   const base = {
     status: SERVERLESS && !kv ? "storage_missing" : "ok",
     service: "watch-monitor-mcp",
-    version: "6.8.0",
+    version: "6.9.0",
     runtime: SERVERLESS ? "vercel" : "node",
     watches: setups.length,
     last_tick_at: SERVERLESS ? lastTickAt : undefined,
