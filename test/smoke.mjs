@@ -609,7 +609,7 @@ await nextMinute(3000);
 await tick();
 const midway = (await scenarioWatch()).active;
 assert(midway?.liquidityTaken === true, "bar A closed: its wick took the 4412 liquidity");
-assert(midway?.structureShift?.shifted === true, `bar A closed above the 4419.60 lower high: MSS (${midway?.lastReason})`);
+assert(midway?.structureShift?.shifted === true, `bar A closed above 4419.30, the open of the run down into the sweep: CISD (${midway?.lastReason})`);
 assert(midway?.m5Confirmation?.type === "rejection", `the sweep's M5 candle is a rejection (${JSON.stringify(midway?.m5Confirmation)})`);
 assert(midway?.lastReason === "awaiting_retrace", `a zone exists, price is away from it: no entry (${midway?.lastReason})`);
 

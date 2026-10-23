@@ -23,6 +23,7 @@ import {
   lowHangingFruit,
   manageTrade,
   m5Confirmation,
+  smtDivergence,
   evaluateSafety,
   inducement,
   killZoneStatus,
@@ -538,22 +539,22 @@ test("VERCEL — a wick through SL between two ticks still fails the watch", () 
 // ---------------------------------------------------------------------------
 // ENTER NOW — what has to be true before a human enters at market.
 
-test("ENTRY — structure shift needs a body close beyond the last swing into the low", () => {
+test("ENTRY — CISD: a body close beyond the open of the run that delivered price into the low", () => {
   const start = Date.UTC(2026, 9, 21, 13, 0);
-  // Pullback into the POI: lower high 101 at #2, touch at #4, reaction
-  // low 97.5 at #5, a wick above 101 that closes below it (#6), then a
-  // body close at 101.4 (#7).
+  // An up candle, then three down-close candles deliver price to 97.5 (the
+  // run opened at 100.8). A wick above 100.8 that closes below it (#4), then
+  // a body close at 101.0 (#5).
   const shape = [
-    [102, 102.5, 101, 101.5], [100.6, 100.8, 100, 100.2], [100.2, 101, 99.8, 100], [100, 100.2, 98.8, 99],
-    [99, 99.2, 98, 98.4], [98.4, 98.6, 97.5, 98.5], [98.5, 101.3, 98.4, 100.6], [100.6, 101.6, 100.4, 101.4],
+    [100, 101, 99.8, 100.8], [100.8, 100.9, 99.6, 99.8], [99.8, 99.9, 98.7, 98.9], [98.9, 99, 97.5, 97.8],
+    [97.8, 100.95, 97.7, 100.5], [100.5, 101.2, 100.3, 101],
   ];
   const bars = shape.map(([o, h, l, c], i) => bar(start + i * M1, o, h, l, c));
-  const touch = start + 4 * M1;
-  assert.deepEqual(structureShift(bars.slice(0, 7), "buy", touch), { shifted: false, level: 101, at: null, via: "swing" }, "a wick is not a shift");
+  const touch = start + 2 * M1;
+  assert.deepEqual(structureShift(bars.slice(0, 5), "buy", touch), { shifted: false, level: 100.8, at: null }, "a wick is not a shift");
   const shift = structureShift(bars, "buy", touch);
   assert.equal(shift.shifted, true);
-  assert.equal(shift.at, start + 7 * M1);
-  const lowerLow = [...bars, bar(start + 8 * M1, 101.4, 101.5, 97, 97.2)];
+  assert.equal(shift.at, start + 5 * M1);
+  const lowerLow = [...bars, bar(start + 6 * M1, 101, 101.1, 97, 97.2)];
   assert.equal(structureShift(lowerLow, "buy", touch).shifted, false, "a new low after the shift resets it");
 
   // A straight drop has no swing: the level is the open of the run of
@@ -563,7 +564,6 @@ test("ENTRY — structure shift needs a body close beyond the last swing into th
   const cisd = structureShift(straight, "buy", start + 2 * M1);
   assert.equal(cisd.level, 103);
   assert.equal(cisd.shifted, true);
-  assert.equal(cisd.via, "cisd");
 });
 
 test("ENTRY — R:R is measured at the market price the human will actually get", () => {
@@ -832,16 +832,16 @@ const m1Bars = (rows) => rows.map(([o, h, l, c], i) => bar(T0 + i * M1, o, h, l,
 const TOUCH = T0 + 6 * M1;
 const mirror = (rows) => rows.map(([o, h, l, c]) => [200 - o, 200 - l, 200 - h, 200 - c]);
 
-test("MODEL 2022 — MSS by displacement, then the FVG of the leg; stop beyond the swing low", () => {
+test("MODEL 2022 — CISD with displacement, then the FVG of the leg; stop beyond the swing low", () => {
   const rows = [
     ...DECLINE,
     [99.6, 103.5, 99.5, 103.3], // displacement
-    [103.3, 107.8, 103.6, 107.5], // closes above 107: MSS
+    [103.3, 107.8, 103.6, 107.5], // closes above 106.8, the open of the run down: CISD
     [107.5, 112, 104, 106.2],
   ];
   const model = entryModel(m1Bars(rows), "buy", TOUCH);
   assert.equal(model.mss.shifted, true);
-  assert.equal(model.mss.level, 107);
+  assert.equal(model.mss.level, 106.8);
   assert.deepEqual(
     [model.zone.model, model.zone.low, model.zone.high, model.zone.stop, model.zone.ote],
     ["FVG", 103.5, 104, 99, false],
@@ -935,22 +935,22 @@ test("MODEL OTE — a low inside the OTE band makes the order block an entry; ou
   assert.equal(entryModel(m1Bars(rows), "buy", TOUCH, { ote: { low: 101, high: 104 } }).zone, null, "a low outside the band: no OTE, no OB");
 });
 
-test("MODEL 2022 — an MSS without a displacement candle is not the 2022 model", () => {
+test("MODEL 2022 — a CISD without a displacement candle is not the 2022 model", () => {
   // Up into the 107 swing in small candles that still leave gaps.
   const rows = [
     ...DECLINE,
     [99.8, 101.2, 99.7, 101],
     [102, 103.4, 101.9, 103.2],
     [104.2, 105.5, 104.1, 105.3],
-    [105.4, 107.6, 104.5, 107.4], // closes above 107: an MSS, but every body is under 2× the average
+    [105.4, 107.6, 104.5, 107.4], // closes above 106.8: a CISD, but every body is under 2× the average
   ];
   const model = entryModel(m1Bars(rows), "buy", TOUCH);
-  assert.equal(model.mss.via, "swing");
+  assert.equal(model.mss.shifted, true);
   assert.equal(model.displaced, false);
   assert.equal(model.zone, null, "gaps 101.2–104.1 and 103.4–104.5 exist, but no 2022 entry without displacement");
 });
 
-test("MODEL 2022 — a CISD is not the 2022 model's MSS; under OTE it is enough", () => {
+test("MODEL 2022 — a straight drop: the CISD with displacement gives the FVG; OTE tags it", () => {
   // A straight drop to 98 with no swing high, then displacement and a gap.
   const rows = [
     [103, 103.2, 101.8, 102],
@@ -961,11 +961,11 @@ test("MODEL 2022 — a CISD is not the 2022 model's MSS; under OTE it is enough"
   ];
   const touch = T0 + 2 * M1;
   const plain = entryModel(m1Bars(rows), "buy", touch);
-  assert.equal(plain.mss.via, "cisd");
+  assert.equal(plain.mss.level, 103);
   assert.equal(plain.displaced, true);
-  assert.equal(plain.zone, null, "the 2022 model breaks a swing; a CISD alone does not qualify");
+  assert.deepEqual([plain.zone.model, plain.zone.low, plain.zone.high, plain.zone.ote], ["FVG", 101.9, 102, false]);
   const inOte = entryModel(m1Bars(rows), "buy", touch, { ote: { low: 97, high: 99 } });
-  assert.deepEqual([inOte.zone.model, inOte.zone.low, inOte.zone.high, inOte.zone.ote], ["FVG", 101.9, 102, true], "OTE: MSS/CISD and the FVG");
+  assert.deepEqual([inOte.zone.model, inOte.zone.low, inOte.zone.high, inOte.zone.ote], ["FVG", 101.9, 102, true], "OTE: CISD and the FVG");
 });
 
 test("TARGET — low-hanging fruit: the nearest untaken pool, or a nearer H1 gap", () => {
@@ -990,7 +990,7 @@ const SELL_TRADE = { direction: "sell", entry: 100, sl: 104, risk: 4, targets: [
 const RUN_DOWN = [
   [100, 100.2, 98.4, 98.6],
   [98.6, 98.7, 97.4, 97.6],
-  [97.6, 98.9, 97.5, 98.7], // lower high 98.9
+  [97.6, 98.9, 97.5, 98.7], // a bounce; the run down to the low opens at 98.7
   [98.7, 98.8, 96.2, 96.4],
   [96.4, 96.5, 95.2, 95.4], // best price 95.2: 1.2R in favour
   [95.4, 97.2, 95.3, 97], // bounces, still under 98.9
@@ -1000,7 +1000,7 @@ test("TRADE — where price stops and turns back, CLOSE NOW", () => {
   const holding = manageTrade(SELL_TRADE, m1Bars(RUN_DOWN), { mid: 97, protective: 97.1 });
   assert.deepEqual([holding.action, holding.best], ["HOLD", 95.2]);
   const turned = manageTrade(SELL_TRADE, m1Bars([...RUN_DOWN, [97, 99.2, 96.9, 99.1]]), { mid: 99.1, protective: 99.2 });
-  assert.deepEqual([turned.action, turned.level, turned.price], ["REVERSAL", 98.9, 99.2], "a body close above the lower high into the low");
+  assert.deepEqual([turned.action, turned.level, turned.price], ["REVERSAL", 98.7, 99.2], "a body close above 98.7, the open of the run down into the low: CISD");
   assert.equal(
     manageTrade(SELL_TRADE, m1Bars([...RUN_DOWN, [97, 99.2, 96.9, 99.1]]), { mid: 99.1, protective: 99.2 }, { armR: 2 }).action,
     "HOLD",
@@ -1062,4 +1062,17 @@ test("TRADE — the bar the entry happened in does not count as progress", () =>
   const trade = { ...SELL_TRADE, enteredAt: T0 + 3 * M1 };
   const bars = m5Bars([[96, 100.3, 95.5, 99.8], [99.8, 100.4, 99, 100.2], [100.2, 101, 99.9, 100.9]]);
   assert.equal(manageTrade(trade, bars, { mid: 100.9, protective: 101 }).action, "HOLD", "no 1R of progress was made after the entry");
+});
+
+test("SMT — at the sweep the main symbol takes liquidity and its partner does not", () => {
+  const flat = (base) => Array.from({ length: 10 }, () => [base, base + 1, base - 1, base]);
+  const gold = m5Bars([...flat(100), [100, 103, 99.5, 101], [101, 101.5, 99, 99.2]]); // a higher high at #10
+  const silverLower = m5Bars([...flat(50), [50, 50.8, 49.5, 50.2], [50.2, 50.4, 49.2, 49.4]]); // stays under 51
+  const silverHigher = m5Bars([...flat(50), [50, 51.6, 49.5, 50.2], [50.2, 50.4, 49.2, 49.4]]);
+  const sweepAt = T0 + 10 * 300_000;
+  assert.equal(smtDivergence(gold, silverLower, "sell", sweepAt), true, "gold swept its highs, silver did not: bearish SMT");
+  assert.equal(smtDivergence(gold, silverHigher, "sell", sweepAt), false, "both took their highs: no divergence");
+  assert.equal(smtDivergence(gold, silverLower.slice(0, 3), "sell", sweepAt), null, "partner bars missing: cannot tell");
+  const mirror = (bars) => bars.map((b) => ({ ...b, open: 200 - b.open, high: 200 - b.low, low: 200 - b.high, close: 200 - b.close }));
+  assert.equal(smtDivergence(mirror(gold), mirror(silverLower), "buy", sweepAt), true, "a buy is the mirror image");
 });

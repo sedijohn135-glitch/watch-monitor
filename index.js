@@ -46,6 +46,7 @@ import {
   liquidityTaken,
   lowHangingFruit,
   m5Confirmation,
+  smtDivergence,
   manageTrade,
   marketRR,
   nyClock,
@@ -97,7 +98,7 @@ const CONFIG = {
   // After ENTER NOW: how far in R the trade must have run before an M1
   // structure shift against it triggers CLOSE NOW.
   exitArmR: num(process.env.EXIT_ARM_R, 1, 0),
-  // The timeframe the MSS, the model zones and CLOSE NOW are read on. M1
+  // The timeframe the CISD, the model zones and CLOSE NOW are read on. M1
   // is noise; M5 by default. (The M5 engulfing/rejection is always M5, and
   // M1 is still used, as data only, to see wicks touch the SL between ticks.)
   entryTimeframe: ["M1", "M5", "M15"].includes(String(process.env.ENTRY_TIMEFRAME || "").toUpperCase())
@@ -410,8 +411,8 @@ function confirmWatch(watch, quote, model, gates, rr, stop, tp) {
       `<b>Checklist</b>\n` +
       `✅ Liquidity ${fmt(watch.sweep_level)} taken\n` +
       `✅ Entry ${fmt(watch.entry)} touched\n` +
-      `✅ MSS: ${CONFIG.entryTimeframe} body close ${buy ? "above" : "below"} ${fmt(model.mss.level)}` +
-      `${model.mss.via === "cisd" ? " (CISD)" : model.displaced ? " with displacement" : ""}\n` +
+      `✅ CISD: ${CONFIG.entryTimeframe} body close ${buy ? "above" : "below"} ${fmt(model.mss.level)}` +
+      `${model.displaced ? " with displacement" : ""}\n` +
       `✅ ${htmlEscape(zoneLabel(model.zone))}: ${fmt(model.zone.low)} – ${fmt(model.zone.high)}\n` +
       `✅ ${htmlEscape(model.candleText)}\n` +
       `✅ Price retraced into the entry zone ${htmlEscape(model.zoneText)}\n` +
@@ -771,7 +772,9 @@ async function tickSetupWatch(watch) {
     return;
   }
 
-  const ids = await market.resolveSymbols([watch.symbol]);
+  // The first partner of the SMT bundle is the one SMT is read against.
+  const partner = SMT_BUNDLES[watch.symbol]?.[0]?.symbol ?? null;
+  const ids = await market.resolveSymbols(partner ? [watch.symbol, partner] : [watch.symbol]);
   const mainId = ids.get(watch.symbol);
   if (mainId === undefined) {
     watch.lastReason = "symbol_unavailable";
@@ -867,7 +870,7 @@ async function tickSetupWatch(watch) {
       `<b>ENTRY TOUCHED</b>\n` +
         `<b>${htmlEscape(watch.symbol)}</b> ${htmlEscape(watch.direction.toUpperCase())}\n` +
         `<b>Entry:</b> ${htmlEscape(formatLevel(watch.entry))} | <b>Price:</b> ${htmlEscape(formatLevel(safety.price))}\n` +
-        `<i>Next: liquidity taken → ${CONFIG.entryTimeframe} MSS → FVG / IFVG / Unicorn → M5 engulfing or rejection → ENTER NOW on the retrace into the zone.</i>`,
+        `<i>Next: liquidity taken → ${CONFIG.entryTimeframe} CISD → FVG / IFVG / Unicorn → M5 engulfing, rejection or SMT → ENTER NOW on the retrace into the zone.</i>`,
       { dedupeKey: `${watch.id}:touched` },
     );
   } else if (safety.action === "WAIT") {
@@ -936,7 +939,7 @@ async function tickSetupWatch(watch) {
     watch.lastReason = "awaiting_liquidity_sweep";
     return;
   }
-  // Steps 2–3: MSS, then the zone the displacement left. Read from closed
+  // Steps 2–3: CISD, then the zone the displacement left. Read from closed
   // bars of the entry timeframe only, so a late tick can neither miss nor
   // invent it.
   // OTE needs the H1 dealing range; without H1 candles the other three
@@ -949,25 +952,33 @@ async function tickSetupWatch(watch) {
   if (!model.mss.shifted || !model.zone) {
     watch.lifecycle = "TOUCHED";
     watch.lastGateBlockReason = null;
-    watch.lastReason = model.mss.shifted ? "awaiting_fvg" : "awaiting_structure_shift";
+    watch.lastReason = model.mss.shifted ? "awaiting_fvg" : "awaiting_cisd";
     return;
   }
-  // Absolute: an M5 engulfing or rejection candle in the trade's direction,
-  // from the M5 bar of the turn on. Never M1: one minute is noise.
+  // Absolute: at least one strong confirmation, all on M5 (M1 is noise) —
+  // an engulfing or rejection candle in the trade's direction from the
+  // bar of the turn on, or SMT divergence with the partner at the sweep.
+  const hhmm = (ms) => new Date(ms).toISOString().slice(11, 16);
   const candle = m5Confirmation(
     m5.bars,
     watch.direction,
     Math.floor(model.extremeAt / PERIOD_MS.M5) * PERIOD_MS.M5,
     tolerance,
   );
+  const smt = await smtAtSweep(watch, m5.bars, partner, ids.get(partner));
   watch.m5Confirmation = candle;
-  if (!candle) {
+  watch.smt = smt;
+  const confirmations = [
+    candle && `M5 ${candle.type} ${hhmm(candle.at)} UTC`,
+    smt?.divergent && `SMT divergence vs ${smt.partner} at ${hhmm(smt.at)} UTC`,
+  ].filter(Boolean);
+  if (!confirmations.length) {
     watch.lifecycle = "TOUCHED";
     watch.lastGateBlockReason = null;
-    watch.lastReason = "awaiting_m5_engulfing_or_rejection";
+    watch.lastReason = "awaiting_engulfing_rejection_or_smt";
     return;
   }
-  const candleText = `M5 ${candle.type} ${new Date(candle.at).toISOString().slice(11, 16)} UTC`;
+  const candleText = confirmations.join(" + ");
 
   const zone = model.zone;
   const label = zoneLabel(zone);
@@ -992,7 +1003,7 @@ async function tickSetupWatch(watch) {
     watch.target = await targetFor(watch, mainId, mid);
     const tp = firstTarget(watch, watch.target, mid);
     notify(
-      `<b>🟡 MSS + ${htmlEscape(label)} — ENTRY ZONE READY</b>\n` +
+      `<b>🟡 CISD + ${htmlEscape(label)} — ENTRY ZONE READY</b>\n` +
         `<b>${htmlEscape(watch.symbol)} ${htmlEscape(watch.direction.toUpperCase())}</b>\n` +
         `<b>Entry zone:</b> ${htmlEscape(zoneText)}\n` +
         (prepared ? `<b>Validated by:</b> ${htmlEscape(label)} ${htmlEscape(formatLevel(zone.low))} – ${htmlEscape(formatLevel(zone.high))}\n` : "") +
@@ -1075,6 +1086,22 @@ async function targetFor(watch, symbolId, price) {
     log(`low-hanging fruit for ${watch.id} unavailable: ${error.message}`);
     return null;
   }
+}
+
+// SMT at the sweep, on M5: the bar where price went furthest beyond
+// sweep_level (the liquidity taken), against the bundle's first partner.
+// Null when there is no partner, no sweep bar in the window, or too few
+// partner bars to tell.
+async function smtAtSweep(watch, m5bars, partner, partnerId) {
+  if (!partner || partnerId === undefined) return null;
+  const buy = watch.direction === "buy";
+  const beyond = m5bars.filter((bar) => (buy ? bar.low <= watch.sweep_level : bar.high >= watch.sweep_level));
+  if (!beyond.length) return null;
+  const sweep = beyond.reduce((best, bar) => (buy ? (bar.low < best.low ? bar : best) : bar.high > best.high ? bar : best));
+  const raw = await market.bars(partner, partnerId, "M5", 100);
+  const partnerBars = closedSeries(raw || [], "M5", { nowMs: Date.now(), staleBars: Infinity }).bars;
+  const divergent = smtDivergence(m5bars, partnerBars, watch.direction, sweep.timestampMs);
+  return divergent === null ? null : { divergent, partner, at: sweep.timestampMs };
 }
 
 // The low-hanging fruit when it lies between the price and the registered
@@ -1356,7 +1383,7 @@ const CUSTOM_TOOLS = [
   {
     name: "register_watch",
     description:
-      "Registers a trading setup for live monitoring. The monitor validates it on live M5 candles — liquidity taken, MSS, an ICT entry model (FVG / IFVG / Unicorn / OTE order block), an M5 engulfing or rejection — and sends ENTER NOW on Telegram when price retraces into the entry zone, with R:R, kill zone, news and spread clear. Then it manages the trade: TP alerts, SL to breakeven after TP1, CLOSE NOW where price turns back. Never places an order.",
+      "Registers a trading setup for live monitoring. The monitor validates it on live M5 candles — liquidity taken, CISD, an ICT entry model (FVG / IFVG / Unicorn / OTE order block), an M5 engulfing, rejection or SMT divergence — and sends ENTER NOW on Telegram when price retraces into the entry zone, with R:R, kill zone, news and spread clear. Then it manages the trade: TP alerts, SL to breakeven after TP1, CLOSE NOW where price turns back. Never places an order.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -1384,7 +1411,7 @@ const CUSTOM_TOOLS = [
         entry_zone_low: {
           type: "number",
           description:
-            "The prepared entry zone's lower edge (the FVG / OB / breaker range the entry sits in). Send it with entry_zone_high whenever the analysis has a zone: ENTER NOW then comes only when price retraces into this zone, after the monitor has validated the setup (liquidity taken, M5 MSS, an ICT entry model, an M5 engulfing or rejection). The entry must lie inside the zone and the SL beyond it.",
+            "The prepared entry zone's lower edge (the FVG / OB / breaker range the entry sits in). Send it with entry_zone_high whenever the analysis has a zone: ENTER NOW then comes only when price retraces into this zone, after the monitor has validated the setup (liquidity taken, M5 CISD, an ICT entry model, an M5 engulfing, rejection or SMT divergence). The entry must lie inside the zone and the SL beyond it.",
         },
         entry_zone_high: {
           type: "number",
@@ -1765,7 +1792,7 @@ async function handleMcpRequest(req, res) {
       result: {
         protocolVersion: body.params?.protocolVersion || CONFIG.protocolVersion,
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.7.0" },
+        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.8.0" },
       },
     });
     return;
@@ -1860,7 +1887,7 @@ app.get("/health", async (req, res) => {
   const base = {
     status: SERVERLESS && !kv ? "storage_missing" : "ok",
     service: "watch-monitor-mcp",
-    version: "6.7.0",
+    version: "6.8.0",
     runtime: SERVERLESS ? "vercel" : "node",
     watches: setups.length,
     last_tick_at: SERVERLESS ? lastTickAt : undefined,
