@@ -526,6 +526,9 @@ const vercel = boot({
   KV_REST_API_TOKEN: "kv-token",
   FAST_MODE_INTERVAL_MS: "1500",
   FAST_MODE_WINDOW_MS: "4000",
+  // The scripted scenario plays the model on M1 so it takes minutes, not
+  // an hour of M5 bars; M5 itself is covered by the unit tests.
+  ENTRY_TIMEFRAME: "M1",
 });
 await sleep(1500);
 const tick = (query = "", headers = { authorization: "Bearer secret" }) =>

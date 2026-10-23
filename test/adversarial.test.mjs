@@ -1048,3 +1048,18 @@ test("M5 CONFIRMATION — a rejection wick; a symmetric doji is not one", () => 
   assert.equal(m5Confirmation(doji, "buy", T0), null);
   assert.equal(m5Confirmation(hammer, "buy", T0 + 600_000), null, "only from the turn on");
 });
+
+test("MODEL on M5 — the touch's own M5 bar is part of the reaction, wherever in it the touch fell", () => {
+  const rows = [...DECLINE, [99.6, 103.5, 99.5, 103.3], [103.3, 107.8, 103.6, 107.5], [107.5, 112, 104, 106.2]];
+  const touch = T0 + 6 * 300_000 + 3 * M1; // three minutes into the bar that made the 99 low
+  const onM5 = entryModel(m5Bars(rows), "buy", touch, { span: 300_000 });
+  assert.deepEqual([onM5.zone.model, onM5.zone.low, onM5.zone.high, onM5.zone.stop], ["FVG", 103.5, 104, 99]);
+  assert.equal(entryModel(m5Bars(rows), "buy", touch).zone?.stop, 99.5, "read with an M1 span, the 99 low is skipped and the stop lands on the wrong swing");
+});
+
+test("TRADE — the bar the entry happened in does not count as progress", () => {
+  // Sold at 100 three minutes into an M5 bar that had traded down to 95.5 first.
+  const trade = { ...SELL_TRADE, enteredAt: T0 + 3 * M1 };
+  const bars = m5Bars([[96, 100.3, 95.5, 99.8], [99.8, 100.4, 99, 100.2], [100.2, 101, 99.9, 100.9]]);
+  assert.equal(manageTrade(trade, bars, { mid: 100.9, protective: 101 }).action, "HOLD", "no 1R of progress was made after the entry");
+});

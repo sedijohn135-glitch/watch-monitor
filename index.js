@@ -97,6 +97,12 @@ const CONFIG = {
   // After ENTER NOW: how far in R the trade must have run before an M1
   // structure shift against it triggers CLOSE NOW.
   exitArmR: num(process.env.EXIT_ARM_R, 1, 0),
+  // The timeframe the MSS, the model zones and CLOSE NOW are read on. M1
+  // is noise; M5 by default. (The M5 engulfing/rejection is always M5, and
+  // M1 is still used, as data only, to see wicks touch the SL between ticks.)
+  entryTimeframe: ["M1", "M5", "M15"].includes(String(process.env.ENTRY_TIMEFRAME || "").toUpperCase())
+    ? String(process.env.ENTRY_TIMEFRAME).toUpperCase()
+    : "M5",
 
   priceScale: num(process.env.CTRADER_PRICE_SCALE, 100000, 1),
   scaleTolerance: num(process.env.SCALE_TOLERANCE, 0.35, 0.05),
@@ -404,7 +410,7 @@ function confirmWatch(watch, quote, model, gates, rr, stop, tp) {
       `<b>Checklist</b>\n` +
       `✅ Liquidity ${fmt(watch.sweep_level)} taken\n` +
       `✅ Entry ${fmt(watch.entry)} touched\n` +
-      `✅ MSS: M1 body close ${buy ? "above" : "below"} ${fmt(model.mss.level)}` +
+      `✅ MSS: ${CONFIG.entryTimeframe} body close ${buy ? "above" : "below"} ${fmt(model.mss.level)}` +
       `${model.mss.via === "cisd" ? " (CISD)" : model.displaced ? " with displacement" : ""}\n` +
       `✅ ${htmlEscape(zoneLabel(model.zone))}: ${fmt(model.zone.low)} – ${fmt(model.zone.high)}\n` +
       `✅ ${htmlEscape(model.candleText)}\n` +
@@ -425,10 +431,17 @@ function confirmWatch(watch, quote, model, gates, rr, stop, tp) {
 async function manageOpenTrade(watch, { mainId, mid, executable, protective, now }) {
   const trade = watch.trade;
   const buy = trade.direction === "buy";
-  const raw = await market.bars(watch.symbol, mainId, "M1", 80);
-  const bars = closedSeries(raw || [], "M1", { nowMs: now, staleBars: Infinity }).bars;
+  // M1 only to see a wick touch the stop or a target between ticks; the
+  // turn that closes the trade is read on the entry timeframe.
+  const tf = CONFIG.entryTimeframe;
+  const [m1raw, tfRaw] = await Promise.all([
+    market.bars(watch.symbol, mainId, "M1", 80),
+    tf === "M1" ? null : market.bars(watch.symbol, mainId, tf, 100),
+  ]);
+  const m1 = closedSeries(m1raw || [], "M1", { nowMs: now, staleBars: Infinity }).bars;
+  const bars = tf === "M1" ? m1 : closedSeries(tfRaw || [], tf, { nowMs: now, staleBars: Infinity }).bars;
   const sinceMs = Math.max(trade.enteredAt, watch.lastTickAt ? Date.parse(watch.lastTickAt) : 0);
-  const seen = quotesWithGap(watch.direction, { mid, executable, protective }, bars, sinceMs);
+  const seen = quotesWithGap(watch.direction, { mid, executable, protective }, m1, sinceMs);
   const result = manageTrade(trade, bars, seen, { armR: CONFIG.exitArmR });
   trade.best = result.best;
   store.dirty = true;
@@ -475,7 +488,7 @@ async function manageOpenTrade(watch, { mainId, mid, executable, protective, now
     { resolvedPrice: exit, exit_reason: result.action, result_r: Number(r.toFixed(2)), trade },
     `<b>${title}</b>\n${head}\n` +
       (result.action === "REVERSAL"
-        ? `<b>Close at market</b> ≈ ${fmt(exit)} — price stopped at ${fmt(result.best)} and an M1 candle closed back ` +
+        ? `<b>Close at market</b> ≈ ${fmt(exit)} — price stopped at ${fmt(result.best)} and an ${tf} candle closed back ` +
           `${buy ? "below" : "above"} ${fmt(result.level)}\n`
         : `<b>At:</b> ${fmt(exit)}\n`) +
       `<b>Result:</b> ${signedR(exit)} on what is still open` +
@@ -854,7 +867,7 @@ async function tickSetupWatch(watch) {
       `<b>ENTRY TOUCHED</b>\n` +
         `<b>${htmlEscape(watch.symbol)}</b> ${htmlEscape(watch.direction.toUpperCase())}\n` +
         `<b>Entry:</b> ${htmlEscape(formatLevel(watch.entry))} | <b>Price:</b> ${htmlEscape(formatLevel(safety.price))}\n` +
-        `<i>Next: liquidity taken → M1 MSS → FVG / IFVG / Unicorn → M5 engulfing or rejection → ENTER NOW on the retrace into the zone.</i>`,
+        `<i>Next: liquidity taken → ${CONFIG.entryTimeframe} MSS → FVG / IFVG / Unicorn → M5 engulfing or rejection → ENTER NOW on the retrace into the zone.</i>`,
       { dedupeKey: `${watch.id}:touched` },
     );
   } else if (safety.action === "WAIT") {
@@ -864,20 +877,21 @@ async function tickSetupWatch(watch) {
   }
 
   // -- The entry model -------------------------------------------------------
-  const [m5raw, m1raw, h1raw] = await Promise.all([
-    market.bars(watch.symbol, mainId, "M5", 60),
-    market.bars(watch.symbol, mainId, "M1", 80),
+  const tf = CONFIG.entryTimeframe;
+  const [m5raw, tfRaw, h1raw] = await Promise.all([
+    market.bars(watch.symbol, mainId, "M5", 100),
+    tf === "M5" ? null : market.bars(watch.symbol, mainId, tf, 80),
     market.bars(watch.symbol, mainId, "H1", 60),
   ]);
   const m5 = closedSeries(m5raw || [], "M5", { nowMs: now });
-  const m1 = closedSeries(m1raw || [], "M1", { nowMs: now, staleBars: 5 });
+  const series = tf === "M5" ? m5 : closedSeries(tfRaw || [], tf, { nowMs: now, staleBars: 5 });
   const h1 = closedSeries(h1raw || [], "H1", { nowMs: now });
-  if (m5.status !== "OK" || m1.status !== "OK" || m1.bars.length < 20) {
-    watch.lastReason = `candles_${(m5.status !== "OK" ? m5.status : m1.status).toLowerCase()}`;
+  if (m5.status !== "OK" || series.status !== "OK" || series.bars.length < 20) {
+    watch.lastReason = `candles_${(m5.status !== "OK" ? m5.status : series.status).toLowerCase()}`;
     noteDataQuality(
       watch,
       false,
-      m5.status === "NO_TIMESTAMP" || m1.status === "NO_TIMESTAMP"
+      m5.status === "NO_TIMESTAMP" || series.status === "NO_TIMESTAMP"
         ? "candle feed omitted bar timestamps; closure cannot be verified"
         : "insufficient or stale candle history",
     );
@@ -885,20 +899,20 @@ async function tickSetupWatch(watch) {
   }
 
   // Candle bodies and the live quote must describe the same instrument.
-  const barVsSpot = market.checkScale(m1.bars.at(-1).close, mid);
+  const barVsSpot = market.checkScale(series.bars.at(-1).close, mid);
   if (!barVsSpot.ok) {
     watch.lastReason = "candle_spot_divergence";
     noteDataQuality(
       watch,
       false,
-      `candle close ${formatLevel(m1.bars.at(-1).close)} disagrees with live mid ${formatLevel(mid)}`,
+      `candle close ${formatLevel(series.bars.at(-1).close)} disagrees with live mid ${formatLevel(mid)}`,
     );
     return;
   }
 
   // Only stops run after registration count, unless the caller said the
   // sweep had already printed; then the M5 history must show it.
-  const sweepBars = [...m5.bars, ...m1.bars].filter(
+  const sweepBars = [...m5.bars, ...(tf === "M5" ? [] : series.bars)].filter(
     (bar) => watch.liquidity_taken || bar.timestampMs >= watch.armedAtMs,
   );
   if (sweepBars.length) {
@@ -923,11 +937,12 @@ async function tickSetupWatch(watch) {
     return;
   }
   // Steps 2–3: MSS, then the zone the displacement left. Read from closed
-  // M1 bars only, so a tick a minute late can neither miss nor invent it.
+  // bars of the entry timeframe only, so a late tick can neither miss nor
+  // invent it.
   // OTE needs the H1 dealing range; without H1 candles the other three
   // models still work.
   const ote = h1.status === "OK" ? oteZone(h1.bars.slice(-48), watch.direction) : null;
-  const model = entryModel(m1.bars, watch.direction, Date.parse(watch.entryTouchedAt), { ote });
+  const model = entryModel(series.bars, watch.direction, Date.parse(watch.entryTouchedAt), { ote, span: PERIOD_MS[tf] });
   watch.structureShift = model.mss;
   watch.entryZone = model.zone;
   store.dirty = true;
@@ -1341,7 +1356,7 @@ const CUSTOM_TOOLS = [
   {
     name: "register_watch",
     description:
-      "Registers a trading setup for live monitoring. The monitor waits for the ICT entry model on live M1 candles — liquidity taken, MSS, an FVG / IFVG / Unicorn zone, then the retrace into it — plus R:R, kill zone, news and spread, before sending a Telegram confirmation. Never places an order.",
+      "Registers a trading setup for live monitoring. The monitor validates it on live M5 candles — liquidity taken, MSS, an ICT entry model (FVG / IFVG / Unicorn / OTE order block), an M5 engulfing or rejection — and sends ENTER NOW on Telegram when price retraces into the entry zone, with R:R, kill zone, news and spread clear. Then it manages the trade: TP alerts, SL to breakeven after TP1, CLOSE NOW where price turns back. Never places an order.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -1369,7 +1384,7 @@ const CUSTOM_TOOLS = [
         entry_zone_low: {
           type: "number",
           description:
-            "The prepared entry zone's lower edge (the FVG / OB / breaker range the entry sits in). Send it with entry_zone_high whenever the analysis has a zone: ENTER NOW then comes only when price retraces into this zone, after the monitor has validated the setup (liquidity taken, M1 MSS, an ICT entry model). The entry must lie inside the zone and the SL beyond it.",
+            "The prepared entry zone's lower edge (the FVG / OB / breaker range the entry sits in). Send it with entry_zone_high whenever the analysis has a zone: ENTER NOW then comes only when price retraces into this zone, after the monitor has validated the setup (liquidity taken, M5 MSS, an ICT entry model, an M5 engulfing or rejection). The entry must lie inside the zone and the SL beyond it.",
         },
         entry_zone_high: {
           type: "number",
@@ -1750,7 +1765,7 @@ async function handleMcpRequest(req, res) {
       result: {
         protocolVersion: body.params?.protocolVersion || CONFIG.protocolVersion,
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.6.0" },
+        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.7.0" },
       },
     });
     return;
@@ -1845,7 +1860,7 @@ app.get("/health", async (req, res) => {
   const base = {
     status: SERVERLESS && !kv ? "storage_missing" : "ok",
     service: "watch-monitor-mcp",
-    version: "6.6.0",
+    version: "6.7.0",
     runtime: SERVERLESS ? "vercel" : "node",
     watches: setups.length,
     last_tick_at: SERVERLESS ? lastTickAt : undefined,
