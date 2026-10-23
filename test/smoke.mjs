@@ -601,8 +601,38 @@ await rpc(
   1,
   9804,
 );
+// The same move, registered with the analysis's prepared zone (the PD
+// array 4411.50–4415 the sweep wicks into).
+await rpc(
+  "tools/call",
+  {
+    name: "register_watch",
+    arguments: {
+      setup_id: "scenario-zone",
+      symbol: "XAUUSD",
+      direction: "buy",
+      entry: 4414,
+      sl: 4400,
+      tp1: 4451,
+      tp2: 4460,
+      sweep_level: 4412,
+      liquidity_taken: true,
+      entry_zone_low: 4411.5,
+      entry_zone_high: 4415,
+      setup_model: "2022 model",
+      conviction: "A",
+    },
+  },
+  1,
+  9804,
+);
+const zoneWatch = async () => {
+  const listed = JSON.parse((await rpc("tools/call", { name: "list_watches" }, 1, 9804)).result.content[0].text);
+  return listed.active.find((watch) => watch.setup_id === "scenario-zone") ?? listed.recent.find((r) => r.setup_id === "scenario-zone");
+};
 await tick();
 assert((await scenarioWatch()).active?.entryTouched === true, "minute A: entry touched live");
+assert((await zoneWatch())?.entryTouched === true, "prepared zone: price in the zone is the touch");
 
 price = 4425; // the displacement, away from every zone
 await nextMinute(3000);
@@ -612,6 +642,11 @@ assert(midway?.liquidityTaken === true, "bar A closed: its wick took the 4412 li
 assert(midway?.structureShift?.shifted === true, `bar A closed above 4419.30, the open of the run down into the sweep: CISD (${midway?.lastReason})`);
 assert(midway?.m5Confirmation?.type === "rejection", `the sweep's M5 candle is a rejection (${JSON.stringify(midway?.m5Confirmation)})`);
 assert(midway?.lastReason === "awaiting_retrace", `a zone exists, price is away from it: no entry (${midway?.lastReason})`);
+const zoned = await zoneWatch();
+assert(
+  zoned?.validator?.state === "armed" && zoned.validator.last?.type === "rejection" && zoned.lastReason === "awaiting_retrace",
+  `prepared zone: the sweep's M5 rejection in it arms the setup; price is away, no entry (${JSON.stringify(zoned?.validator)} ${zoned?.lastReason} ${JSON.stringify(zoned?.trade ?? null)})`,
+);
 
 price = 4427; // price has not come back
 await nextMinute(3000);
@@ -638,6 +673,11 @@ const open = (await scenarioWatch()).active;
 const trade = open?.trade;
 assert(open?.lifecycle === "IN_TRADE", `retrace into the FVG: REAL CONFIRMATION — ENTER NOW, and the trade stays watched (${open?.lifecycle ?? (await scenarioWatch()).resolved?.status})`);
 assert(trade?.rr_at_entry >= 1, `entered in the zone with R:R ${trade?.rr_at_entry} to TP1`);
+const zoneTrade = await zoneWatch();
+assert(
+  zoneTrade?.lifecycle === "IN_TRADE" && zoneTrade.trade?.entry_zone?.low === 4419.3,
+  `prepared zone: the retrace to the CISD level and gap enters too (${zoneTrade?.lifecycle} ${JSON.stringify(zoneTrade?.trade?.entry_zone)})`,
+);
 assert(
   Math.abs(trade?.sl - 4410.7) < 0.01,
   `the stop: under the 4411 swing low by spread + tolerance, not the registered 4400 (${trade?.sl})`,

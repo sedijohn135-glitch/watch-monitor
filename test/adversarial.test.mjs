@@ -25,6 +25,7 @@ import {
   m5Confirmation,
   obstacles,
   zoneVerdict,
+  zonePriceAction,
   smtDivergence,
   evaluateSafety,
   inducement,
@@ -1050,6 +1051,55 @@ test("M5 CONFIRMATION — in the prepared zone: the candle must have traded into
   const into = (zone) => (bar) => bar.high >= zone.low;
   assert.deepEqual(m5Confirmation(btc, "sell", T0 + 300_000, 0, into({ low: 81670.21 })), { type: "rejection", at: T0 + 300_000 });
   assert.equal(m5Confirmation(btc, "sell", T0 + 300_000, 0, into({ low: 81760 })), null, "a rejection below the zone is not in it");
+});
+
+// 23 Oct BTCUSD, the prepared sell zone 81670.21–81820.16: the sweep and
+// rejection 16:45 UTC, the bearish engulfing 16:50 (T0 = 16:40).
+const BTC_ZONE = { low: 81670.21, high: 81820.16 };
+const BTC = [
+  [81643.9, 81682.39, 81605.34, 81655.16],
+  [81654.41, 81756.93, 81606.35, 81665.67],
+  [81664.52, 81690.58, 81579.84, 81598.65],
+];
+const onM5 = (rows) => [{ tf: "M5", span: 300_000, bars: m5Bars(rows) }];
+
+test("VALIDATOR — price action in the prepared zone arms the setup, the moment it confirms", () => {
+  const atRejection = zonePriceAction(onM5(BTC.slice(0, 2)), "sell", BTC_ZONE, T0 + 300_000, 8);
+  assert.equal(atRejection.state, "armed");
+  assert.deepEqual([atRejection.last.type, atRejection.last.at, atRejection.last.fresh], ["rejection", T0 + 600_000, true]);
+  const atEngulfing = zonePriceAction(onM5(BTC), "sell", BTC_ZONE, T0 + 300_000, 8);
+  assert.deepEqual([atEngulfing.last.type, atEngulfing.confirmations.length], ["engulfing", 2]);
+  assert.equal(zonePriceAction(onM5(BTC), "sell", BTC_ZONE, T0 + 900_000, 8).state, null, "nothing before the sweep counts");
+  assert.equal(zonePriceAction(onM5(BTC.slice(0, 2)), "buy", BTC_ZONE, T0 + 300_000, 8).state, "failing", "for a buy it is price action against it");
+  assert.equal(zonePriceAction(onM5([[81450, 81560, 81440, 81445]]), "sell", BTC_ZONE, T0, 8).state, null, "a rejection away from the zone is not price action at it");
+});
+
+test("VALIDATOR — a failing setup gives no entry, and confirms again only on new price action", () => {
+  const above = [...BTC, [81600, 81850, 81590, 81840]];
+  const failing = zonePriceAction(onM5(above), "sell", BTC_ZONE, T0 + 300_000, 8);
+  assert.deepEqual([failing.state, failing.last.type], ["failing", "close beyond the zone"]);
+  const soup = zonePriceAction(onM5([...above, [81845, 81850, 81560, 81580]]), "sell", BTC_ZONE, T0 + 300_000, 8);
+  assert.deepEqual([soup.state, soup.last.type, soup.confirmations.length], ["armed", "engulfing", 1], "back below with an engulfing: armed again");
+  const hammer = zonePriceAction(onM5([...BTC, [81640, 81700, 81500, 81690]]), "sell", BTC_ZONE, T0 + 300_000, 8);
+  assert.deepEqual([hammer.state, hammer.last.type], ["failing", "rejection against the trade"]);
+});
+
+test("VALIDATOR — M15 too: its close outranks the M5 candles inside it", () => {
+  const zone = { low: 100, high: 102 };
+  const m5 = { tf: "M5", span: 300_000, bars: m5Bars([[101, 103, 100.8, 102.8], [102.8, 103, 101.2, 101.4], [101.4, 101.6, 100.6, 100.8]]) };
+  const m15 = { tf: "M15", span: 900_000, bars: [bar(T0, 101, 103, 100.6, 100.8)] };
+  assert.equal(zonePriceAction([m5], "sell", zone, T0).state, "failing", "on M5 alone the close above the zone failed it");
+  const both = zonePriceAction([m5, m15], "sell", zone, T0);
+  assert.deepEqual([both.state, both.last.tf, both.last.type], ["armed", "M15", "rejection"]);
+});
+
+test("TOUCH — with a prepared zone, reaching the zone is the touch", () => {
+  const watch = { direction: "sell", entry: 81716.13, sl: 81825.92, tp1: 80922.44, entry_zone_low: 81670.21, entry_zone_high: 81820.16, entryTouched: false };
+  const at = (price) => evaluateSafety(watch, { mid: price, executable: price, protective: price + 5, tolerance: 8 }).action;
+  assert.equal(at(81680), "TOUCH", "inside the zone, short of the entry price");
+  assert.equal(at(81600), "WAIT");
+  assert.equal(at(81680), "TOUCH");
+  assert.equal(evaluateSafety({ ...watch, entry_zone_low: null }, { mid: 81680, executable: 81680, protective: 81685, tolerance: 8 }).action, "WAIT", "without a zone, the entry price");
 });
 
 test("M5 CONFIRMATION — a rejection wick; a symmetric doji is not one", () => {
