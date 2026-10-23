@@ -133,7 +133,6 @@ const CONFIG = {
   // this long; 0 disables.
   defaultExpiryMinutes: num(process.env.WATCH_DEFAULT_EXPIRY_MIN, 720, 0),
 
-  killZoneEnabled: process.env.KILL_ZONE_FILTER_ENABLED !== "false",
   spreadEnabled: process.env.SPREAD_CHECK_ENABLED !== "false",
   spreadBaselineSamples: num(process.env.SPREAD_BASELINE_SAMPLES, 5, 3),
   spreadHistoryMax: num(process.env.SPREAD_HISTORY_MAX, 20, 5),
@@ -419,7 +418,7 @@ function confirmWatch(watch, quote, model, gates, rr, stop, tp, walls = []) {
       `✅ Price reached ${watch.entry_zone_low != null ? "the prepared zone" : fmt(watch.entry)}\n` +
       `✅ ${htmlEscape(model.candleText)}\n` +
       `✅ ${htmlEscape(model.where)} ${htmlEscape(model.zoneText)}\n` +
-      `✅ ${htmlEscape(gates.zone || "session filter off")} · news clear · spread ${fmt(quote.spread)}\n` +
+      `✅ ${htmlEscape(gates.zone || "outside the kill zones")} · news clear · spread ${fmt(quote.spread)}\n` +
       (watch.liquidity && watch.liquidity !== "N/A" ? `<b>Liquidity:</b> ${htmlEscape(watch.liquidity)}\n` : "") +
       `<b>Setup:</b> ${htmlEscape(watch.setup_model)} · conviction ${htmlEscape(watch.conviction)}\n` +
       (walls.length
@@ -792,12 +791,9 @@ async function newsStatusForWatch(watch, nowMs = Date.now()) {
 
 async function applyExternalGates(watch, spread) {
   const reasons = [];
+  // No session or kill-zone filter (the owner's call, 23 Oct): when to
+  // trade is the analysis's decision. The session is only reported.
   const session = killZoneStatus();
-  // Kill zones are the New York session's clock; crypto trades around it.
-  const crypto = /^(BTC|ETH)/.test(watch.symbol);
-  if (CONFIG.killZoneEnabled && !crypto && !session.active) {
-    reasons.push(session.weekend ? "Weekend" : session.inLunch ? "NY Lunch" : "Outside kill zone");
-  }
   const news = await newsStatusForWatch(watch);
   if (news.blocked) reasons.push(`News: ${news.reason}`);
   return {
@@ -1636,7 +1632,7 @@ const CUSTOM_TOOLS = [
   {
     name: "register_watch",
     description:
-      "Registers a trading setup for live monitoring. The monitor validates it on live M5 candles — liquidity taken, CISD, an ICT entry model (FVG / IFVG / Unicorn / OTE order block), an M5 engulfing, rejection or SMT divergence — and sends ENTER NOW on Telegram when price retraces into the entry zone, with R:R, kill zone, news and spread clear. Then it manages the trade: TP alerts, SL to breakeven after TP1, CLOSE NOW where price turns back or an M5–H4 zone in the way holds. Never places an order.",
+      "Registers a trading setup for live monitoring. The monitor validates it on live M5 candles — liquidity taken, CISD, an ICT entry model (FVG / IFVG / Unicorn / OTE order block), an M5 engulfing, rejection or SMT divergence — and sends ENTER NOW on Telegram when price retraces into the entry zone, with R:R, news and spread clear (no session filter). Then it manages the trade: TP alerts, SL to breakeven after TP1, CLOSE NOW where price turns back or an M5–H4 zone in the way holds. Never places an order.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -2045,7 +2041,7 @@ async function handleMcpRequest(req, res) {
       result: {
         protocolVersion: body.params?.protocolVersion || CONFIG.protocolVersion,
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.11.0" },
+        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.12.0" },
       },
     });
     return;
@@ -2140,7 +2136,7 @@ app.get("/health", async (req, res) => {
   const base = {
     status: SERVERLESS && !kv ? "storage_missing" : "ok",
     service: "watch-monitor-mcp",
-    version: "6.11.0",
+    version: "6.12.0",
     runtime: SERVERLESS ? "vercel" : "node",
     watches: setups.length,
     last_tick_at: SERVERLESS ? lastTickAt : undefined,
@@ -2167,7 +2163,6 @@ app.get("/health", async (req, res) => {
     local_auth_configured: Boolean(CONFIG.authToken),
     news_filter_enabled: CONFIG.newsEnabled,
     news_fail_closed: CONFIG.newsFailClosed,
-    kill_zone_filter_enabled: CONFIG.killZoneEnabled,
     spread_check_enabled: CONFIG.spreadEnabled,
     ...monitorHealth(),
     capacity: { setups: `${setups.length}/${CONFIG.maxSetupWatches}` },
