@@ -1012,21 +1012,22 @@ async function tickSetupWatch(watch) {
   const hhmm = (ms) => new Date(ms).toISOString().slice(11, 16);
   const floorTo = (ms, span) => Math.floor(ms / span) * span;
   const m15bars = m15.status === "OK" ? m15.bars : [];
-  // The CISD model (Mastering the 4 ICT Entry Models; the owner's CISD
-  // chart): after the reaction, a body close beyond the open of the run of
-  // candles that delivered price to the extreme, then the entry on the
-  // retrace to that level or to the gap the displacement left. Read on
-  // the entry timeframe, and on M15 when it has none.
-  let cisdTf = tf;
-  let model = entryModel(series.bars, watch.direction, touchMs, { ote, span: PERIOD_MS[tf] });
-  if (!(model.mss.shifted && model.zone) && tf !== "M15" && m15bars.length >= 20) {
+  // The CISD model (the owner's CISD and CISD × SMT charts; Mastering the
+  // 4 ICT Entry Models): after the reaction, a candle closes beyond the
+  // open of the consecutive candles that delivered price to the extreme;
+  // the entry is on the retrace to that level — or to the gap the
+  // displacement left, when it left one — with the stop beyond the
+  // extreme. Read on the entry timeframe, and on M15 when it has none.
+  let [cisdTf, cisdBars] = [tf, series.bars];
+  let model = entryModel(cisdBars, watch.direction, touchMs, { ote, span: PERIOD_MS[tf] });
+  if (!model.mss.shifted && tf !== "M15" && m15bars.length >= 20) {
     const onM15 = entryModel(m15bars, watch.direction, touchMs, { ote, span: PERIOD_MS.M15 });
-    if (onM15.mss.shifted && onM15.zone) [model, cisdTf] = [onM15, "M15"];
+    if (onM15.mss.shifted) [model, cisdTf, cisdBars] = [onM15, "M15", m15bars];
   }
   watch.structureShift = model.mss;
   watch.entryZone = model.zone;
   store.dirty = true;
-  const validated = Boolean(model.mss.shifted && model.zone);
+  const validated = Boolean(model.mss.shifted);
   const prepared = watch.entry_zone_low !== null && watch.entry_zone_low !== undefined;
   const preparedZone = prepared ? { low: watch.entry_zone_low, high: watch.entry_zone_high } : null;
   // From the sweep on: the M5 bar that took the liquidity (noticed live or
@@ -1053,11 +1054,15 @@ async function tickSetupWatch(watch) {
     : null;
   watch.m5Confirmation = turnCandle ?? null;
   const cisdZone = validated && {
-    low: Math.min(model.zone.low, model.mss.level),
-    high: Math.max(model.zone.high, model.mss.level),
+    low: Math.min(model.zone?.low ?? Infinity, model.mss.level),
+    high: Math.max(model.zone?.high ?? -Infinity, model.mss.level),
   };
+  const extremeBar = validated ? cisdBars.find((bar) => bar.timestampMs === model.extremeAt) : null;
+  const cisdSwing = model.zone?.stop ?? (extremeBar && (buy ? extremeBar.low : extremeBar.high));
+  const cisdKey = validated ? `cisd:${model.mss.level}:${model.zone?.low ?? ""}` : "";
   const cisdText = validated
-    ? `${cisdTf} CISD ${formatLevel(model.mss.level)} + ${zoneLabel(model.zone)} ${formatLevel(model.zone.low)} – ${formatLevel(model.zone.high)}`
+    ? `${cisdTf} CISD ${formatLevel(model.mss.level)}` +
+      (model.zone ? ` + ${zoneLabel(model.zone)} ${formatLevel(model.zone.low)} – ${formatLevel(model.zone.high)}` : "")
     : "";
 
   // Each way in: { name, zone, swing (the stop goes beyond it), fresh,
@@ -1130,8 +1135,8 @@ async function tickSetupWatch(watch) {
       // strong confirmation beside it.
       const cisdSince = read.confirmations.some((event) => event.type === "CISD");
       const strong = turnCandle || smt?.divergent || read.confirmations.some((event) => event.type !== "CISD");
-      if (validated && cisdSince && strong) {
-        routes.push({ name: "CISD retrace", key: `cisd:${model.mss.level}:${model.zone.low}`, zone: cisdZone, swing: model.zone.stop, fresh: false, confirmed: `${cisdText} · ${confirmed}` });
+      if (validated && cisdSwing && cisdSince && strong) {
+        routes.push({ name: "CISD retrace", key: cisdKey, zone: cisdZone, swing: cisdSwing, fresh: false, confirmed: `${cisdText} · ${confirmed}` });
       }
     } else {
       watch.lifecycle = "TOUCHED";
@@ -1143,10 +1148,10 @@ async function tickSetupWatch(watch) {
     // Without a prepared zone: the CISD model, with a strong confirmation —
     // an M5 or M15 engulfing or rejection from the turn on, or SMT
     // divergence at the sweep.
-    if (!validated) {
+    if (!validated || !cisdSwing) {
       watch.lifecycle = "TOUCHED";
       watch.lastGateBlockReason = null;
-      watch.lastReason = model.mss.shifted ? "awaiting_fvg" : "awaiting_cisd";
+      watch.lastReason = "awaiting_cisd";
       return;
     }
     const confirmations = [
@@ -1161,9 +1166,9 @@ async function tickSetupWatch(watch) {
     }
     routes.push({
       name: "CISD retrace",
-      key: `cisd:${model.mss.level}:${model.zone.low}`,
+      key: cisdKey,
       zone: cisdZone,
-      swing: model.zone.stop,
+      swing: cisdSwing,
       fresh: false,
       confirmed: `${cisdText} · ${confirmations.join(" + ")}`,
     });
@@ -2041,7 +2046,7 @@ async function handleMcpRequest(req, res) {
       result: {
         protocolVersion: body.params?.protocolVersion || CONFIG.protocolVersion,
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.12.0" },
+        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.13.0" },
       },
     });
     return;
@@ -2136,7 +2141,7 @@ app.get("/health", async (req, res) => {
   const base = {
     status: SERVERLESS && !kv ? "storage_missing" : "ok",
     service: "watch-monitor-mcp",
-    version: "6.12.0",
+    version: "6.13.0",
     runtime: SERVERLESS ? "vercel" : "node",
     watches: setups.length,
     last_tick_at: SERVERLESS ? lastTickAt : undefined,
