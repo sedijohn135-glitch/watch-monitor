@@ -586,7 +586,7 @@ assert(midway?.liquidityTaken === true, "bar A closed: its wick took the 4412 li
 assert(midway?.structureShift?.shifted === true, `bar A closed above the 4419.60 lower high: structure shift (${midway?.lastReason})`);
 assert(!(await scenarioWatch()).resolved, "but one observation is not a confirmation: evidence must survive a new M1 bar");
 
-price = 4420.6; // trading above the last closed M1 high: the expansion is pushing
+price = 4419; // no new high, not "pushing": v6.1 waited here and missed the move
 await nextMinute(3000);
 await tick();
 const confirmed = (await scenarioWatch()).resolved;

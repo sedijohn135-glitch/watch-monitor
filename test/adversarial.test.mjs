@@ -28,7 +28,6 @@ import {
   closedSeries,
   evaluateConfirmation,
   evaluateSafety,
-  expansionState,
   inducement,
   killZoneStatus,
   liquidityMap,
@@ -771,30 +770,6 @@ test("LIQUIDITY MAP — premium/discount and the imbalances price is drawn to", 
   );
   assert.deepEqual(unfilledGaps(h1).filter((gap) => gap.type === "bullish").map(({ from, to }) => [from, to]), [[102, 102.6], [103, 105]]);
   assert.equal(map.h1_imbalances.below[0].from, 103, "the nearest unfilled gap below price is the internal-range draw");
-});
-
-test("ENTRY — ENTER NOW lands on the push, never into a pullback", () => {
-  const start = Date.UTC(2026, 9, 21, 13, 0);
-  // Ten quiet candles (body 0.5), the reaction low at #10, a 3.0-body
-  // displacement candle at #11, then #12 breaks #11's high.
-  const shape = [
-    ...Array.from({ length: 10 }, () => [100, 100.4, 99.4, 99.5]),
-    [99.5, 99.6, 97, 97.4],
-    [97.4, 100.6, 97.3, 100.4],
-    [100.4, 101.2, 100.2, 101],
-  ];
-  const bars = shape.map(([o, h, l, c], i) => bar(start + i * M1, o, h, l, c));
-  const touch = start + 10 * M1;
-
-  const pushing = expansionState(bars, "buy", 101.3, touch);
-  assert.deepEqual(pushing, { underway: true, displaced: true, pushing: true, retrace: 0 });
-
-  const pullingBack = expansionState(bars, "buy", 99.4, touch);
-  assert.equal(pullingBack.underway, false, "price gave back half the leg: wait for the next push");
-  assert.ok(pullingBack.retrace > 0.35);
-
-  const noDisplacement = expansionState(bars.slice(0, 11), "buy", 99, touch);
-  assert.equal(noDisplacement.displaced, false, "no strong candle away from the low yet");
 });
 
 // ---------------------------------------------------------------------------
