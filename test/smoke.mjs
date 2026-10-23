@@ -509,6 +509,8 @@ const vercel = boot({
   SERVERLESS: "true",
   KV_REST_API_URL: "http://127.0.0.1:9805",
   KV_REST_API_TOKEN: "kv-token",
+  FAST_MODE_INTERVAL_MS: "1500",
+  FAST_MODE_WINDOW_MS: "4000",
 });
 await sleep(1500);
 const tick = (query = "", headers = { authorization: "Bearer secret" }) =>
@@ -593,8 +595,14 @@ price = 4427; // price has not come back
 await nextMinute(3000);
 await tick(); // minute 1 closed: still no gap above bar A
 await nextMinute(3000);
-await tick(); // minute 2 closed: its low leaves the FVG
+const readyTick = await (await tick()).json(); // minute 2 closed: its low leaves the FVG
 const ready = (await scenarioWatch()).active;
+assert(readyTick.hot === true, "a ready zone makes the watch hot");
+const lastTick = async () =>
+  (await (await fetch("http://127.0.0.1:9804/health", { headers: { authorization: "Bearer secret" } })).json()).last_tick_at;
+const answeredAt = await lastTick();
+await sleep(2000);
+assert((await lastTick()) > answeredAt, "fast mode: checked again after the tick was answered, without the cron");
 assert(
   ready?.entryZone?.model === "FVG" && ready.entryZone.low === 4420 && ready.entryZone.high === 4421.5,
   `the displacement left the FVG 4420–4421.5 (${JSON.stringify(ready?.entryZone)})`,
@@ -602,7 +610,7 @@ assert(
 assert(!(await scenarioWatch()).resolved, "the move away from the zone is never an entry");
 
 price = 4421; // the retrace into the FVG
-await sleep(2500); // past the spot cache
+await sleep(3000); // past the spot cache and the fast checks
 await tick();
 const confirmed = (await scenarioWatch()).resolved;
 assert(confirmed?.status === "CONFIRMED", `retrace into the FVG: REAL CONFIRMATION — ENTER NOW (${confirmed?.status ?? (await scenarioWatch()).active?.lastReason})`);

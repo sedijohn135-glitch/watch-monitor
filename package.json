@@ -10,8 +10,11 @@
     "smoke": "node test/smoke.mjs"
   },
   "dependencies": {
+    "@vercel/functions": "3.9.11",
     "dotenv": "^16.4.5",
     "express": "^4.19.2"
   },
-  "engines": { "node": "22.x" }
+  "engines": {
+    "node": "22.x"
+  }
 }

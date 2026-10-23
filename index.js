@@ -27,6 +27,8 @@
 import express from "express";
 import "dotenv/config";
 import { randomUUID, timingSafeEqual } from "node:crypto";
+import { setTimeout as sleep } from "node:timers/promises";
+import { waitUntil } from "@vercel/functions";
 
 import {
   PERIOD_MS,
@@ -83,6 +85,11 @@ const CONFIG = {
   // Vercel only: a tick gap longer than this means the external cron
   // stopped; the watches restart from live data as after a restart.
   maxTickGapMs: num(process.env.MAX_TICK_GAP_MS, 5 * 60_000, 90_000),
+  // Vercel only: while an entry zone is ready, keep checking every
+  // FAST_MODE_INTERVAL_MS for FAST_MODE_WINDOW_MS after the cron's tick,
+  // so a retrace into the zone between two minutes is not missed.
+  fastIntervalMs: num(process.env.FAST_MODE_INTERVAL_MS, 15_000, 1000),
+  fastWindowMs: num(process.env.FAST_MODE_WINDOW_MS, 50_000, 0),
 
   priceScale: num(process.env.CTRADER_PRICE_SCALE, 100000, 1),
   scaleTolerance: num(process.env.SCALE_TOLERANCE, 0.35, 0.05),
@@ -1716,19 +1723,38 @@ app.all("/tick", async (req, res) => {
     return;
   }
   try {
-    const result = await withState(
-      async () => {
-        await runDueWatches();
-        return { watches: store.setups.size };
-      },
-      { tick: true },
-    );
+    const result = await withState(runTick, { tick: true });
     res.json({ ok: true, ...result });
+    if (SERVERLESS && result.hot && CONFIG.fastWindowMs > 0) waitUntil(fastChecks());
   } catch (error) {
     log(`tick failed: ${error.message}`);
     res.status(503).json({ ok: false, error: error.message });
   }
 });
+
+async function runTick() {
+  await runDueWatches();
+  // A ready zone makes the watch hot: the retrace into it is the one step
+  // a once-a-minute check can miss.
+  return { watches: store.setups.size, hot: store.active().some((watch) => watch.lifecycle === "CONFIRMING") };
+}
+
+// Fast mode. The cron must be answered within its 30 s timeout, so the
+// extra checks run after the response (waitUntil keeps the function
+// alive), each a full locked tick of its own: the lock is never held
+// across the waits, so a register_watch in between is not blocked.
+async function fastChecks() {
+  const until = Date.now() + CONFIG.fastWindowMs;
+  while (Date.now() + CONFIG.fastIntervalMs <= until) {
+    await sleep(CONFIG.fastIntervalMs);
+    try {
+      if (!(await withState(runTick, { tick: true })).hot) return;
+    } catch (error) {
+      log(`fast check failed: ${error.message}`);
+      return;
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // §11 Boot and shutdown

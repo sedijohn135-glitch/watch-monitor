@@ -87,9 +87,12 @@ once a minute to run the monitor.
    monitor, and the sign-in page has no attempt limit.
 
 Trade-off against a long-lived host: price is checked once a minute
-instead of every 10 s, so an SL/TP touch is reported up to a minute late,
-and a retrace into the zone is seen only if price is still in it at a
-tick. Wicks between ticks are still seen through the closed M1 bars. If
+instead of every 10 s, so an SL/TP touch is reported up to a minute late.
+**Fast mode** covers the one step that cannot wait a minute: while an
+entry zone is ready, each `/tick` is answered at once (cron-job.org gives
+up after 30 s) and the function keeps checking every 15 s for 50 s more
+(`waitUntil`), so a retrace into the zone is caught within ~15 s. Wicks
+between ticks are still seen through the closed M1 bars. If
 the cron stops for more than `MAX_TICK_GAP_MS`, the next tick sends
 `MONITOR GAP` and the watches resume as after a restart.
 
@@ -114,6 +117,7 @@ the cron stops for more than `MAX_TICK_GAP_MS`, the next tick sends
 | `KV_REST_API_URL` / `KV_REST_API_TOKEN` | — | Vercel only: Upstash Redis |
 | `CRON_SECRET` | — | Vercel Pro cron only: accepted as a bearer on `/tick` |
 | `MAX_TICK_GAP_MS` | `300000` | Vercel only: a longer gap between ticks is reported and treated as a restart |
+| `FAST_MODE_INTERVAL_MS` / `FAST_MODE_WINDOW_MS` | `15000` / `50000` | Vercel only: extra checks while an entry zone is ready; window `0` turns fast mode off |
 | `STATE_FILE` | `./data/watch-state.json` | process mode only |
 | `SCHEDULER_TICK_MS` | `2500` | process mode only |
 | `WATCH_INTERVAL_MS` | `10000` | per-watch cadence in process mode |
