@@ -45,6 +45,7 @@ import {
   liquidityMap,
   liquidityTaken,
   lowHangingFruit,
+  m5Confirmation,
   manageTrade,
   marketRR,
   nyClock,
@@ -406,6 +407,7 @@ function confirmWatch(watch, quote, model, gates, rr, stop, tp) {
       `✅ MSS: M1 body close ${buy ? "above" : "below"} ${fmt(model.mss.level)}` +
       `${model.mss.via === "cisd" ? " (CISD)" : model.displaced ? " with displacement" : ""}\n` +
       `✅ ${htmlEscape(zoneLabel(model.zone))}: ${fmt(model.zone.low)} – ${fmt(model.zone.high)}\n` +
+      `✅ ${htmlEscape(model.candleText)}\n` +
       `✅ Price retraced into the entry zone ${htmlEscape(model.zoneText)}\n` +
       `✅ ${htmlEscape(gates.zone || "session filter off")} · news clear · spread ${fmt(quote.spread)}\n` +
       (watch.liquidity && watch.liquidity !== "N/A" ? `<b>Liquidity:</b> ${htmlEscape(watch.liquidity)}\n` : "") +
@@ -852,7 +854,7 @@ async function tickSetupWatch(watch) {
       `<b>ENTRY TOUCHED</b>\n` +
         `<b>${htmlEscape(watch.symbol)}</b> ${htmlEscape(watch.direction.toUpperCase())}\n` +
         `<b>Entry:</b> ${htmlEscape(formatLevel(watch.entry))} | <b>Price:</b> ${htmlEscape(formatLevel(safety.price))}\n` +
-        `<i>Next: liquidity taken → M1 MSS → FVG / IFVG / Unicorn → ENTER NOW on the retrace into it.</i>`,
+        `<i>Next: liquidity taken → M1 MSS → FVG / IFVG / Unicorn → M5 engulfing or rejection → ENTER NOW on the retrace into the zone.</i>`,
       { dedupeKey: `${watch.id}:touched` },
     );
   } else if (safety.action === "WAIT") {
@@ -935,6 +937,22 @@ async function tickSetupWatch(watch) {
     watch.lastReason = model.mss.shifted ? "awaiting_fvg" : "awaiting_structure_shift";
     return;
   }
+  // Absolute: an M5 engulfing or rejection candle in the trade's direction,
+  // from the M5 bar of the turn on. Never M1: one minute is noise.
+  const candle = m5Confirmation(
+    m5.bars,
+    watch.direction,
+    Math.floor(model.extremeAt / PERIOD_MS.M5) * PERIOD_MS.M5,
+    tolerance,
+  );
+  watch.m5Confirmation = candle;
+  if (!candle) {
+    watch.lifecycle = "TOUCHED";
+    watch.lastGateBlockReason = null;
+    watch.lastReason = "awaiting_m5_engulfing_or_rejection";
+    return;
+  }
+  const candleText = `M5 ${candle.type} ${new Date(candle.at).toISOString().slice(11, 16)} UTC`;
 
   const zone = model.zone;
   const label = zoneLabel(zone);
@@ -963,6 +981,7 @@ async function tickSetupWatch(watch) {
         `<b>${htmlEscape(watch.symbol)} ${htmlEscape(watch.direction.toUpperCase())}</b>\n` +
         `<b>Entry zone:</b> ${htmlEscape(zoneText)}\n` +
         (prepared ? `<b>Validated by:</b> ${htmlEscape(label)} ${htmlEscape(formatLevel(zone.low))} – ${htmlEscape(formatLevel(zone.high))}\n` : "") +
+        `<b>Confirmed by:</b> ${htmlEscape(candleText)}\n` +
         `<b>SL:</b> ${htmlEscape(formatLevel(modelStop))} (${swingSide})\n` +
         `<b>TP1:</b> ${htmlEscape(formatLevel(tp.level))} (${htmlEscape(tp.what)})\n` +
         `<i>Not an entry yet. ENTER NOW comes when price retraces into the zone.</i>`,
@@ -999,7 +1018,7 @@ async function tickSetupWatch(watch) {
   }
   if (gates.pass) {
     watch.lastReason = "confirming";
-    confirmWatch(watch, { executable, spread }, { ...model, entryZone, zoneText }, gates, rr, stop, tp);
+    confirmWatch(watch, { executable, spread }, { ...model, entryZone, zoneText, candleText }, gates, rr, stop, tp);
     return;
   }
   const reasonText = gates.reasons.join(" | ");
@@ -1731,7 +1750,7 @@ async function handleMcpRequest(req, res) {
       result: {
         protocolVersion: body.params?.protocolVersion || CONFIG.protocolVersion,
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.5.0" },
+        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.6.0" },
       },
     });
     return;
@@ -1826,7 +1845,7 @@ app.get("/health", async (req, res) => {
   const base = {
     status: SERVERLESS && !kv ? "storage_missing" : "ok",
     service: "watch-monitor-mcp",
-    version: "6.5.0",
+    version: "6.6.0",
     runtime: SERVERLESS ? "vercel" : "node",
     watches: setups.length,
     last_tick_at: SERVERLESS ? lastTickAt : undefined,

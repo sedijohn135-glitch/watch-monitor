@@ -65,6 +65,19 @@ function scriptedM1(count) {
   });
 }
 
+// M5 during the scenario is the scripted M1 aggregated, so the sweep bar's
+// long lower wick is an M5 rejection, as it would be on a real chart.
+function scriptedM5(count) {
+  const byBar = new Map();
+  for (const minute of scriptedM1(count * 5 + 5)) {
+    const open = Math.floor(minute.timestamp / 300_000) * 300_000;
+    const bar = byBar.get(open);
+    if (!bar) byBar.set(open, { ...minute, timestamp: open });
+    else Object.assign(bar, { high: Math.max(bar.high, minute.high), low: Math.min(bar.low, minute.low), close: minute.close });
+  }
+  return [...byBar.values()].slice(-count);
+}
+
 const PERIOD_SPAN = { M_1: 60_000, M_5: 300_000, M_15: 900_000, H_1: 3_600_000, H_4: 14_400_000, D_1: 86_400_000 };
 
 const upstream = createServer((req, res) => {
@@ -153,7 +166,9 @@ const upstream = createServer((req, res) => {
             ? bars(60, PERIOD_SPAN[args.period], price)
             : args.period === "M_1"
               ? scriptedM1(80)
-              : bars(60, PERIOD_SPAN[args.period], 4440); // the higher timeframes' pools sit ~4443
+              : args.period === "M_5"
+                ? scriptedM5(60)
+                : bars(60, PERIOD_SPAN[args.period], 4440); // the higher timeframes' pools sit ~4443
         return reply({ content: [{ type: "text", text: JSON.stringify(candles) }] });
       }
       return reply({ content: [{ type: "text", text: "{}" }] });
@@ -547,7 +562,7 @@ assert(!vWatch?.recovered, "back-to-back ticks keep the watch as saved instead o
 const health = await (await fetch("http://127.0.0.1:9804/health", { headers: { authorization: "Bearer secret" } })).json();
 assert(health.storage === "redis" && health.last_tick_at, `health reports Redis and the last tick (${health.storage})`);
 
-console.log("\n— a real ENTER NOW, end to end on M1 time (about 3 minutes) —");
+console.log("\n— a real ENTER NOW, end to end on M1 time (3 to 8 minutes) —");
 const nextMinute = (offsetMs) => sleep(60_000 - (Date.now() % 60_000) + offsetMs);
 const scenarioWatch = async () => {
   const listed = JSON.parse((await rpc("tools/call", { name: "list_watches" }, 1, 9804)).result.content[0].text);
@@ -556,7 +571,10 @@ const scenarioWatch = async () => {
     resolved: listed.recent.find((record) => record.setup_id === "scenario"),
   };
 };
-await nextMinute(1000);
+// Bar A is the last minute of its M5 bar, so that M5 candle (the sweep's
+// rejection) has closed by the next minute's check.
+do await nextMinute(1000);
+while (Math.floor(Date.now() / 60_000) % 5 !== 4);
 scenarioMinute = Math.floor(Date.now() / 60_000);
 price = 4414.3; // ask 4414.40: the entry is touched live
 await rpc(
@@ -589,6 +607,7 @@ await tick();
 const midway = (await scenarioWatch()).active;
 assert(midway?.liquidityTaken === true, "bar A closed: its wick took the 4412 liquidity");
 assert(midway?.structureShift?.shifted === true, `bar A closed above the 4419.60 lower high: MSS (${midway?.lastReason})`);
+assert(midway?.m5Confirmation?.type === "rejection", `the sweep's M5 candle is a rejection (${JSON.stringify(midway?.m5Confirmation)})`);
 assert(midway?.lastReason === "awaiting_retrace", `a zone exists, price is away from it: no entry (${midway?.lastReason})`);
 
 price = 4427; // price has not come back

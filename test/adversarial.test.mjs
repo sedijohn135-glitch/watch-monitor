@@ -22,6 +22,7 @@ import {
   oteZone,
   lowHangingFruit,
   manageTrade,
+  m5Confirmation,
   evaluateSafety,
   inducement,
   killZoneStatus,
@@ -1022,4 +1023,28 @@ test("ENTRY ZONE — the analysis's prepared zone is kept, and must make sense",
   assert.throws(() => validateWatchInput({ ...base, entry_zone_low: 4019.82 }), /go together/);
   assert.throws(() => validateWatchInput({ ...base, entry_zone_low: 4021, entry_zone_high: 4022 }), /inside the entry zone/);
   assert.throws(() => validateWatchInput({ ...base, entry_zone_low: 4019, entry_zone_high: 4029 }), /beyond the entry zone/);
+});
+
+// ---------------------------------------------------------------------------
+// The M5 candle that confirms the turn.
+
+const m5Bars = (rows) => rows.map(([o, h, l, c], i) => bar(T0 + i * 300_000, o, h, l, c));
+
+test("M5 CONFIRMATION — an engulfing in the trade's direction", () => {
+  // 23 Oct 06:15–06:20 UTC, XAUUSD: the bearish engulfing after the sweep.
+  const gold = m5Bars([[4019.07, 4022.18, 4018.46, 4021.46], [4021.43, 4022.64, 4016.88, 4017.14]]);
+  assert.deepEqual(m5Confirmation(gold, "sell", T0, 0.1), { type: "engulfing", at: T0 + 300_000 });
+  assert.equal(m5Confirmation(gold, "buy", T0, 0.1), null, "it confirms the sell, not a buy");
+  const buy = m5Bars([[101, 101.2, 99.8, 100], [99.9, 101.6, 99.7, 101.4]]);
+  assert.equal(m5Confirmation(buy, "buy", T0)?.type, "engulfing");
+  const inside = m5Bars([[101, 101.2, 99.8, 100], [100.2, 100.9, 100.1, 100.8]]);
+  assert.equal(m5Confirmation(inside, "buy", T0), null, "a candle inside the previous body engulfs nothing");
+});
+
+test("M5 CONFIRMATION — a rejection wick; a symmetric doji is not one", () => {
+  const hammer = m5Bars([[101, 101.2, 100, 100.2], [100.2, 100.6, 97, 100.5]]);
+  assert.deepEqual(m5Confirmation(hammer, "buy", T0 + 300_000), { type: "rejection", at: T0 + 300_000 });
+  const doji = m5Bars([[100, 102, 98, 100.05]]);
+  assert.equal(m5Confirmation(doji, "buy", T0), null);
+  assert.equal(m5Confirmation(hammer, "buy", T0 + 600_000), null, "only from the turn on");
 });
