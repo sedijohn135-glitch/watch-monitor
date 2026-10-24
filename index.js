@@ -929,7 +929,10 @@ async function tickSetupWatch(watch) {
     notify(
       `<b>ENTRY TOUCHED</b>\n` +
         `<b>${htmlEscape(watch.symbol)}</b> ${htmlEscape(watch.direction.toUpperCase())}\n` +
-        `<b>Entry:</b> ${htmlEscape(formatLevel(watch.entry))} | <b>Price:</b> ${htmlEscape(formatLevel(safety.price))}\n` +
+        (watch.entry_zone_low != null
+          ? `<b>Zone:</b> ${htmlEscape(formatLevel(watch.entry_zone_low))} – ${htmlEscape(formatLevel(watch.entry_zone_high))}`
+          : `<b>Entry:</b> ${htmlEscape(formatLevel(watch.entry))}`) +
+        ` | <b>Price:</b> ${htmlEscape(formatLevel(safety.price))}\n` +
         `<i>Next: liquidity taken → price action confirms (M5 / M15 engulfing or rejection in the zone, CISD, SMT) → ENTER NOW.</i>`,
       { dedupeKey: `${watch.id}:touched` },
     );
@@ -1835,8 +1838,12 @@ async function handleCustomTool(name, args = {}) {
         `<b>WATCH ACTIVE</b>\n` +
           `<b>${htmlEscape(watch.symbol)}</b> — ${htmlEscape(watch.direction.toUpperCase())}\n` +
           `<b>Entry:</b> ${htmlEscape(formatLevel(watch.entry))} | <b>SL:</b> ${htmlEscape(formatLevel(watch.sl))} | <b>TP1:</b> ${htmlEscape(formatLevel(watch.tp1))}\n` +
+          (watch.entry_zone_low != null
+            ? `<b>Entry zone:</b> ${htmlEscape(formatLevel(watch.entry_zone_low))} – ${htmlEscape(formatLevel(watch.entry_zone_high))} (watched: price reaching the zone is the touch)\n`
+            : "") +
           `<b>Liquidity to take:</b> ${htmlEscape(formatLevel(watch.sweep_level))}\n` +
-          `<i>Waiting for the liquidity sweep, entry touch and persistent confirmation.</i>`,
+          `<i>Waiting for the sweep, price in the ${watch.entry_zone_low != null ? "zone" : "entry"}, then price action that confirms ` +
+          `(M5 / M15 engulfing or rejection, CISD).</i>`,
         { dedupeKey: `${watch.id}:armed` },
       );
     }
@@ -2046,7 +2053,7 @@ async function handleMcpRequest(req, res) {
       result: {
         protocolVersion: body.params?.protocolVersion || CONFIG.protocolVersion,
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.13.0" },
+        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.13.1" },
       },
     });
     return;
@@ -2141,7 +2148,7 @@ app.get("/health", async (req, res) => {
   const base = {
     status: SERVERLESS && !kv ? "storage_missing" : "ok",
     service: "watch-monitor-mcp",
-    version: "6.13.0",
+    version: "6.13.1",
     runtime: SERVERLESS ? "vercel" : "node",
     watches: setups.length,
     last_tick_at: SERVERLESS ? lastTickAt : undefined,
