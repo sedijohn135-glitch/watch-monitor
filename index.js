@@ -34,9 +34,15 @@ import {
   PERIOD_MS,
   barIsClosed,
   calcATR,
+  advanceGeneration,
   chaseLimit,
+  checkAcceptance,
+  checkCISD,
+  checkSMT,
+  classifyEngulfing,
+  classifyWick,
   closedSeries,
-  entryModel,
+  evaluateConfirmation,
   evaluateSafety,
   finiteNumber,
   formatLevel,
@@ -44,21 +50,17 @@ import {
   killZoneStatus,
   liquidityMap,
   liquidityTaken,
-  lowHangingFruit,
-  m5Confirmation,
   obstacles,
   zoneVerdict,
-  zonePriceAction,
-  smtDivergence,
   manageTrade,
   marketRR,
   nyClock,
   newsBlackout,
   numericTimestampMs,
-  oteZone,
   periodMs,
   priceTolerance,
   quotesWithGap,
+  structureShift,
   symbolCurrencies,
   updateSpreadHealth,
   validateWatchInput,
@@ -101,9 +103,9 @@ const CONFIG = {
   // After ENTER NOW: how far in R the trade must have run before an M1
   // structure shift against it triggers CLOSE NOW.
   exitArmR: num(process.env.EXIT_ARM_R, 1, 0),
-  // The timeframe the CISD, the model zones and CLOSE NOW are read on. M1
-  // is noise; M5 by default. (The M5 engulfing/rejection is always M5, and
-  // M1 is still used, as data only, to see wicks touch the SL between ticks.)
+  // The timeframe CLOSE NOW (price turned back) is read on. M1 is noise;
+  // M5 by default. (M1 is still used, as data only, to see wicks touch the
+  // SL between ticks.)
   entryTimeframe: ["M1", "M5", "M15"].includes(String(process.env.ENTRY_TIMEFRAME || "").toUpperCase())
     ? String(process.env.ENTRY_TIMEFRAME).toUpperCase()
     : "M5",
@@ -126,6 +128,18 @@ const CONFIG = {
     ETHUSD: 10029,
   },
 
+  // Wall-clock hold before evidence graduates. On Vercel the ticks come
+  // about every 60 s with some jitter, so 50 s there: the new M1 bar is
+  // the market-time half of the hold either way.
+  minConfirmationHoldMs: num(
+    process.env.MIN_CONFIRMATION_HOLD_MS,
+    process.env.VERCEL || process.env.SERVERLESS === "true" ? 50_000 : 60_000,
+    0,
+  ),
+  requireNewBar: process.env.REQUIRE_NEW_M1_CANDLE !== "false",
+  acceptanceAtrFraction: num(process.env.ACCEPTANCE_ATR_FRACTION, 0.5, 0.05),
+  acceptanceRiskFraction: num(process.env.ACCEPTANCE_RISK_FRACTION, 0.35, 0.05),
+  evidenceFadeAtrFraction: num(process.env.EVIDENCE_FADE_ATR_FRACTION, 0.25, 0),
   // ENTER NOW means "enter at market when you read this": below this R:R
   // to TP1 at the live price, the move already happened.
   minRrAtEntry: num(process.env.MIN_RR_AT_ENTRY, 1, 0),
@@ -371,17 +385,10 @@ function nyTime(nowMs = Date.now()) {
 // Written to be acted on from a phone: everything MT5 needs, the price
 // beyond which not to chase, and why it fired. The watch is not resolved
 // here: from now on it is the trade the human took, managed tick by tick.
-function confirmWatch(watch, quote, model, gates, rr, stop, tp, walls = []) {
+function confirmWatch(watch, quote, result, gates, mss, rr, walls = []) {
   const buy = watch.direction === "buy";
   const fmt = (value) => htmlEscape(formatLevel(value));
-  // TP1 is the low-hanging fruit when there is one; the registered
-  // targets follow as the runners.
-  const runners = [watch.tp1, watch.tp2, watch.tp3].filter(
-    (level) => Number.isFinite(level) && (buy ? level > tp.level : level < tp.level),
-  );
-  const targets =
-    `<b>TP1:</b> ${fmt(tp.level)} (${htmlEscape(tp.what)})` +
-    runners.map((level, index) => ` | <b>TP${index + 2}:</b> ${fmt(level)}`).join("");
+  const targets = [watch.tp1, watch.tp2, watch.tp3].filter(Number.isFinite);
   watch.lifecycle = "IN_TRADE";
   watch.status = "IN_TRADE";
   watch.lastReason = "in_trade";
@@ -389,17 +396,16 @@ function confirmWatch(watch, quote, model, gates, rr, stop, tp, walls = []) {
   watch.trade = {
     direction: watch.direction,
     entry: quote.executable,
-    sl: stop.sl,
-    risk: Math.abs(quote.executable - stop.sl),
-    targets: [tp.level, ...runners],
+    sl: watch.sl,
+    risk: Math.abs(quote.executable - watch.sl),
+    targets,
     hit: 0,
     best: quote.executable,
     enteredAt: Date.now(),
     rr_at_entry: Number(rr.toFixed(2)),
-    model: model.zone,
-    entry_zone: model.entryZone,
-    low_hanging_fruit: tp.fruit ? watch.target : null,
-    structure_shift: model.mss,
+    signals: result.signals,
+    strength: result.strength,
+    structure_shift: mss,
     gates: gates.summary,
     obstacles: walls,
   };
@@ -408,19 +414,19 @@ function confirmWatch(watch, quote, model, gates, rr, stop, tp, walls = []) {
   notify(
     `<b>🟢 REAL CONFIRMATION — ENTER NOW</b>\n` +
       `<b>${htmlEscape(watch.symbol)} ${buy ? "BUY" : "SELL"} at market</b> ≈ ${fmt(quote.executable)} (${buy ? "ask" : "bid"})\n` +
-      `<b>SL:</b> ${fmt(stop.sl)} — ${htmlEscape(stop.reason)} (risk ${fmt(watch.trade.risk)})\n` +
-      `${targets}\n` +
-      `<b>R:R to TP1 now:</b> ${htmlEscape(rr.toFixed(2))}\n` +
-      `<b>Do not enter ${buy ? "above" : "below"}:</b> ${fmt(chaseLimit({ ...watch, sl: stop.sl, tp1: tp.level }, CONFIG.minRrAtEntry))} ` +
+      `<b>SL:</b> ${fmt(watch.sl)} (risk ${fmt(watch.trade.risk)})\n` +
+      targets.map((level, index) => `<b>TP${index + 1}:</b> ${fmt(level)}`).join(" | ") +
+      `\n<b>R:R to TP1 now:</b> ${htmlEscape(rr.toFixed(2))}\n` +
+      `<b>Do not enter ${buy ? "above" : "below"}:</b> ${fmt(chaseLimit(watch, CONFIG.minRrAtEntry))} ` +
       `(R:R under ${htmlEscape(CONFIG.minRrAtEntry)})\n` +
       `<b>Checklist</b>\n` +
       `✅ Liquidity ${fmt(watch.sweep_level)} taken\n` +
-      `✅ Price reached ${watch.entry_zone_low != null ? "the prepared zone" : fmt(watch.entry)}\n` +
-      `✅ ${htmlEscape(model.candleText)}\n` +
-      `✅ ${htmlEscape(model.where)} ${htmlEscape(model.zoneText)}\n` +
+      `✅ Price reached ${watch.entry_zone_low != null ? `the zone ${fmt(watch.entry_zone_low)} – ${fmt(watch.entry_zone_high)}` : fmt(watch.entry)}\n` +
+      `✅ M1 CISD: body close ${buy ? "above" : "below"} ${fmt(mss.level)}\n` +
+      `✅ ${htmlEscape(result.signals.join(" + "))}\n` +
       `✅ ${htmlEscape(gates.zone || "outside the kill zones")} · news clear · spread ${fmt(quote.spread)}\n` +
       (watch.liquidity && watch.liquidity !== "N/A" ? `<b>Liquidity:</b> ${htmlEscape(watch.liquidity)}\n` : "") +
-      `<b>Setup:</b> ${htmlEscape(watch.setup_model)} · conviction ${htmlEscape(watch.conviction)}\n` +
+      `<b>Setup:</b> ${htmlEscape(watch.setup_model)} · conviction ${htmlEscape(watch.conviction)} · ${htmlEscape(result.strength)}\n` +
       (walls.length
         ? `<b>Obstacles to target:</b>\n` +
           walls.map((zone) => `🧱 ${zone.tf} ${zone.kind} (${zone.pattern}) ${fmt(zone.low)} – ${fmt(zone.high)}`).join("\n") +
@@ -832,9 +838,8 @@ async function tickSetupWatch(watch) {
     return;
   }
 
-  // The first partner of the SMT bundle is the one SMT is read against.
-  const partner = SMT_BUNDLES[watch.symbol]?.[0]?.symbol ?? null;
-  const ids = await market.resolveSymbols(partner ? [watch.symbol, partner] : [watch.symbol]);
+  const bundle = SMT_BUNDLES[watch.symbol] || [];
+  const ids = await market.resolveSymbols([watch.symbol, ...bundle.map((item) => item.symbol)]);
   const mainId = ids.get(watch.symbol);
   if (mainId === undefined) {
     watch.lastReason = "symbol_unavailable";
@@ -933,7 +938,8 @@ async function tickSetupWatch(watch) {
           ? `<b>Zone:</b> ${htmlEscape(formatLevel(watch.entry_zone_low))} – ${htmlEscape(formatLevel(watch.entry_zone_high))}`
           : `<b>Entry:</b> ${htmlEscape(formatLevel(watch.entry))}`) +
         ` | <b>Price:</b> ${htmlEscape(formatLevel(safety.price))}\n` +
-        `<i>Next: liquidity taken → price action confirms (M5 / M15 engulfing or rejection in the zone, CISD, SMT) → ENTER NOW.</i>`,
+        `<i>Waiting for persistent live confirmation: liquidity taken, evidence (CISD, SMT, engulfing or rejection, ` +
+        `acceptance) held over a new M1 candle, an M1 CISD → ENTER NOW.</i>`,
       { dedupeKey: `${watch.id}:touched` },
     );
   } else if (safety.action === "WAIT") {
@@ -942,26 +948,25 @@ async function tickSetupWatch(watch) {
     return;
   }
 
-  // -- The entry model -------------------------------------------------------
-  const tf = CONFIG.entryTimeframe;
-  const [m5raw, tfRaw, h1raw, m15raw, m1raw] = await Promise.all([
-    market.bars(watch.symbol, mainId, "M5", 100),
-    tf === "M5" || tf === "M1" ? null : market.bars(watch.symbol, mainId, tf, 80),
-    market.bars(watch.symbol, mainId, "H1", 60),
-    market.bars(watch.symbol, mainId, "M15", 100),
+  // -- Evidence -------------------------------------------------------------
+  //
+  // The v6.1 REAL CONFIRMATION, back by the owner's choice (28 Oct): the
+  // analysis has done the hard work, the monitor only has to see the turn.
+  // Liquidity taken, price at the zone, evidence (CISD, SMT, an engulfing
+  // or rejection, live acceptance) held over a new M1 bar, an M1 CISD, and
+  // R:R to TP1 at market still >= 1.
+  const [m5raw, m1raw] = await Promise.all([
+    market.bars(watch.symbol, mainId, "M5", 60),
     market.bars(watch.symbol, mainId, "M1", 80),
   ]);
   const m5 = closedSeries(m5raw || [], "M5", { nowMs: now });
-  const m15 = closedSeries(m15raw || [], "M15", { nowMs: now });
-  const m1 = closedSeries(m1raw || [], "M1", { nowMs: now });
-  const series = tf === "M5" ? m5 : tf === "M1" ? m1 : closedSeries(tfRaw || [], tf, { nowMs: now, staleBars: 5 });
-  const h1 = closedSeries(h1raw || [], "H1", { nowMs: now });
-  if (m5.status !== "OK" || series.status !== "OK" || series.bars.length < 20) {
-    watch.lastReason = `candles_${(m5.status !== "OK" ? m5.status : series.status).toLowerCase()}`;
+  const m1 = closedSeries(m1raw || [], "M1", { nowMs: now, staleBars: 5 });
+  if (m5.status !== "OK" || m1.status !== "OK" || m5.bars.length < 20 || m1.bars.length < 20) {
+    watch.lastReason = `candles_${(m5.status !== "OK" ? m5.status : m1.status).toLowerCase()}`;
     noteDataQuality(
       watch,
       false,
-      m5.status === "NO_TIMESTAMP" || series.status === "NO_TIMESTAMP"
+      m5.status === "NO_TIMESTAMP" || m1.status === "NO_TIMESTAMP"
         ? "candle feed omitted bar timestamps; closure cannot be verified"
         : "insufficient or stale candle history",
     );
@@ -969,20 +974,33 @@ async function tickSetupWatch(watch) {
   }
 
   // Candle bodies and the live quote must describe the same instrument.
-  const barVsSpot = market.checkScale(series.bars.at(-1).close, mid);
+  // Disagreement here means one of the two feeds is wrong and neither can
+  // be used as evidence.
+  const barVsSpot = market.checkScale(m5.bars.at(-1).close, mid);
   if (!barVsSpot.ok) {
     watch.lastReason = "candle_spot_divergence";
     noteDataQuality(
       watch,
       false,
-      `candle close ${formatLevel(series.bars.at(-1).close)} disagrees with live mid ${formatLevel(mid)}`,
+      `candle close ${formatLevel(m5.bars.at(-1).close)} disagrees with live mid ${formatLevel(mid)}`,
     );
     return;
   }
 
+  const partners = [];
+  for (const item of bundle) {
+    const partnerId = ids.get(item.symbol);
+    if (partnerId === undefined) continue;
+    const bars = await market.bars(item.symbol, partnerId, "M5", 45);
+    const series = closedSeries(bars || [], "M5", { nowMs: now });
+    if (series.status === "OK" && series.bars.length >= 20) {
+      partners.push({ symbol: item.symbol, bars: series.bars, inverse: item.inverse === true });
+    }
+  }
+
   // Only stops run after registration count, unless the caller said the
   // sweep had already printed; then the M5 history must show it.
-  const sweepBars = [...m5.bars, ...(tf === "M5" ? [] : series.bars)].filter(
+  const sweepBars = [...m5.bars, ...m1.bars].filter(
     (bar) => watch.liquidity_taken || bar.timestampMs >= watch.armedAtMs,
   );
   if (sweepBars.length) {
@@ -993,294 +1011,92 @@ async function tickSetupWatch(watch) {
     );
   }
 
+  watch.generation = advanceGeneration(watch.generation || { generation: 0 }, m1.latestCloseMs);
+  const atrM5 = calcATR(m5.bars, 14);
+  // How far price may pull back before a seen signal counts as faded. The
+  // raw quote tolerance (0.10 on gold) is noise inside the 60s hold, so in
+  // v6.0 gold evidence was wiped before it could ever graduate.
+  const fadeBand = Math.max(tolerance, atrM5 * CONFIG.evidenceFadeAtrFraction);
+
+  const signals = {
+    cisd: checkCISD(m1.bars, watch.direction),
+    smt: checkSMT(m5.bars, partners, watch.direction),
+    engulfM5: classifyEngulfing(m5.bars, watch.direction, "M5"),
+    engulfM1: classifyEngulfing(m1.bars, watch.direction, "M1"),
+    wick: classifyWick(m5.bars.at(-1), atrM5, watch.direction),
+    acceptance: checkAcceptance(watch, mid, protective, atrM5, tolerance, {
+      atrFraction: CONFIG.acceptanceAtrFraction,
+      riskFraction: CONFIG.acceptanceRiskFraction,
+    }),
+  };
+
   if (spreadHealth.abnormal) {
+    // Evidence is not advanced on a bad quote — the acceptance term is
+    // derived from bid/ask and would be measuring the spread, not the
+    // market.
     watch.lastReason = "spread_abnormal";
     noteDataQuality(watch, false, `spread ${formatLevel(spread)} exceeds cap ${formatLevel(spreadHealth.cap)}`);
     return;
   }
   noteDataQuality(watch, true);
 
-  // Step 1, liquidity grab: no stops run, no trade.
-  if (!watch.liquidityTaken) {
-    watch.lifecycle = "TOUCHED";
-    watch.lastReason = "awaiting_liquidity_sweep";
-    return;
-  }
-  // Steps 2–3: CISD, then the zone the displacement left. Read from closed
-  // bars of the entry timeframe only, so a late tick can neither miss nor
-  // invent it.
-  // OTE needs the H1 dealing range; without H1 candles the other three
-  // models still work.
-  const ote = h1.status === "OK" ? oteZone(h1.bars.slice(-48), watch.direction) : null;
-  const touchMs = Date.parse(watch.entryTouchedAt);
-  const buy = watch.direction === "buy";
-  const hhmm = (ms) => new Date(ms).toISOString().slice(11, 16);
-  const floorTo = (ms, span) => Math.floor(ms / span) * span;
-  const m15bars = m15.status === "OK" ? m15.bars : [];
-  // The CISD model (the owner's CISD and CISD × SMT charts; Mastering the
-  // 4 ICT Entry Models): after the reaction, a candle closes beyond the
-  // open of the consecutive candles that delivered price to the extreme;
-  // the entry is on the retrace to that level — or to the gap the
-  // displacement left, when it left one — with the stop beyond the
-  // extreme. Read on M1, the entry timeframe and M15, and the first to
-  // close beyond its level counts (28 Oct XAUUSD: the M1 closed above the
-  // level at 13:00, the M5 closed 6 cents short of it and the entry never
-  // came). M1 only for the CISD, and only while its bars still reach back
-  // to the touch: its candles are noise as a confirmation.
-  const cisdSeries = [
-    ["M1", m1.status === "OK" && m1.bars[0]?.timestampMs <= touchMs ? m1.bars : []],
-    [tf, series.bars],
-    ["M15", m15bars],
-  ].filter(([name, bars], index, all) => bars.length >= 20 && all.findIndex(([other]) => other === name) === index);
-  const cisdReads = cisdSeries.map(([name, bars]) => ({
-    name,
-    bars,
-    model: entryModel(bars, watch.direction, touchMs, { ote, span: PERIOD_MS[name] }),
-  }));
-  const closedAt = (read) => read.model.mss.at + PERIOD_MS[read.name];
-  const pick =
-    cisdReads.filter((read) => read.model.mss.shifted).sort((a, b) => closedAt(a) - closedAt(b))[0] ??
-    cisdReads.find((read) => read.name === tf) ??
-    cisdReads[0];
-  const [model, cisdTf, cisdBars] = [pick.model, pick.name, pick.bars];
-  watch.structureShift = model.mss;
-  watch.entryZone = model.zone;
+  const result = evaluateConfirmation(watch, signals, {
+    mid,
+    tolerance: fadeBand,
+    nowMs: now,
+    generation: watch.generation.generation,
+    hasBarTime: watch.generation.hasBarTime,
+    minHoldMs: CONFIG.minConfirmationHoldMs,
+    requireNewBar: CONFIG.requireNewBar,
+  });
+  watch.evidence = result.evidence;
+  watch.lastSignals = result.signals;
+  const mss = structureShift(m1.bars, watch.direction, Date.parse(watch.entryTouchedAt));
+  watch.structureShift = mss;
   store.dirty = true;
-  const validated = Boolean(model.mss.shifted);
-  const prepared = watch.entry_zone_low !== null && watch.entry_zone_low !== undefined;
-  const preparedZone = prepared ? { low: watch.entry_zone_low, high: watch.entry_zone_high } : null;
-  // From the sweep on: the M5 bar that took the liquidity (noticed live or
-  // only once it closed), or the touch's bar when the sweep came first.
-  const takenAt = Date.parse(watch.liquidityTakenAt) || touchMs;
-  const sweepBar = m5.bars.findLast(
-    (bar) => bar.timestampMs <= takenAt && (buy ? bar.low <= watch.sweep_level : bar.high >= watch.sweep_level),
-  );
-  const sweptFrom = Math.max(floorTo(touchMs, PERIOD_MS.M5), sweepBar ? sweepBar.timestampMs : floorTo(takenAt, PERIOD_MS.M5));
-  const smt = await smtAtSweep(watch, m5.bars, partner, ids.get(partner));
-  watch.smt = smt;
-  // The candle of the turn, M5 or M15, whichever closed first.
-  const turnCandle = validated
-    ? [
-        ["M5", m5.bars],
-        ["M15", m15bars],
-      ]
-        .map(([name, bars]) => {
-          const found = m5Confirmation(bars, watch.direction, floorTo(model.extremeAt, PERIOD_MS[name]), tolerance);
-          return found && { tf: name, ...found, closes: found.at + PERIOD_MS[name] };
-        })
-        .filter(Boolean)
-        .sort((x, y) => x.closes - y.closes)[0]
-    : null;
-  watch.m5Confirmation = turnCandle ?? null;
-  const extremeBar = validated ? cisdBars.find((bar) => bar.timestampMs === model.extremeAt) : null;
-  const cisdSwing = model.zone?.stop ?? (extremeBar && (buy ? extremeBar.low : extremeBar.high));
-  // The gap counts only on the trade's side of the swing: one the
-  // displacement left, not an older one beyond the extreme (28 Oct XAUUSD:
-  // an inversion gap at 4047 under the 4050.46 low stretched the entry
-  // zone down to it).
-  const gap = model.zone && cisdSwing && (buy ? model.zone.low > cisdSwing : model.zone.high < cisdSwing) ? model.zone : null;
-  const cisdZone = validated && {
-    low: Math.min(gap?.low ?? Infinity, model.mss.level),
-    high: Math.max(gap?.high ?? -Infinity, model.mss.level),
-  };
-  const cisdKey = validated ? `cisd:${model.mss.level}:${gap?.low ?? ""}` : "";
-  const cisdText = validated
-    ? `${cisdTf} CISD ${formatLevel(model.mss.level)}` +
-      (gap ? ` + ${zoneLabel(gap)} ${formatLevel(gap.low)} – ${formatLevel(gap.high)}` : "")
-    : "";
 
-  // The entry is the CISD model (the owner's CISD and CISD × SMT charts):
-  // after the sweep, a CISD, backed by SMT divergence or an M5 / M15
-  // engulfing or rejection, then the retrace to the CISD level or its gap.
-  // An engulfing or rejection alone never enters: 24–27 Oct, four entries
-  // on a candle in the zone without a CISD or with a stop inside the zone,
-  // four stops.
-  const backing = [
-    turnCandle && `${turnCandle.tf} ${turnCandle.type} ${hhmm(turnCandle.at)} UTC`,
-    smt?.divergent && `SMT divergence vs ${smt.partner} at ${hhmm(smt.at)} UTC`,
-  ].filter(Boolean);
-  let cisdHolds = validated;
-  if (prepared) {
-    // The validator. From the sweep on, price action in the analysis's
-    // zone on M5 and M15: a close through the zone's far edge, or an
-    // engulfing or rejection against the trade in it, means the setup is
-    // failing — no entry until a new CISD, and the watch goes on until the
-    // invalidation.
-    const extra = [
-      validated &&
-        model.mss.at >= sweptFrom && {
-          kind: "confirm",
-          type: "CISD",
-          tf: cisdTf,
-          span: PERIOD_MS[cisdTf],
-          at: model.mss.at + PERIOD_MS[cisdTf],
-        },
-    ].filter(Boolean);
-    const read = zonePriceAction(
-      [
-        { tf: "M5", span: PERIOD_MS.M5, bars: m5.bars },
-        { tf: "M15", span: PERIOD_MS.M15, bars: m15bars },
-      ],
-      watch.direction,
-      preparedZone,
-      sweptFrom,
-      tolerance,
-      extra,
-    );
-    const describe = (event) => `${event.tf} ${event.type} ${hhmm(event.at - event.span)} UTC`;
-    const was = watch.validator?.state ?? null;
-    watch.validator = { state: read.state, last: read.last };
-    if (read.state === "failing") {
-      // Once per failing spell, not on every candle of it.
-      if (was !== "failing") {
-        notify(
-          `<b>⚠️ PRICE ACTION AGAINST THE SETUP — NO ENTRY</b>\n` +
-            `<b>${htmlEscape(watch.symbol)} ${buy ? "BUY" : "SELL"}</b>\n` +
-            `<b>Seen:</b> ${htmlEscape(describe(read.last))}\n` +
-            `<b>Zone:</b> ${htmlEscape(formatLevel(preparedZone.low))} – ${htmlEscape(formatLevel(preparedZone.high))}\n` +
-            `<i>No entry while it fails. Watching until the invalidation ${htmlEscape(formatLevel(watch.invalidation ?? watch.sl))}: ` +
-            `ENTER NOW comes only after a new CISD.</i>`,
-          { dedupeKey: `${watch.id}:failing:${read.last.tf}:${read.last.at}` },
-        );
-      }
+  if (!result.enter) {
+    // Evidence that had graduated and then decayed must walk the
+    // lifecycle backwards, visibly, rather than leaving the watch parked
+    // in CONFIRMING with nothing behind it.
+    if (watch.lifecycle === "CONFIRMING") {
       watch.lifecycle = "TOUCHED";
+      watch.lastReason = "evidence_decayed";
       watch.lastGateBlockReason = null;
-      watch.lastReason = "price_action_against_setup";
-      return;
+    } else {
+      watch.lastReason = "evidence_pending";
     }
-    // The CISD counts while nothing has failed since it.
-    cisdHolds = read.confirmations.some((event) => event.type === "CISD");
-    backing.push(...read.confirmations.filter((event) => event.type !== "CISD").slice(-1).map((event) => `${describe(event)} in the zone`));
-  }
-  if (!cisdHolds || !cisdSwing) {
-    watch.lifecycle = "TOUCHED";
-    watch.lastGateBlockReason = null;
-    watch.lastReason = "awaiting_cisd";
     return;
   }
-  if (!backing.length) {
-    watch.lifecycle = "TOUCHED";
-    watch.lastGateBlockReason = null;
-    watch.lastReason = "awaiting_engulfing_rejection_or_smt";
+
+  // The two facts no evidence counter can stand in for: the stops were
+  // run, and order flow turned on a closed M1 body. Without both there is
+  // nothing to tell the human yet.
+  if (!watch.liquidityTaken || !mss.shifted) {
+    if (watch.lifecycle === "CONFIRMING") watch.lifecycle = "TOUCHED";
+    watch.lastReason = !watch.liquidityTaken ? "awaiting_liquidity_sweep" : "awaiting_structure_shift";
     return;
   }
-  // The stop beyond the reaction's extreme and, with a prepared zone,
-  // beyond the zone's far edge too — a retest of the zone is not a reason
-  // to be out — plus spread and tolerance, never wider than the registered
-  // SL.
-  const swing = prepared ? (buy ? Math.min(cisdSwing, preparedZone.low) : Math.max(cisdSwing, preparedZone.high)) : cisdSwing;
-  const buffer = tolerance + spread;
-  const modelStop = buy ? Math.max(swing - buffer, watch.sl) : Math.min(swing + buffer, watch.sl);
-  const swingSide = prepared ? (buy ? "below the zone and the swing low" : "above the zone and the swing high") : buy ? "below the swing low" : "above the swing high";
-  const entryZone = cisdZone;
-  const zoneText = `${formatLevel(entryZone.low)} – ${formatLevel(entryZone.high)} (CISD level${gap ? " + gap" : ""})`;
-  const inZone = (zone) => executable >= zone.low - tolerance && executable <= zone.high + tolerance;
-  // ENTER NOW needs price action at the CISD level, not just price there:
-  // after the CISD, an M5 engulfing or rejection that traded into the level
-  // (or its gap) and closed holding it. An M5 close through it, or an
-  // engulfing or rejection against the trade there, means the CISD failed —
-  // no entry until price action reclaims it (28 Oct XAUUSD: ENTER NOW on
-  // the first touch of the level while that M5 candle engulfed it from
-  // above, and price kept falling).
-  const atLevel = zonePriceAction(
-    [{ tf: "M5", span: PERIOD_MS.M5, bars: m5.bars }],
-    watch.direction,
-    entryZone,
-    model.mss.at + PERIOD_MS[cisdTf],
-    tolerance,
-  );
-  watch.cisdRetrace = { state: atLevel.state, last: atLevel.last };
-  const held = atLevel.state === "armed" ? atLevel.last : null;
-  // Entered in the zone, or at the close of the candle that held it while
-  // price is still within that candle.
-  const ready =
-    held &&
-    (inZone(entryZone) ||
-      (held.fresh &&
-        (buy
-          ? executable >= entryZone.low - tolerance && executable <= Math.max(entryZone.high, held.high) + tolerance
-          : executable <= entryZone.high + tolerance && executable >= Math.min(entryZone.low, held.low) - tolerance)));
-  const candleText =
-    `${cisdText} · ${backing.join(" + ")}` +
-    (held ? ` · M5 ${held.type} holding the CISD level ${hhmm(held.at - held.span)} UTC` : "");
-  const validation = candleText;
+
   watch.lifecycle = "CONFIRMING";
-  // The target is looked up once per CISD, not on every fast check.
-  if (watch.targetKey !== cisdKey) {
-    watch.targetKey = cisdKey;
-    watch.target = await targetFor(watch, mainId, mid);
-  }
-  if (atLevel.state === "failing" && watch.cisdFailNotified !== `${cisdKey}:${atLevel.last.at}`) {
-    watch.cisdFailNotified = `${cisdKey}:${atLevel.last.at}`;
-    notify(
-      `<b>⚠️ CISD LEVEL LOST — NO ENTRY</b>\n` +
-        `<b>${htmlEscape(watch.symbol)} ${buy ? "BUY" : "SELL"}</b>\n` +
-        `<b>Seen:</b> M5 ${htmlEscape(atLevel.last.type)} ${hhmm(atLevel.last.at - atLevel.last.span)} UTC at ${htmlEscape(zoneText)}\n` +
-        `<i>No entry unless an M5 engulfing or rejection takes the level back, or a new CISD forms. ` +
-        `Watching until the invalidation ${htmlEscape(formatLevel(watch.invalidation ?? watch.sl))}.</i>`,
-      { dedupeKey: `${watch.id}:cisd-lost:${cisdKey}:${atLevel.last.at}` },
-    );
-  }
-  // Once per CISD, and only while there is a retrace to wait for: the
-  // notifier's dedupe does not outlive a Vercel request.
-  if (!ready && atLevel.state !== "failing" && watch.zoneNotified !== cisdKey) {
-    watch.zoneNotified = cisdKey;
-    const tp = firstTarget(watch, watch.target, buy ? entryZone.high : entryZone.low, modelStop);
-    notify(
-      `<b>🟡 CISD CONFIRMED — ENTRY ZONE READY</b>\n` +
-        `<b>${htmlEscape(watch.symbol)} ${htmlEscape(watch.direction.toUpperCase())}</b>\n` +
-        `<b>Entry:</b> ${htmlEscape(zoneText)}\n` +
-        `<b>Confirmed by:</b> ${htmlEscape(candleText)}\n` +
-        `<b>SL:</b> ${htmlEscape(formatLevel(modelStop))} (${swingSide}) · <b>TP1:</b> ${htmlEscape(formatLevel(tp.level))} (${htmlEscape(tp.what)})\n` +
-        `<i>Not an entry yet. ENTER NOW comes when price retraces to the CISD level and an M5 engulfing or rejection holds it.</i>`,
-    );
-  }
-
-  // Step 4: enter on the retrace to the CISD level or its gap, once an M5
-  // candle has held it — never on the move away, never on a bare touch.
-  if (!ready) {
-    watch.lastReason =
-      atLevel.state === "failing" ? "cisd_level_lost" : inZone(entryZone) ? "awaiting_m5_hold_at_cisd" : "awaiting_retrace";
-    return;
-  }
-
   watch.lastReason = "awaiting_gates";
-  // A stop within three spreads of the fill is noise, not a stop.
-  const tooTight = Math.abs(executable - modelStop) < 3 * spread;
-  const stop = {
-    sl: tooTight ? watch.sl : modelStop,
-    reason: tooTight ? "registered SL — the swing stop is within 3 spreads" : swingSide,
-  };
-  // TP1 is the nearest target that pays the minimum R:R (the guide's
-  // low-hanging fruit first); R:R and the do-not-chase price are measured
-  // to it and to the stop actually sent.
-  const tp = firstTarget(watch, watch.target, executable, stop.sl);
-  const plan = { ...watch, sl: stop.sl, tp1: tp.level };
+
   const gates = await applyExternalGates(watch, spread);
-  const rr = marketRR(plan, executable);
+  const rr = marketRR(watch, executable);
   watch.rrAtMarket = Number(rr.toFixed(2));
   if (rr < CONFIG.minRrAtEntry) {
     gates.pass = false;
     // Stable wording: the block notice is sent once per distinct reason,
     // and a live number in it would resend it every tick.
     gates.reasons.unshift(
-      `R:R to TP1 below ${CONFIG.minRrAtEntry} (price is past ${formatLevel(chaseLimit(plan, CONFIG.minRrAtEntry))}) — do not chase; waiting for a better price in the zone`,
+      `R:R at market below ${CONFIG.minRrAtEntry} (price ran past ${formatLevel(chaseLimit(watch, CONFIG.minRrAtEntry))}) — do not chase; waiting for a pullback`,
     );
   }
   if (gates.pass) {
     watch.lastReason = "confirming";
-    const furthest = [tp.level, watch.tp1, watch.tp2, watch.tp3].filter(Number.isFinite);
-    const walls = await obstaclesFor(watch, mainId, executable, buy ? Math.max(...furthest) : Math.min(...furthest));
-    confirmWatch(
-      watch,
-      { executable, spread },
-      { ...model, entryZone, zoneText, candleText, where: "Price retraced to" },
-      gates,
-      rr,
-      stop,
-      tp,
-      walls,
-    );
+    const furthest = [watch.tp1, watch.tp2, watch.tp3].filter(Number.isFinite);
+    const walls = await obstaclesFor(watch, mainId, executable, watch.direction === "buy" ? Math.max(...furthest) : Math.min(...furthest));
+    confirmWatch(watch, { executable, spread }, result, gates, mss, rr, walls);
     return;
   }
   const reasonText = gates.reasons.join(" | ");
@@ -1288,56 +1104,13 @@ async function tickSetupWatch(watch) {
     watch.lastGateBlockReason = reasonText;
     watch.lastReason = "gate_blocked";
     notify(
-      `<b>MODEL CONFIRMED — WAITING ON GATE</b>\n` +
+      `<b>TECHNICALLY CONFIRMED — WAITING ON GATE</b>\n` +
         `<b>${htmlEscape(watch.symbol)}</b> ${htmlEscape(watch.direction.toUpperCase())}\n` +
-        `<b>Model:</b> ${htmlEscape(validation)}\n` +
+        `<b>Evidence:</b> ${htmlEscape(result.signals.join(" + "))}\n` +
         `<b>Blocked by:</b> ${htmlEscape(reasonText)}`,
       { dedupeKey: `${watch.id}:gate:${reasonText}` },
     );
   }
-}
-
-// The guide's target from the same liquidity map the analysis reads. Only
-// fetched when a zone appears and on ENTER NOW, so it costs next to
-// nothing; a failure leaves the line out rather than delaying the entry.
-async function targetFor(watch, symbolId, price) {
-  try {
-    const nowMs = Date.now();
-    const raw = Object.fromEntries(
-      await Promise.all(
-        ["D1", "H1", "M15"].map(async (tf) => [tf, await market.history(watch.symbol, symbolId, tf, SNAPSHOT_BARS[tf])]),
-      ),
-    );
-    const closedOf = (tf) => closedSeries(raw[tf] || [], tf, { nowMs, staleBars: Infinity }).bars;
-    const map = liquidityMap({
-      d1: closedOf("D1"),
-      h1: closedOf("H1"),
-      m15: closedOf("M15"),
-      price,
-      nowMs,
-      equalTolerance: Math.max(priceTolerance(watch.symbol, price), calcATR(closedOf("H1"), 14) * 0.1),
-    });
-    return lowHangingFruit(map, watch.direction, price);
-  } catch (error) {
-    log(`low-hanging fruit for ${watch.id} unavailable: ${error.message}`);
-    return null;
-  }
-}
-
-// SMT at the sweep, on M5: the bar where price went furthest beyond
-// sweep_level (the liquidity taken), against the bundle's first partner.
-// Null when there is no partner, no sweep bar in the window, or too few
-// partner bars to tell.
-async function smtAtSweep(watch, m5bars, partner, partnerId) {
-  if (!partner || partnerId === undefined) return null;
-  const buy = watch.direction === "buy";
-  const beyond = m5bars.filter((bar) => (buy ? bar.low <= watch.sweep_level : bar.high >= watch.sweep_level));
-  if (!beyond.length) return null;
-  const sweep = beyond.reduce((best, bar) => (buy ? (bar.low < best.low ? bar : best) : bar.high > best.high ? bar : best));
-  const raw = await market.bars(partner, partnerId, "M5", 100);
-  const partnerBars = closedSeries(raw || [], "M5", { nowMs: Date.now(), staleBars: Infinity }).bars;
-  const divergent = smtDivergence(m5bars, partnerBars, watch.direction, sweep.timestampMs);
-  return divergent === null ? null : { divergent, partner, at: sweep.timestampMs };
 }
 
 // The zones that can stop the trade on its way to the furthest target, on
@@ -1360,40 +1133,6 @@ async function obstaclesFor(watch, symbolId, entry, target) {
     log(`obstacles for ${watch.id} unavailable: ${error.message}`);
     return [];
   }
-}
-
-// TP1: the nearest target that pays the minimum R:R from this price to
-// this stop — the low-hanging fruit when it lies before the registered
-// TP1, then the registered targets in turn. When none pays it, the
-// registered TP1, and the R:R gate says so.
-function firstTarget(watch, fruit, price, sl) {
-  const buy = watch.direction === "buy";
-  const ahead = (level) => Number.isFinite(level) && (buy ? level > price : level < price);
-  const risk = Math.abs(price - sl);
-  const candidates = [
-    fruit &&
-      ahead(fruit.level) &&
-      (buy ? fruit.level < watch.tp1 : fruit.level > watch.tp1) && {
-        level: fruit.level,
-        what: `low-hanging fruit · ${fruit.what}`,
-        fruit: true,
-      },
-    ...[watch.tp1, watch.tp2, watch.tp3].map((level, index) => ahead(level) && { level, what: `registered TP${index + 1}`, fruit: false }),
-  ].filter(Boolean);
-  return (
-    candidates.find((target) => risk > 0 && Math.abs(target.level - price) / risk >= CONFIG.minRrAtEntry) ?? {
-      level: watch.tp1,
-      what: "registered TP1",
-      fruit: false,
-    }
-  );
-}
-
-function zoneLabel(zone) {
-  const name = { FVG: "2022 model · FVG", IFVG: "Inversion · IFVG", Unicorn: "Unicorn · breaker + FVG", OB: "Order Block" }[
-    zone.model
-  ];
-  return zone.ote ? `OTE 62–79% · ${name}` : name;
 }
 
 // ---------------------------------------------------------------------------
@@ -1658,7 +1397,7 @@ const CUSTOM_TOOLS = [
   {
     name: "register_watch",
     description:
-      "Registers a trading setup for live monitoring. The monitor validates it on live candles — price reaches the zone, the liquidity at sweep_level is taken, then a CISD on M1, M5 or M15 (the first to close beyond its level) backed by SMT divergence or an M5 / M15 engulfing or rejection — and sends ENTER NOW on Telegram when price retraces to the CISD level and an M5 engulfing or rejection holds it, with R:R ≥ 1, news and spread clear (no session filter). A close through the zone or price action against the trade in it means no entry until a new CISD, watched until the invalidation. Then it manages the trade: TP alerts, SL to breakeven after TP1, CLOSE NOW where price turns back or an M5–H4 zone in the way holds. Never places an order.",
+      "Registers a trading setup for live monitoring. The monitor confirms it on live candles — price reaches the zone, the liquidity at sweep_level is taken, evidence (CISD, SMT divergence, an M5 / M1 engulfing or M5 rejection, live acceptance beyond the entry) holds over a new M1 candle, and an M1 candle body closes beyond the open of the run into the low / high (CISD) — and sends ENTER NOW on Telegram with the registered SL and TPs, when R:R to TP1 at market is ≥ 1 and news and spread are clear (no session filter). Then it manages the trade: TP alerts, SL to breakeven after TP1, CLOSE NOW where price turns back or an M5–H4 zone in the way holds. Never places an order.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -1686,7 +1425,7 @@ const CUSTOM_TOOLS = [
         entry_zone_low: {
           type: "number",
           description:
-            "The prepared zone's lower edge: the PD array (FVG / OB / breaker) where price must react. Send it with entry_zone_high whenever the analysis has a zone. Price reaching it is the entry touch; after the sweep the monitor needs a CISD on M1, M5 or M15 (backed by SMT divergence or an M5 / M15 engulfing or rejection) and enters on the retrace to the CISD level once an M5 engulfing or rejection holds it; a close through this zone or price action against the trade in it means no entry until a new CISD, watched until the invalidation. The entry must lie inside the zone and the SL beyond it.",
+            "The prepared zone's lower edge: the PD array (FVG / OB / breaker) where price must react. Send it with entry_zone_high whenever the analysis has a zone. Price reaching it is the entry touch, then the monitor waits for the sweep and the live confirmation. The entry must lie inside the zone and the SL beyond it.",
         },
         entry_zone_high: {
           type: "number",
@@ -1809,6 +1548,8 @@ function createSetupWatch(args) {
     entryTouchedAt: null,
     liquidityTaken: false,
     liquidityTakenAt: null,
+    evidence: {},
+    generation: { lastBarTimeMs: null, generation: 0, hasBarTime: false },
     spreadSamples: [],
     lastGoodUpdateAt: null,
     degradedSince: null,
@@ -1860,8 +1601,8 @@ async function handleCustomTool(name, args = {}) {
             ? `<b>Entry zone:</b> ${htmlEscape(formatLevel(watch.entry_zone_low))} – ${htmlEscape(formatLevel(watch.entry_zone_high))} (watched: price reaching the zone is the touch)\n`
             : "") +
           `<b>Liquidity to take:</b> ${htmlEscape(formatLevel(watch.sweep_level))}\n` +
-          `<i>Waiting for the sweep, price in the ${watch.entry_zone_low != null ? "zone" : "entry"}, then price action that confirms ` +
-          `(M5 / M15 engulfing or rejection, CISD).</i>`,
+          `<i>Waiting for the sweep, price in the ${watch.entry_zone_low != null ? "zone" : "entry"}, then evidence held over a new ` +
+          `M1 candle (CISD, SMT, engulfing or rejection, acceptance) and an M1 CISD.</i>`,
         { dedupeKey: `${watch.id}:armed` },
       );
     }
@@ -2071,7 +1812,7 @@ async function handleMcpRequest(req, res) {
       result: {
         protocolVersion: body.params?.protocolVersion || CONFIG.protocolVersion,
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.16.0" },
+        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.17.0" },
       },
     });
     return;
@@ -2166,7 +1907,7 @@ app.get("/health", async (req, res) => {
   const base = {
     status: SERVERLESS && !kv ? "storage_missing" : "ok",
     service: "watch-monitor-mcp",
-    version: "6.16.0",
+    version: "6.17.0",
     runtime: SERVERLESS ? "vercel" : "node",
     watches: setups.length,
     last_tick_at: SERVERLESS ? lastTickAt : undefined,

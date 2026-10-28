@@ -38,9 +38,8 @@ function bars(count, span, base) {
 // A scripted M1 path around minute `scenarioMinute` (bar A): a pullback
 // with one lower high (4419.60) into the POI, then bar A wicks to 4411 —
 // through the entry and the 4412 sell-side liquidity — and closes 4419.80,
-// above that lower high: liquidity grab + MSS. Minute 1 is the
-// displacement, minute 2 leaves its low above bar A's high: the 2022
-// model's FVG, 4420–4421.5.
+// above 4419.30, the open of the run down into it: sweep + M1 CISD +
+// engulfing in one bar.
 let scenarioMinute = null;
 const SCRIPT = {
   "-6": [4419, 4419.2, 4418, 4418.3],
@@ -50,19 +49,6 @@ const SCRIPT = {
   "-2": [4416.4, 4416.6, 4415.2, 4415.5],
   "-1": [4415.5, 4415.6, 4414.6, 4414.8],
   0: [4414.6, 4420, 4411, 4419.8],
-  1: [4419.8, 4426, 4419.6, 4425.5],
-  2: [4425.5, 4428, 4421.5, 4427],
-  // Price holds up, then the retrace: into the gap during minutes 6–8 and
-  // back up — the M5 bar of minutes 6–10 is a hammer holding the CISD
-  // level, the confirmation ENTER NOW waits for.
-  3: [4427, 4427.5, 4425.8, 4426.5],
-  4: [4426.5, 4427.8, 4426, 4427.2],
-  5: [4427.2, 4428, 4426.9, 4427],
-  6: [4427, 4427.2, 4421.2, 4421.4],
-  7: [4421.4, 4421.6, 4420.3, 4420.6],
-  8: [4420.6, 4421, 4420.2, 4420.8],
-  9: [4420.8, 4422.5, 4420.7, 4422.3],
-  10: [4422.3, 4426.5, 4422.2, 4426.2],
 };
 function scriptedM1(count) {
   const lastOpen = Math.floor(NOW() / 60_000) * 60_000;
@@ -247,6 +233,7 @@ const env = {
   TELEGRAM_CHAT_ID: "1",
   SCHEDULER_TICK_MS: "1000",
   WATCH_INTERVAL_MS: "3000",
+  MIN_CONFIRMATION_HOLD_MS: "0",
   NEWS_FILTER_ENABLED: "false",
 };
 
@@ -536,9 +523,6 @@ const vercel = boot({
   KV_REST_API_TOKEN: "kv-token",
   FAST_MODE_INTERVAL_MS: "1500",
   FAST_MODE_WINDOW_MS: "4000",
-  // The scripted scenario plays the model on M1 so it takes minutes, not
-  // an hour of M5 bars; M5 itself is covered by the unit tests.
-  ENTRY_TIMEFRAME: "M1",
 });
 await sleep(1500);
 const tick = (query = "", headers = { authorization: "Bearer secret" }) =>
@@ -575,7 +559,7 @@ assert(!vWatch?.recovered, "back-to-back ticks keep the watch as saved instead o
 const health = await (await fetch("http://127.0.0.1:9804/health", { headers: { authorization: "Bearer secret" } })).json();
 assert(health.storage === "redis" && health.last_tick_at, `health reports Redis and the last tick (${health.storage})`);
 
-console.log("\n— a real ENTER NOW, end to end on M1 time (12 to 17 minutes) —");
+console.log("\n— a real ENTER NOW, end to end on M1 time (about 3 minutes) —");
 const nextMinute = (offsetMs) => sleep(60_000 - (Date.now() % 60_000) + offsetMs);
 const scenarioWatch = async () => {
   const listed = JSON.parse((await rpc("tools/call", { name: "list_watches" }, 1, 9804)).result.content[0].text);
@@ -584,10 +568,7 @@ const scenarioWatch = async () => {
     resolved: listed.recent.find((record) => record.setup_id === "scenario"),
   };
 };
-// Bar A is the last minute of its M5 bar, so that M5 candle (the sweep's
-// rejection) has closed by the next minute's check.
-do await nextMinute(1000);
-while (Math.floor(Date.now() / 60_000) % 5 !== 4);
+await nextMinute(1000);
 scenarioMinute = Math.floor(Date.now() / 60_000);
 price = 4414.3; // ask 4414.40: the entry is touched live
 await rpc(
@@ -604,7 +585,7 @@ await rpc(
       tp2: 4460,
       sweep_level: 4412,
       liquidity_taken: true,
-      setup_model: "2022 model",
+      setup_model: "Sweep + CISD",
       conviction: "A",
     },
   },
@@ -629,7 +610,7 @@ await rpc(
       liquidity_taken: true,
       entry_zone_low: 4411.5,
       entry_zone_high: 4415,
-      setup_model: "2022 model",
+      setup_model: "Sweep + CISD",
       conviction: "A",
     },
   },
@@ -644,71 +625,34 @@ await tick();
 assert((await scenarioWatch()).active?.entryTouched === true, "minute A: entry touched live");
 assert((await zoneWatch())?.entryTouched === true, "prepared zone: price in the zone is the touch");
 
-price = 4425; // the displacement, away from every zone
+price = 4419; // acceptance: well beyond entry, far from the stop
 await nextMinute(3000);
 await tick();
 const midway = (await scenarioWatch()).active;
 assert(midway?.liquidityTaken === true, "bar A closed: its wick took the 4412 liquidity");
-assert(midway?.structureShift?.shifted === true, `bar A closed above 4419.30, the open of the run down into the sweep: CISD (${midway?.lastReason})`);
-assert(midway?.m5Confirmation?.type === "rejection", `the sweep's M5 candle is a rejection (${JSON.stringify(midway?.m5Confirmation)})`);
-assert(midway?.lastReason === "awaiting_retrace", `a zone exists, price is away from it: no entry (${midway?.lastReason})`);
-const zoned = await zoneWatch();
-assert(
-  zoned?.validator?.state === "armed" && zoned.validator.last?.type === "rejection" && zoned.lastReason === "awaiting_retrace",
-  `prepared zone: the sweep's M5 rejection in it arms the setup; price is away, no entry (${JSON.stringify(zoned?.validator)} ${zoned?.lastReason} ${JSON.stringify(zoned?.trade ?? null)})`,
-);
+assert(midway?.structureShift?.shifted === true, `bar A closed above 4419.30, the open of the run down into the sweep: M1 CISD (${midway?.lastReason})`);
+assert(midway?.lifecycle !== "IN_TRADE", `one observation is not a confirmation: evidence must survive a new M1 bar (${midway?.lastReason})`);
 
-price = 4427; // price has not come back
 await nextMinute(3000);
-await tick(); // minute 1 closed: still no gap above bar A
-await nextMinute(3000);
-const readyTick = await (await tick()).json(); // minute 2 closed: its low leaves the FVG
-const ready = (await scenarioWatch()).active;
-assert(readyTick.hot === true, "a ready zone makes the watch hot");
+await tick();
+const open = (await scenarioWatch()).active;
+const trade = open?.trade;
+assert(open?.lifecycle === "IN_TRADE", `a new M1 bar later: REAL CONFIRMATION — ENTER NOW, and the trade stays watched (${open?.lifecycle ?? (await scenarioWatch()).resolved?.status} ${open?.lastReason})`);
+assert(trade?.rr_at_entry >= 1, `entered at market with R:R ${trade?.rr_at_entry} to TP1`);
+assert(trade?.sl === 4400 && trade.targets.join() === "4451,4460", `the registered SL and TPs (${trade?.sl} ${trade?.targets})`);
+assert(Array.isArray(trade?.obstacles), `the zones in the way to the target were mapped on M5–H4 (${JSON.stringify(trade?.obstacles)})`);
+const zoneTrade = await zoneWatch();
+assert(zoneTrade?.lifecycle === "IN_TRADE", `prepared zone: the same confirmation enters too (${zoneTrade?.lifecycle} ${zoneTrade?.lastReason})`);
+
+console.log("\n— managing the trade —");
+const tradeTick = await (await tick()).json();
+assert(tradeTick.hot === true, "an open trade makes the watch hot");
 const lastTick = async () =>
   (await (await fetch("http://127.0.0.1:9804/health", { headers: { authorization: "Bearer secret" } })).json()).last_tick_at;
 const answeredAt = await lastTick();
 await sleep(2000);
 assert((await lastTick()) > answeredAt, "fast mode: checked again after the tick was answered, without the cron");
-assert(
-  ready?.entryZone?.model === "FVG" && ready.entryZone.low === 4420 && ready.entryZone.high === 4421.5,
-  `the displacement left the FVG 4420–4421.5 (${JSON.stringify(ready?.entryZone)})`,
-);
-assert(!(await scenarioWatch()).resolved, "the move away from the zone is never an entry");
 
-price = 4421; // the retrace into the FVG — a touch is not a confirmation
-await nextMinute(3000);
-await tick();
-assert(
-  (await scenarioWatch()).active?.lifecycle !== "IN_TRADE",
-  `price at the CISD level without an M5 candle holding it: no entry (${(await scenarioWatch()).active?.lastReason})`,
-);
-// The M5 bar of minutes 6–10 closes as a hammer at the level.
-while (Math.floor(Date.now() / 60_000) - scenarioMinute < 11) await nextMinute(3000);
-price = 4426; // still within that candle
-await sleep(3000); // past the spot cache and the fast checks
-await tick();
-const open = (await scenarioWatch()).active;
-const trade = open?.trade;
-assert(open?.lifecycle === "IN_TRADE", `the M5 hammer held the CISD level: REAL CONFIRMATION — ENTER NOW, and the trade stays watched (${open?.lifecycle ?? (await scenarioWatch()).resolved?.status} ${open?.lastReason} ${JSON.stringify(open?.cisdRetrace)})`);
-assert(trade?.rr_at_entry >= 1, `entered in the zone with R:R ${trade?.rr_at_entry} to TP1`);
-const zoneTrade = await zoneWatch();
-assert(
-  zoneTrade?.lifecycle === "IN_TRADE" && zoneTrade.trade?.entry_zone?.low === 4419.3,
-  `prepared zone: the retrace to the CISD level and gap enters too (${zoneTrade?.lifecycle} ${JSON.stringify(zoneTrade?.trade?.entry_zone)})`,
-);
-assert(
-  Math.abs(trade?.sl - 4410.7) < 0.01,
-  `the stop: under the 4411 swing low by spread + tolerance, not the registered 4400 (${trade?.sl})`,
-);
-assert(
-  trade?.low_hanging_fruit?.level > trade?.entry && trade.low_hanging_fruit.level < 4451 && trade.targets[0] === trade.low_hanging_fruit.level,
-  `TP1 is the low-hanging fruit, the nearest untaken pool before the registered 4451 (${JSON.stringify(trade?.low_hanging_fruit)}, targets ${trade?.targets})`,
-);
-
-assert(Array.isArray(trade?.obstacles), `the zones in the way to the target were mapped on M5–H4 (${JSON.stringify(trade?.obstacles)})`);
-
-console.log("\n— managing the trade —");
 price = trade.targets[0] + 0.5; // TP1
 await sleep(3000);
 await tick();
