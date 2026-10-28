@@ -944,15 +944,17 @@ async function tickSetupWatch(watch) {
 
   // -- The entry model -------------------------------------------------------
   const tf = CONFIG.entryTimeframe;
-  const [m5raw, tfRaw, h1raw, m15raw] = await Promise.all([
+  const [m5raw, tfRaw, h1raw, m15raw, m1raw] = await Promise.all([
     market.bars(watch.symbol, mainId, "M5", 100),
-    tf === "M5" ? null : market.bars(watch.symbol, mainId, tf, 80),
+    tf === "M5" || tf === "M1" ? null : market.bars(watch.symbol, mainId, tf, 80),
     market.bars(watch.symbol, mainId, "H1", 60),
     market.bars(watch.symbol, mainId, "M15", 100),
+    market.bars(watch.symbol, mainId, "M1", 80),
   ]);
   const m5 = closedSeries(m5raw || [], "M5", { nowMs: now });
   const m15 = closedSeries(m15raw || [], "M15", { nowMs: now });
-  const series = tf === "M5" ? m5 : closedSeries(tfRaw || [], tf, { nowMs: now, staleBars: 5 });
+  const m1 = closedSeries(m1raw || [], "M1", { nowMs: now });
+  const series = tf === "M5" ? m5 : tf === "M1" ? m1 : closedSeries(tfRaw || [], tf, { nowMs: now, staleBars: 5 });
   const h1 = closedSeries(h1raw || [], "H1", { nowMs: now });
   if (m5.status !== "OK" || series.status !== "OK" || series.bars.length < 20) {
     watch.lastReason = `candles_${(m5.status !== "OK" ? m5.status : series.status).toLowerCase()}`;
@@ -1020,13 +1022,27 @@ async function tickSetupWatch(watch) {
   // open of the consecutive candles that delivered price to the extreme;
   // the entry is on the retrace to that level — or to the gap the
   // displacement left, when it left one — with the stop beyond the
-  // extreme. Read on the entry timeframe, and on M15 when it has none.
-  let [cisdTf, cisdBars] = [tf, series.bars];
-  let model = entryModel(cisdBars, watch.direction, touchMs, { ote, span: PERIOD_MS[tf] });
-  if (!model.mss.shifted && tf !== "M15" && m15bars.length >= 20) {
-    const onM15 = entryModel(m15bars, watch.direction, touchMs, { ote, span: PERIOD_MS.M15 });
-    if (onM15.mss.shifted) [model, cisdTf, cisdBars] = [onM15, "M15", m15bars];
-  }
+  // extreme. Read on M1, the entry timeframe and M15, and the first to
+  // close beyond its level counts (28 Oct XAUUSD: the M1 closed above the
+  // level at 13:00, the M5 closed 6 cents short of it and the entry never
+  // came). M1 only for the CISD, and only while its bars still reach back
+  // to the touch: its candles are noise as a confirmation.
+  const cisdSeries = [
+    ["M1", m1.status === "OK" && m1.bars[0]?.timestampMs <= touchMs ? m1.bars : []],
+    [tf, series.bars],
+    ["M15", m15bars],
+  ].filter(([name, bars], index, all) => bars.length >= 20 && all.findIndex(([other]) => other === name) === index);
+  const cisdReads = cisdSeries.map(([name, bars]) => ({
+    name,
+    bars,
+    model: entryModel(bars, watch.direction, touchMs, { ote, span: PERIOD_MS[name] }),
+  }));
+  const closedAt = (read) => read.model.mss.at + PERIOD_MS[read.name];
+  const pick =
+    cisdReads.filter((read) => read.model.mss.shifted).sort((a, b) => closedAt(a) - closedAt(b))[0] ??
+    cisdReads.find((read) => read.name === tf) ??
+    cisdReads[0];
+  const [model, cisdTf, cisdBars] = [pick.model, pick.name, pick.bars];
   watch.structureShift = model.mss;
   watch.entryZone = model.zone;
   store.dirty = true;
@@ -1598,7 +1614,7 @@ const CUSTOM_TOOLS = [
   {
     name: "register_watch",
     description:
-      "Registers a trading setup for live monitoring. The monitor validates it on live candles — price reaches the zone, the liquidity at sweep_level is taken, then a CISD on M5 (M15 when M5 has none) backed by SMT divergence or an M5 / M15 engulfing or rejection — and sends ENTER NOW on Telegram on the retrace to the CISD level, with R:R ≥ 1, news and spread clear (no session filter). A close through the zone or price action against the trade in it means no entry until a new CISD, watched until the invalidation. Then it manages the trade: TP alerts, SL to breakeven after TP1, CLOSE NOW where price turns back or an M5–H4 zone in the way holds. Never places an order.",
+      "Registers a trading setup for live monitoring. The monitor validates it on live candles — price reaches the zone, the liquidity at sweep_level is taken, then a CISD on M1, M5 or M15 (the first to close beyond its level) backed by SMT divergence or an M5 / M15 engulfing or rejection — and sends ENTER NOW on Telegram on the retrace to the CISD level, with R:R ≥ 1, news and spread clear (no session filter). A close through the zone or price action against the trade in it means no entry until a new CISD, watched until the invalidation. Then it manages the trade: TP alerts, SL to breakeven after TP1, CLOSE NOW where price turns back or an M5–H4 zone in the way holds. Never places an order.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -1626,7 +1642,7 @@ const CUSTOM_TOOLS = [
         entry_zone_low: {
           type: "number",
           description:
-            "The prepared zone's lower edge: the PD array (FVG / OB / breaker) where price must react. Send it with entry_zone_high whenever the analysis has a zone. Price reaching it is the entry touch; after the sweep the monitor needs a CISD (backed by SMT divergence or an M5 / M15 engulfing or rejection) and enters on the retrace to the CISD level; a close through this zone or price action against the trade in it means no entry until a new CISD, watched until the invalidation. The entry must lie inside the zone and the SL beyond it.",
+            "The prepared zone's lower edge: the PD array (FVG / OB / breaker) where price must react. Send it with entry_zone_high whenever the analysis has a zone. Price reaching it is the entry touch; after the sweep the monitor needs a CISD on M1, M5 or M15 (backed by SMT divergence or an M5 / M15 engulfing or rejection) and enters on the retrace to the CISD level; a close through this zone or price action against the trade in it means no entry until a new CISD, watched until the invalidation. The entry must lie inside the zone and the SL beyond it.",
         },
         entry_zone_high: {
           type: "number",
@@ -2011,7 +2027,7 @@ async function handleMcpRequest(req, res) {
       result: {
         protocolVersion: body.params?.protocolVersion || CONFIG.protocolVersion,
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.14.1" },
+        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.15.0" },
       },
     });
     return;
@@ -2106,7 +2122,7 @@ app.get("/health", async (req, res) => {
   const base = {
     status: SERVERLESS && !kv ? "storage_missing" : "ok",
     service: "watch-monitor-mcp",
-    version: "6.14.1",
+    version: "6.15.0",
     runtime: SERVERLESS ? "vercel" : "node",
     watches: setups.length,
     last_tick_at: SERVERLESS ? lastTickAt : undefined,
