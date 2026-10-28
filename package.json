@@ -1,6 +1,6 @@
 {
   "name": "watch-monitor-mcp",
-  "version": "6.20.0",
+  "version": "6.20.1",
   "private": true,
   "type": "module",
   "main": "index.js",

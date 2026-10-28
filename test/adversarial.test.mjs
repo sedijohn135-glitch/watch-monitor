@@ -537,12 +537,14 @@ test("REGRESSION — engulfing requires the bar to close in the trade direction"
   assert.equal(classifyEngulfing([previous, bearishBody], "buy", "M5"), "none");
 });
 
-test("ENGULFING — only an opposite candle can be engulfed (owner's definition, 28 Oct)", () => {
-  // The 28 Oct replay's 15:03–15:04 M1 pair: a small bearish bar after a
-  // bearish bar, opening over its close and closing under its open. v6.0
-  // called it an engulfing; its body sits inside the previous one.
+test("ENGULFING — the v6.0 rule stays: a same-colour bar opening beyond the close and closing beyond the open counts (owner, 28 Oct)", () => {
+  // The live 28 Oct 20:02 buy entered at 20:34 on exactly such a bar (20:32
+  // bullish after a bullish 20:31) and was the owner's sniper entry. A
+  // stricter reading would have blocked it; the owner keeps v6.0.
+  const liveBuy = [bar(0, 4056.56, 4057.44, 4056.11, 4056.89), bar(M1, 4056.86, 4059.45, 4056.82, 4058.87)];
+  assert.equal(classifyEngulfing(liveBuy, "buy", "M1"), "soft");
   const continuation = [bar(0, 4043.45, 4044.24, 4042.55, 4043.04), bar(M1, 4043.08, 4043.34, 4042.67, 4042.79)];
-  assert.equal(classifyEngulfing(continuation, "sell", "M1"), "none");
+  assert.equal(classifyEngulfing(continuation, "sell", "M1"), "soft");
   const bullishThenBearish = [bar(0, 4042.5, 4043.2, 4042.4, 4043.04), bar(M1, 4043.08, 4043.34, 4042.2, 4042.3)];
   assert.equal(classifyEngulfing(bullishThenBearish, "sell", "M1"), "soft");
   const mirror = [bar(0, 100.5, 100.6, 99.9, 100), bar(M1, 99.9, 101.2, 99.8, 101.1)];

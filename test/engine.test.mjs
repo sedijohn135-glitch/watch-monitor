@@ -396,7 +396,7 @@ test("Registration answers with what the monitor will check, in this setup's pri
   const h = createHarness({ start: T0, series: buySeries() });
   const { plan, warnings } = h.register({ ...BUY, snapshot_as_of: new Date(T0 - 45 * MIN).toISOString(), score: 9 });
   assert.equal(plan.contract, "setup/1");
-  assert.equal(plan.rules, "v6.0-acceptance/strict-engulfing");
+  assert.equal(plan.rules, "v6.0-acceptance");
   assert.match(plan.touch, /^ask ≤ 4415\.10 \(zone high 4415\.00/);
   assert.match(plan.invalidation, /^bid ≤ 4405\.00/);
   assert.match(plan.sweep, /not wait/);
@@ -541,19 +541,20 @@ test("REPLAY CAPTURE — a resolved setup leaves its candles, and replaying them
   assert.match(enter.text, /M1 engulfing \(soft\) 15:01 UTC/);
 });
 
-test("REPLAY 28 Oct XAUUSD buy (20:02): the live 20:34 ENTER NOW rode a continuation bar; with the strict engulfing it is confirmed only at 20:46, past the chase level, and held", async () => {
+test("REPLAY 28 Oct XAUUSD buy (20:02): the live sniper entry — ENTER NOW at 20:34 on the 20:32 M1 engulfing, as live", async () => {
   const fixture = JSON.parse(readFileSync(new URL("./fixtures/xauusd-2026-10-28-buy.json", import.meta.url), "utf8"));
   const { watch, messages } = await replay(fixture);
   const when = (pattern) => {
     const found = messages.find((message) => pattern.test(message.text));
     return found && new Date(found.at).toISOString().slice(11, 19);
   };
-  // Live (6.19): "M1 engulfing (soft) 20:32" — the 20:32 bar is bullish
-  // after a bullish 20:31 bar — and acceptance gave ENTER NOW at 20:34:07
-  // at 4062.02. The same replay with the 6.19 engulfing enters at 20:34:06.
+  // Live (6.19): "M1 engulfing (soft) 20:32" and acceptance gave ENTER NOW
+  // at 20:34:07 at 4062.02, R:R 1.30 — the owner's sniper entry, in profit.
+  // A stricter engulfing (tried in 6.20.0) blocked it; this pins v6.0.
   assert.equal(when(/ENTRY TOUCHED/), "20:30:06");
-  assert.equal(messages.filter((message) => /REAL CONFIRMATION/.test(message.text)).length, 0, "no entry on the continuation bar");
-  assert.equal(when(/WAITING ON GATE/), "20:46:06");
-  assert.match(messages.find((message) => /WAITING ON GATE/.test(message.text)).text, /R:R at market below 1 \(price ran past 4065\.48\)/);
-  assert.equal(watch.lifecycle, "CONFIRMING");
+  assert.equal(when(/REAL CONFIRMATION/), "20:34:06");
+  const enter = messages.find((message) => /REAL CONFIRMATION/.test(message.text));
+  assert.match(enter.text, /M1 engulfing \(soft\) 20:32 UTC/);
+  assert.equal(watch.trade.rr_at_entry, 1.29);
+  assert.equal(watch.lifecycle, "IN_TRADE");
 });

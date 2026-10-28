@@ -61,7 +61,7 @@ entry, or can stop monitoring; **M** degrades timeliness or auditability;
 | A-6 | H | **Contract mismatch on `sweep_level`.** K11, V11 r17, S6 r15 and the snapshot's `rule` text say the liquidity must be taken before entry, and Gemini's MONITOR line promises "waiting for sweep / M5 CISD". Since 6.18.0 the monitor does not wait for it. | K11 §7; Gemini output of 28 Oct 14:42; `index.js` snapshot `rule`. | Open decision (§4 C-1). Meanwhile the contract states exactly what the monitor checks, registration echoes it (`setup-contract.md`), and the refusal for a missing `sweep_level` no longer says "no liquidity taken, no trade". |
 | A-7 | M | **Target order not validated.** `tp2`/`tp3` only had to be beyond the entry, so TP2 < TP1 for a buy was accepted and trade management would hit targets out of order. | `validateWatchInput` | 6.19: rejected with a diagnosable error. |
 | A-8 | — | Property, not a defect: a retroactive touch (A-1 fix) followed by acceptance can send ENTER NOW below a sell zone or above a buy zone. That is v6.0 acceptance by design ("price back beyond the entry"); R:R ≥ 1 at market still blocks a chase. | 28 Oct: ENTER NOW 15:16 at 4043.33, zone 4044.98–4046.66. | Documented. |
-| A-9 | M | **Loose engulfing (v6.0 as uploaded).** `classifyEngulfing` checks only that the bar has the trade's colour, opens beyond the previous close and closes beyond the previous open. The previous bar's colour and the body sizes are not checked, so a small continuation bar inside the previous body counts as a "soft engulfing". Trade management (`candleSignal`) uses the strict definition: opposite colours and a larger body. | Replay of 28 Oct: the M1 bar 15:04 (4043.08 → 4042.79, body 0.29) after the bearish 15:03 bar (4043.45 → 4043.04, body 0.41) counted as an M1 engulfing and was one of the two price patterns behind ENTER NOW 15:06. | **6.20, owner's decision (28 Oct): strict.** The bar engulfed must be an opposite candle, as in the owner's own definition (OM §5) and in the exits. |
+| A-9 | M | **Loose engulfing (v6.0 as uploaded).** `classifyEngulfing` checks only that the bar has the trade's colour, opens beyond the previous close and closes beyond the previous open. The previous bar's colour and the body sizes are not checked, so a small continuation bar inside the previous body counts as a "soft engulfing". Trade management (`candleSignal`) uses the strict definition: opposite colours and a larger body. | Replay of 28 Oct: the M1 bar 15:04 (4043.08 → 4042.79, body 0.29) after the bearish 15:03 bar (4043.45 → 4043.04, body 0.41) counted as an M1 engulfing and was one of the two price patterns behind ENTER NOW 15:06. | **Kept as v6.0 (owner, 28 Oct evening).** 6.20.0 made it strict on the owner's first answer; the live 20:02 buy — the owner's sniper entry, in profit — entered on exactly such a bar and the strict rule would have blocked it (§7 E7). Reverted in 6.20.1: "don't break what works". Pinned by tests. |
 
 ### B. Reliability and infrastructure
 
@@ -82,7 +82,7 @@ entry, or can stop monitoring; **M** degrades timeliness or auditability;
 |---|---|---|---|
 | C-1 | H | K11 §7 still describes the 6.16 flow (CISD retrace, M5 hold, sweep gate, 🟡 CISD CONFIRMED). Gemini repeats it to the owner, who then expects events the monitor never sends. | Skill updated to the real rules. The MONITOR line now prints the monitor's own acknowledgement verbatim. |
 | C-2 | M | Registration answered only `WATCHING` and an id: nothing said what would be checked, against which thresholds, or until when. | 6.19: `register_watch` returns the contract version and the validation plan with concrete prices, plus warnings (ignored fields, an opposite active watch, an old analysis). |
-| C-3 | L | No contract version on a watch: a future rule change could not tell old watches from new. | 6.19: every watch stores `contract: "setup/1"` and `rules` (`v6.0-acceptance`; `v6.0-acceptance/strict-engulfing` from 6.20). |
+| C-3 | L | No contract version on a watch: a future rule change could not tell old watches from new. | 6.19: every watch stores `contract: "setup/1"` and `rules: "v6.0-acceptance"` (6.20.0 alone used `v6.0-acceptance/strict-engulfing`). |
 
 ### D. Observability
 
@@ -137,16 +137,16 @@ Recommendation: keep the v6.0 confirmation for at least 20 entered setups before
 3. **C-4 obstacle exits.** Done in 6.20 (owner's decision): warning only.
 4. **Infrastructure.** If the Vercel usage page shows provisioned memory or active CPU above 50% of the Hobby limit, or Upstash shows bandwidth above 50%, move to the paid tiers (Vercel Pro $20/month, Upstash pay-as-you-go). The owner has to read these numbers; this session has no access to the Vercel dashboard.
 5. **`MIN_CONFIRMATION_HOLD_MS` = 5000 in Vercel** (verified). The v6.0 value is 60 000, and 50 000 is the coded Vercel default. With once-a-minute ticks the difference is at most one tick: the new-M1-candle rule already spaces graduation a bar apart, and the 28 Oct replay enters at 15:06:06 with 5, 50 or 60 s alike. Keep it, or delete the variable in Vercel → Settings → Environment Variables to return to 50 s. The owner's decision.
-6. **A-9 engulfing.** Done in 6.20 (owner's decision): strict. The replay still sends ENTER NOW at 15:06:06, on the M5 rejection wick alone.
+6. **A-9 engulfing.** Kept as v6.0 (owner, 28 Oct): the strict reading would have blocked the live 20:02 sniper entry (§7 E7).
 7. **B-2 fast mode bound.** Fast mode only for the first 20 min of a gate hold, and none in a trade. TP / SL alerts would then come with the once-a-minute tick, up to ~45 s later; CLOSE NOW decisions, read on M5 closes, would not be delayed. Worth it only if the Vercel usage page shows provisioned memory above about half of 360 GB-h.
 
 ## 6. Verification of 6.19 and 6.20
 
 | Check | Command | Result |
 |---|---|---|
-| Unit tests, v6.0 evidence functions and validation, strict engulfing | `npm test` (`test/adversarial.test.mjs`, 66) | pass |
+| Unit tests, v6.0 evidence functions and validation, the v6.0 engulfing pinned | `npm test` (`test/adversarial.test.mjs`, 66) | pass |
 | Lifecycle tests on a fake clock (`test/harness.mjs`): long, short, touch without acceptance, acceptance without a technical signal, fade, SL before confirmation, same-tick race, wick through the SL, TP1 before the touch, expiry, news, R:R chase, stale quote, stale candles, abnormal spread, quarantine, no quote, wick-only touch, restart, duplicate, two watches, cancel, plan, contract, TP1 → breakeven, Telegram order, LATE prefix | `npm test` (`test/engine.test.mjs`, 29) | pass |
-| Historical replay, 28 Oct XAUUSD buy (`test/fixtures/xauusd-2026-10-28-buy.json`, the live 20:02 setup) | `npm test` (1) | pass |
+| Historical replay, 28 Oct XAUUSD buy (`test/fixtures/xauusd-2026-10-28-buy.json`, the live 20:02 sniper entry: ENTER NOW 20:34:06, R:R 1.29, as live) | `npm test` (1) | pass |
 | Replay capture: a resolved setup's candles, replayed, give the same ENTER NOW | `npm test` (1) | pass |
 | Historical replay, 28 Oct XAUUSD sell (`test/fixtures/xauusd-2026-10-28-sell.json`, real cTrader candles) | `npm test` (1), `npm run replay -- test/fixtures/xauusd-2026-10-28-sell.json` | pass |
 | End to end: HTTP, OAuth, MCP tools, Redis, `/tick`, fake Telegram, restart, replay capture | `npm run smoke` | 86 checks pass |
@@ -156,7 +156,7 @@ Replay against what happened live:
 | | Live (6.18.0 → 6.18.1) | Replay (6.19.0; 6.20.0 where it differs) |
 |---|---|---|
 | Touch (15:00 M1 wick to 4045.11) | missed by 6.18.0; seen 15:10:20 after the 6.18.1 deploy | 15:01:06, the first tick after the bar closed |
-| ENTER NOW | 15:16:07 at 4043.33, R:R 2.03 | 15:06:06 at 4043.91, R:R 2.28; evidence: M1 engulfing (soft) 15:04 + M5 rejection wick (soft) 15:00, acceptance mid 4043.02 ≤ 4044.03. 6.20: the same, on the M5 rejection wick alone (the 15:04 bar no longer counts as an engulfing) |
+| ENTER NOW | 15:16:07 at 4043.33, R:R 2.03 | 15:06:06 at 4043.91, R:R 2.28; evidence: M1 engulfing (soft) 15:04 + M5 rejection wick (soft) 15:00, acceptance mid 4043.02 ≤ 4044.03 (unchanged in 6.20.1) |
 | Exit | 15:35:27 CLOSE NOW, M15 demand held, +0.02R | 6.19: 15:35:06 CLOSE NOW, +0.03R. 6.20: 15:35:06 "M15 DEMAND HELD — CLOSE PART" (part off at +0.03R, SL to breakeven), 15:39:06 stopped at breakeven |
 
 What a replay cannot show: the quote at each tick (the open of the minute stands in for it), fast-mode checks between ticks, and Telegram delivery. One recorded setup is a regression check, not evidence that the rules make money.
@@ -208,7 +208,7 @@ data:
 | L-17 | Sweep before entry (V11 §5.8, G2 State 1, T25) vs a lower score only (V14) | Resolved with evidence | E1, C-1 |
 | L-18 | Keep a setup whose TP1 printed before entry unless a body closes beyond TP2/TP3 (OM) vs TP1 consumed = dead (V14, S6) | Current rule kept | E2 |
 | L-19 | Zone invalidated by a body close beyond it (T25, OM, G1v5 `invalid_if`, G2 `anchor_not_defended`, RW) | Owner, 28 Oct: **not** in the monitor (v6.0 kept). Analysis side, K11 6.20: a zone already closed through is not selected (G1v5 zone validity) | E3 |
-| L-20 | Engulfing = the body swallows the previous opposite candle's body (OM) | Implemented in 6.20 (owner) | A-9 |
+| L-20 | Engulfing = the body swallows the previous opposite candle's body (OM) | Not adopted: tried in 6.20.0, reverted in 6.20.1 (owner) — it would have blocked the live 20:02 sniper entry | A-9, E7 |
 | L-21 | Trouble ahead: no fresh HTF zone within 0.8 × the TP1 distance (T25); FTA < 3R = management level (G2); TP1 = nearest level (OM, V14) | Needs evidence | E4. 6.20: the monitor manages at the obstacle (owner); K11 names the FTA |
 | L-22 | Close early when 3 PD arrays break between entry and SL (V14) | Open proposal | the prompt does not say which arrays or timeframe; needs a definition and replays |
 | L-23 | Time exits near London close / late NY; macros (G2) | Open proposal | no evidence |
@@ -270,10 +270,13 @@ The sign flips with the timeframes counted, so there is no usable signal yet.
   bar: a continuation bar, the A-9 defect.
 - The replay with the 6.19 engulfing reproduces it: 20:34:06, R:R 1.29. That
   checks the replay against a second live decision.
-- With 6.20 it is confirmed only at 20:46, when price was past the chase
-  level 4065.48. It is held as "do not chase" (R:R 0.79) and stays CONFIRMING.
-- The live trade was still open at the daily break (best 4070.90, +0.39R).
-- Regression test: `test/fixtures/xauusd-2026-10-28-buy.json`.
+- With the strict engulfing of 6.20.0 it is confirmed only at 20:46, when
+  price was past the chase level 4065.48, and held as "do not chase".
+- The live trade went the owner's way: in profit at the daily break (best
+  4070.90; the owner's screenshot). Owner: "6.19 gave a sniper entry —
+  don't break what works". The strict engulfing was reverted in 6.20.1.
+- Regression test: `test/fixtures/xauusd-2026-10-28-buy.json` pins the
+  20:34 entry.
 
 **E6 — where the losses came from.**
 - #2 and #5 would have hit their registered stops before TP1 under any
@@ -285,8 +288,9 @@ The sign flips with the timeframes counted, so there is no usable signal yet.
 ### What 6.20 changes because of this audit
 
 **Monitor:**
-- Strict engulfing (L-20).
 - An obstacle that holds is managed, not exited (C-4).
+- The strict engulfing (L-20) shipped in 6.20.0 and was reverted in 6.20.1:
+  the v6.0 entry confirmation is unchanged.
 - Every resolved setup, cancelled ones aside, stores its candles as a replay
   fixture for 30 days (`list_watches { watch_id, replay: true }`). L-19, L-21,
   L-22 and C-1 can then be decided on replays of real setups instead of on 7
@@ -298,6 +302,6 @@ The sign flips with the timeframes counted, so there is no usable signal yet.
   analysis side).
 - Stops clear of liquidity pools (L-25).
 - The FTA is named as a management level (L-21).
-- The monitor's obstacle handling and strict engulfing are described.
+- The monitor's obstacle handling is described.
 
 **Kept, owner 28 Oct:** no zone-invalidation rule in the monitor.

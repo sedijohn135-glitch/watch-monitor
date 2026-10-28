@@ -4,7 +4,7 @@ What the analysis (Gemini, skill `ict-sniper-v11`) sends to `register_watch`,
 what the monitor checks for it, and what it promises back. The code is the
 authority: `lib/core.mjs validateWatchInput`, `lib/engine.mjs`
 (`register`, `validationPlan`, `tickSetupWatch`). This file describes
-monitor 6.20.0, confirmation rules `v6.0-acceptance/strict-engulfing`.
+monitor 6.20.1, confirmation rules `v6.0-acceptance`.
 
 Every watch stores the contract and rule versions it was armed under
 (`contract`, `rules`), so a later rule change can tell old watches from new.
@@ -56,7 +56,7 @@ A malformed setup is refused with the broken rule, never repaired:
   "watch_id": "XAUUSD_1793198887317_1ee06516",
   "lifecycle": "ARMED",
   "contract": "setup/1",
-  "rules": "v6.0-acceptance/strict-engulfing",
+  "rules": "v6.0-acceptance",
   "expires_at": "2026-10-28T18:48:07.317Z",
   "monitor_line": "Touch bid ≥ 4044.88 → ENTER NOW after live acceptance (≤ 4044.03 at most) + one of …",
   "plan": { "touch": "…", "confirmation": "…", "blocks": ["…"], "invalidation": "…",
@@ -122,8 +122,9 @@ setup waits on a gate), safety first.
   - CISD on M1 (strong);
   - SMT divergence on M5 against the partners (XAUUSD: XAGUSD, EURUSD inverted);
   - an M5 engulfing;
-  - an M1 engulfing — in both, the bar before is the opposite colour and
-    its body is swallowed (6.20; v6.0 also counted a same-colour bar);
+  - an M1 engulfing — in both, the v6.0 reading: a bar of the trade's
+    colour that opens beyond the previous close and closes beyond the
+    previous open, whatever the previous bar's colour (owner, 28 Oct);
   - an M5 rejection wick.
 - Each piece must hold for `MIN_CONFIRMATION_HOLD_MS` and survive into a
   new closed M1 bar. The coded default is 50 s on Vercel; production
@@ -208,7 +209,7 @@ characters.
   - A new optional field that changes nothing for existing callers does not
     bump it.
   - The monitor refuses a contract it does not read, rather than guessing.
-- **`rules`** (`v6.0-acceptance/strict-engulfing` since 6.20; `v6.0-acceptance` in 6.19) names the confirmation rules. Changing
+- **`rules`** (`v6.0-acceptance`; `v6.0-acceptance/strict-engulfing` only in 6.20.0, reverted in 6.20.1) names the confirmation rules. Changing
   them changes this name and `docs/requirements.md` together.
   - Watches already armed keep the name they were armed under, so the audit
     trail says which rules decided.

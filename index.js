@@ -184,7 +184,7 @@ const CONFIG = {
 // wall-clock constant: on Vercel a tick only arrives once a minute.
 const SERVERLESS = Boolean(process.env.VERCEL) || process.env.SERVERLESS === "true";
 CONFIG.staleBudgetMs = Math.max(SERVERLESS ? 180_000 : 120_000, CONFIG.setupIntervalMs * 8);
-const VERSION = "6.20.0";
+const VERSION = "6.20.1";
 
 function log(message, ...args) {
   console.error(`[watch-monitor] ${message}`, ...args);
