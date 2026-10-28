@@ -895,7 +895,10 @@ async function tickSetupWatch(watch) {
   // now runs before the entry model, on every tick, in ARMED, TOUCHED and
   // CONFIRMING alike, and it runs even when the spread is abnormal: a bad
   // quote must not make the service ignore an adverse move.
-  const sinceMs = watch.lastTickAt ? Date.parse(watch.lastTickAt) : watch.armedAtMs;
+  const lastSeenMs = watch.lastTickAt ? Date.parse(watch.lastTickAt) : watch.armedAtMs;
+  // Until the touch, every M1 bar since registration: a touch must never
+  // be lost to a tick that missed its bars.
+  const sinceMs = watch.entryTouched ? lastSeenMs : watch.armedAtMs;
   let gapBars = [];
   if (now - sinceMs > 15_000) {
     const raw = await market.bars(watch.symbol, mainId, "M1", 80);
@@ -924,7 +927,7 @@ async function tickSetupWatch(watch) {
     // reaction low and not from after it.
     const touchedLive = evaluateSafety(watch, { mid, executable, protective, tolerance }).action === "TOUCH";
     watch.entryTouched = true;
-    watch.entryTouchedAt = new Date(touchedLive ? now : sinceMs).toISOString();
+    watch.entryTouchedAt = new Date(touchedLive ? now : lastSeenMs).toISOString();
     watch.lifecycle = "TOUCHED";
     watch.lastReason = "entry_touched";
     store.dirty = true;
@@ -1799,7 +1802,7 @@ async function handleMcpRequest(req, res) {
       result: {
         protocolVersion: body.params?.protocolVersion || CONFIG.protocolVersion,
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.18.0" },
+        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.18.1" },
       },
     });
     return;
@@ -1894,7 +1897,7 @@ app.get("/health", async (req, res) => {
   const base = {
     status: SERVERLESS && !kv ? "storage_missing" : "ok",
     service: "watch-monitor-mcp",
-    version: "6.18.0",
+    version: "6.18.1",
     runtime: SERVERLESS ? "vercel" : "node",
     watches: setups.length,
     last_tick_at: SERVERLESS ? lastTickAt : undefined,

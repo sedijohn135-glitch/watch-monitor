@@ -678,6 +678,16 @@ test("IDM — the first pullback after a break of structure, and whether it was 
   assert.equal(inducement(bars.slice(0, 6), "buy", 100), null, "no break of structure, no IDM");
 });
 
+test("TOUCH — a wick in the minute the last tick fell in is not lost", () => {
+  const watch = { direction: "sell", entry: 4045.8, sl: 4050.85, tp1: 4028.09, entry_zone_low: 4044.98, entry_zone_high: 4046.66, entryTouched: false };
+  const quote = { mid: 4042.8, executable: 4042.78, protective: 4042.83 };
+  const tickAt = 1_000_000 * M1 + 6_000; // a tick 6 s into the minute
+  const spike = bar(1_000_000 * M1, 4041.58, 4045.11, 4041.16, 4043.01); // its high came after that tick
+  const seen = quotesWithGap("sell", quote, [spike], tickAt);
+  assert.equal(seen.executable, 4045.11);
+  assert.equal(evaluateSafety(watch, { ...seen, tolerance: 0.1 }).action, "TOUCH");
+});
+
 test("VERCEL — a wick through SL between two ticks still fails the watch", () => {
   const watch = { direction: "buy", entry: 4414, sl: 4400, invalidation: 4400, tp1: 4450, entryTouched: true };
   const quote = { mid: 4412, executable: 4412.1, protective: 4411.9 };
