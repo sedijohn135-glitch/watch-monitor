@@ -1,12 +1,13 @@
 {
   "name": "watch-monitor-mcp",
-  "version": "6.18.1",
+  "version": "6.19.0",
   "private": true,
   "type": "module",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node --test test/adversarial.test.mjs",
+    "test": "node --test test/adversarial.test.mjs test/engine.test.mjs",
+    "replay": "node test/replay.mjs",
     "smoke": "node test/smoke.mjs"
   },
   "dependencies": {

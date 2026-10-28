@@ -193,6 +193,15 @@ const redis = createServer((req, res) => {
       const [lockKey, owner] = rest;
       result = kvData.get(lockKey) === owner ? Number(kvData.delete(lockKey)) : 0;
     }
+    // Lists (the resolved history, the request log), newest first.
+    const list = () => kvData.get(key) ?? [];
+    if (command === "LPUSH") result = kvData.set(key, [value, ...list()]) && list().length;
+    if (command === "LTRIM") {
+      kvData.set(key, list().slice(Number(value), Number(rest[0]) + 1));
+      result = "OK";
+    }
+    if (command === "LRANGE") result = list().slice(Number(value), Number(rest[0]) === -1 ? undefined : Number(rest[0]) + 1);
+    if (command === "LLEN") result = list().length;
     res.setHeader("content-type", "application/json");
     res.end(JSON.stringify({ result }));
   });
@@ -230,16 +239,13 @@ const env = {
   WATCH_MONITOR_AUTH_TOKEN: "secret",
   TELEGRAM_BOT_TOKEN: "x",
   TELEGRAM_CHAT_ID: "1",
+  // Never the real Telegram: every message lands in `received`.
+  TELEGRAM_API_URL: "http://127.0.0.1:9802",
   SCHEDULER_TICK_MS: "1000",
   WATCH_INTERVAL_MS: "3000",
   MIN_CONFIRMATION_HOLD_MS: "0",
   NEWS_FILTER_ENABLED: "false",
 };
-
-// Redirect Telegram at the fake by overriding fetch through an env-driven
-// shim is not possible without touching the source, so the fake telegram
-// exists only to prove the outbox does not throw; delivery failures are
-// expected and asserted as *recorded*, never as lost.
 
 function boot(extra = {}) {
   const child = spawn(process.execPath, ["index.js"], { env: { ...env, ...extra }, stdio: ["ignore", "pipe", "pipe"] });
@@ -361,7 +367,8 @@ const refreshed = await (
 assert(Boolean(refreshed.access_token), "refresh issues a new access token");
 
 const blocked = await rpc("tools/call", { name: "create_order", arguments: { volume: 1 } });
-const requestLog = await (await fetch(`${BASE}/debug/requests`)).json();
+assert((await fetch(`${BASE}/debug/requests`)).status === 401, "the request log needs the token");
+const requestLog = await (await fetch(`${BASE}/debug/requests?token=secret`)).json();
 assert(
   requestLog.some((entry) => entry.rpc === "tools/call" && entry.tool === "create_order") &&
     requestLog.some((entry) => entry.path === "/register") &&
@@ -386,8 +393,14 @@ const registered = await rpc("tools/call", {
     sweep_level: 4410,
   },
 });
-const watchId = JSON.parse(registered.result.content[0].text).watch_id;
+const ack = JSON.parse(registered.result.content[0].text);
+const watchId = ack.watch_id;
 assert(Boolean(watchId), `watch registered (${watchId})`);
+assert(
+  ack.contract === "setup/1" && ack.rules === "v6.0-acceptance" && /Touch ask ≤ 4414\.6/.test(ack.monitor_line) && /4400/.test(ack.plan.invalidation),
+  `the answer states what the monitor will check, with this setup's prices (${ack.monitor_line})`,
+);
+assert(ack.warnings.some((warning) => /expires in 720 min/.test(warning)), "a missing expiry is reported, not silently defaulted");
 
 const duplicate = await rpc("tools/call", {
   name: "register_watch",
@@ -417,6 +430,21 @@ const noLiquidity = await rpc("tools/call", {
   arguments: { symbol: "XAUUSD", direction: "buy", entry: 4414, sl: 4400, tp1: 4450 },
 });
 assert(/sweep_level is required/.test(noLiquidity.error?.message), "no liquidity to take, no registration");
+
+const outOfOrder = await rpc("tools/call", {
+  name: "register_watch",
+  arguments: { symbol: "XAUUSD", direction: "buy", entry: 4414, sl: 4400, tp1: 4450, tp2: 4440, sweep_level: 4410 },
+});
+assert(/tp2 must lie beyond the previous target/.test(outOfOrder.error?.message), "targets out of order are refused with the reason");
+const otherContract = await rpc("tools/call", {
+  name: "register_watch",
+  arguments: { symbol: "XAUUSD", direction: "buy", entry: 4414, sl: 4400, tp1: 4450, sweep_level: 4410, contract: "setup/9" },
+});
+assert(/not supported/.test(otherContract.error?.message), "an unknown contract version is refused, not guessed at");
+assert(
+  received.some((text) => /WATCH ACTIVE/.test(text) && /Monitor checks:/.test(text) && /UTC ·/.test(text)),
+  "WATCH ACTIVE carries the monitor's own plan and a time stamp",
+);
 
 console.log("\n— market snapshot —");
 const snap = JSON.parse(
@@ -557,6 +585,15 @@ assert(!vWatch?.recovered, "back-to-back ticks keep the watch as saved instead o
 
 const health = await (await fetch("http://127.0.0.1:9804/health", { headers: { authorization: "Bearer secret" } })).json();
 assert(health.storage === "redis" && health.last_tick_at, `health reports Redis and the last tick (${health.storage})`);
+assert(health.confirmation?.rules === "v6.0-acceptance" && health.confirmation.min_hold_ms === 0, "health reports the thresholds actually in force");
+assert(typeof vWatch?.waiting_for === "string" && vWatch.waiting_for.length > 10, `list_watches says what each watch waits for (${vWatch?.waiting_for})`);
+
+// The cron stops with a watch waiting: /health must say so, for an uptime check.
+const savedState = kvData.get("watch-monitor:state");
+kvData.set("watch-monitor:state", JSON.stringify({ ...JSON.parse(savedState), lastTickAt: Date.now() - 10 * 60_000 }));
+const staleHealth = await fetch("http://127.0.0.1:9804/health");
+assert(staleHealth.status === 503 && (await staleHealth.json()).status === "stale", "no tick for 10 min with a watch waiting: /health answers 503 stale");
+kvData.set("watch-monitor:state", savedState);
 
 console.log("\n— a real ENTER NOW, end to end on M1 time (about 3 minutes) —");
 const nextMinute = (offsetMs) => sleep(60_000 - (Date.now() % 60_000) + offsetMs);
@@ -616,6 +653,29 @@ await rpc(
   1,
   9804,
 );
+// The same move with a TP1 that price runs past before the confirmation:
+// confirmed, but R:R at market under 1 — held by the gate, not entered.
+await rpc(
+  "tools/call",
+  {
+    name: "register_watch",
+    arguments: {
+      setup_id: "scenario-chase",
+      symbol: "XAUUSD",
+      direction: "buy",
+      entry: 4414.5,
+      sl: 4400,
+      tp1: 4430,
+      tp2: 4460,
+      sweep_level: 4412,
+      liquidity_taken: true,
+      setup_model: "Sweep + CISD",
+      conviction: "B",
+    },
+  },
+  1,
+  9804,
+);
 const zoneWatch = async () => {
   const listed = JSON.parse((await rpc("tools/call", { name: "list_watches" }, 1, 9804)).result.content[0].text);
   return listed.active.find((watch) => watch.setup_id === "scenario-zone") ?? listed.recent.find((r) => r.setup_id === "scenario-zone");
@@ -632,7 +692,7 @@ assert(midway?.liquidityTaken === true, "bar A closed: its wick took the 4412 li
 assert(midway?.lifecycle !== "IN_TRADE", `one observation is not a confirmation: evidence must survive a new M1 bar (${midway?.lastReason})`);
 
 await nextMinute(3000);
-await tick();
+const enterTick = await (await tick()).json();
 const open = (await scenarioWatch()).active;
 const trade = open?.trade;
 assert(open?.lifecycle === "IN_TRADE", `a new M1 bar later: REAL CONFIRMATION — ENTER NOW, and the trade stays watched (${open?.lifecycle ?? (await scenarioWatch()).resolved?.status} ${open?.lastReason})`);
@@ -641,10 +701,22 @@ assert(trade?.sl === 4400 && trade.targets.join() === "4451,4460", `the register
 assert(Array.isArray(trade?.obstacles), `the zones in the way to the target were mapped on M5–H4 (${JSON.stringify(trade?.obstacles)})`);
 const zoneTrade = await zoneWatch();
 assert(zoneTrade?.lifecycle === "IN_TRADE", `prepared zone: the same confirmation enters too (${zoneTrade?.lifecycle} ${zoneTrade?.lastReason})`);
+const enterText = received.find((text) => /REAL CONFIRMATION — ENTER NOW/.test(text) && /4451/.test(text)) || "";
+assert(
+  /Evidence/.test(enterText) && /Live acceptance: mid/.test(enterText) && /Price pattern: M[15] /.test(enterText) && /Nothing was bought or sold/.test(enterText),
+  "ENTER NOW names each piece of evidence, its timeframe and bar, and says nothing was executed",
+);
+const chase = JSON.parse((await rpc("tools/call", { name: "list_watches" }, 1, 9804)).result.content[0].text).active.find(
+  (watch) => watch.setup_id === "scenario-chase",
+);
+assert(
+  chase?.lifecycle === "CONFIRMING" && chase.lastReason === "gate_blocked" && /R:R at market below 1/.test(chase.waiting_for),
+  `confirmed but past the chase level: held by the R:R gate, no ENTER NOW (${chase?.lifecycle} ${chase?.lastReason})`,
+);
+assert(received.some((text) => /WAITING ON GATE/.test(text) && /R:R at market below 1/.test(text)), "the gate block is announced once, as not an entry");
 
 console.log("\n— managing the trade —");
-const tradeTick = await (await tick()).json();
-assert(tradeTick.hot === true, "an open trade makes the watch hot");
+assert(enterTick.hot === true, "a confirmed setup held by a gate makes the monitor hot");
 const lastTick = async () =>
   (await (await fetch("http://127.0.0.1:9804/health", { headers: { authorization: "Bearer secret" } })).json()).last_tick_at;
 const answeredAt = await lastTick();
@@ -662,6 +734,20 @@ await sleep(3000);
 await tick();
 const closed = (await scenarioWatch()).resolved;
 assert(closed?.status === "BREAKEVEN" && closed.exit_reason === "STOP", `back at the entry after TP1: out at breakeven (${closed?.status} ${closed?.exit_reason})`);
+assert(closed && !("history" in closed), "recent outcomes stay compact: no decision trail inlined");
+const full = JSON.parse(
+  (await rpc("tools/call", { name: "list_watches", arguments: { watch_id: closed?.id } }, 1, 9804)).result.content[0].text,
+).watch;
+const trail = (full?.history || []).map((event) => event.type);
+assert(
+  ["registered", "touched", "evidence_seen", "evidence_graduated", "enter_now", "tp_hit", "resolved"].every((type) => trail.includes(type)),
+  `list_watches { watch_id } returns the resolved record with its decision trail (${trail.join(" → ")})`,
+);
+assert(closed && !("spreadSamples" in closed), "the resolved record drops the per-tick working state");
+assert(
+  JSON.parse(kvData.get("watch-monitor:state")).resolved.length === 0 && kvData.get("watch-monitor:resolved")?.length >= 1,
+  "resolved watches live in their own list, not in the snapshot every tick reads",
+);
 
 vercel.kill("SIGTERM");
 await sleep(500);

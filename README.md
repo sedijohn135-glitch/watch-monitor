@@ -1,4 +1,4 @@
-# Watch Monitor MCP — v6.18
+# Watch Monitor MCP — v6.19
 
 Market-data-only MCP server that monitors ICT sniper setups to a
 deterministic conclusion and notifies a human over Telegram. It never
@@ -7,10 +7,20 @@ cTrader connector is unreachable from this endpoint by construction.
 
 **ENTER NOW is the v6.0 REAL CONFIRMATION** (the owner's first upload, back on 28 Oct 2026: the analysis does the hard work, the monitor only has to see the turn). Price reaches the zone (`entry_zone_low` / `entry_zone_high`, or the entry) → **evidence** holds for `MIN_CONFIRMATION_HOLD_MS` and over a **new M1 candle**: live **acceptance** (price back beyond the entry, clear of the stop) plus at least one of **CISD** (an M1 sweep of the recent low / high reclaimed by the close), **SMT divergence** against the symbol's bundle (XAGUSD and EURUSD for gold), or a **price pattern** (M5 / M1 engulfing, M5 rejection wick) → ENTER NOW, with the registered SL and TPs, unless price has run so far that R:R to TP1 at market is under 1 (do not chase) or news / spread block it. The liquidity at `sweep_level` is reported when taken, but ENTER NOW does not wait for it (v6.1–v6.17 did, and v6.1 added an M1 structure shift on top). Evidence that fades (price pulls back through it, `EVIDENCE_FADE_ATR_FRACTION` × M5 ATR — v6.0's raw quote tolerance wiped gold evidence within seconds) resets. No session or kill-zone filter on any symbol: when to trade is the analysis's call. **After ENTER NOW the watch is the trade**: TP alerts, the SL to breakeven after TP1, SL / breakeven / final-target closes, and **CLOSE NOW** where price stops and turns back (a CISD against the trade on `ENTRY_TIMEFRAME`, M5 by default, from the bars after the entry, once it has run `EXIT_ARM_R`, 1R by default). **Obstacles**: ENTER NOW lists the zones between the entry and the furthest target that can stop the trade — for a sell the demand below, for a buy the supply above — the base (RBR / DBR demand, DBD / RBD supply): the candle right before the leg-out, either colour, with a body at most half the leg-out's, where the leg-out is a displacement (a body at least twice the average of the ten before it) that left an FVG — on M5, M15, M30, H1 and H4. When price reaches one, the monitor reads M5 price action: an engulfing or rejection against the trade that holds the zone → **CLOSE NOW**. The zone is broken only by a closed candle of **its own timeframe** through it (an M5 close through an M15 demand breaks nothing) → the trade goes on. v6.1–v6.17 (the liquidity and structure-shift gates, the four ICT entry models, the CISD-retrace model with the M5 hold) are in git history.
 
-**No liquidity taken, no trade.** Every watch carries a `sweep_level` — the
-IDM / sell-side low for a buy, the IDM / buy-side high for a sell — and
-`REAL CONFIRMATION — ENTER NOW` is never sent until price has actually run
-those stops. `get_market_snapshot` computes the liquidity map from the
+**The setup contract** (`setup/1`, [docs/setup-contract.md](docs/setup-contract.md))
+says what the analysis sends, what the monitor checks and what it answers:
+`register_watch` returns `monitor_line`, the monitor's own one-line plan
+with this setup's prices, for the analysis to print verbatim. Every ENTER
+NOW names each piece of evidence with its timeframe and bar; every watch
+keeps a `history` of its decisions, and `list_watches` says what each one
+`waiting_for`. Rules, sources, open decisions and the verification are in
+[docs/requirements.md](docs/requirements.md); running it, in
+[docs/operations.md](docs/operations.md).
+
+**Liquidity.** Every watch carries a `sweep_level` — the IDM / sell-side
+low for a buy, the IDM / buy-side high for a sell. The monitor reports when
+price runs those stops (LIQUIDITY TAKEN); since 6.18 ENTER NOW does not
+wait for it (an open decision, requirements C-1). `get_market_snapshot` computes the liquidity map from the
 candles — PWH/PWL, PDH/PDL, Asia/London/NY AM highs and lows, H1/M15
 swings, EQH/EQL, each ranked 1–5 by how many stops it likely holds; what
 was swept (closed back inside, with Shadow Delta to flag a stop hunt) or
@@ -21,7 +31,8 @@ so the analysis reads liquidity as facts instead of guessing.
 ## Layout
 
 ```
-index.js            server, scheduler, setup engine, snapshot, MCP + REST surface
+index.js            server, scheduler, snapshot, news, MCP + REST surface
+lib/engine.mjs      the setup-watch engine: registration, one tick of a watch, the trade, every message
 lib/core.mjs        pure logic — scaling, bar discipline, evidence, gates, liquidity, IDM, trade management
 lib/upstream.mjs    managed cTrader MCP client + coalescing market-data layer
 lib/openapi.mjs     cTrader Open API feed (JSON over WebSocket), read-only
@@ -30,14 +41,19 @@ lib/notify.mjs      Telegram outbox with retry and delivery accounting
 lib/kv.mjs          Upstash Redis over REST, for Vercel
 lib/oauth.mjs       OAuth for clients that cannot send a bearer header (Gemini app)
 test/adversarial.test.mjs   adversarial suite
+test/engine.test.mjs        every lifecycle case on a fake clock, and the recorded replays
+test/harness.mjs    the engine on a fake clock, scripted candles and quotes, no network
+test/replay.mjs     a recorded market (test/fixtures/) through the engine
 test/smoke.mjs      boots the real server against a fake upstream: twice as a
                     process, once in Vercel mode against a fake Redis
+docs/               setup contract, requirements and decisions, operations
 ```
 
 ```bash
 npm install
-npm test        # adversarial suite
+npm test        # adversarial suite + lifecycle tests + recorded replays
 npm run smoke   # end-to-end, needs nothing external
+npm run replay -- test/fixtures/xauusd-2026-10-28-sell.json   # what this version would have sent
 npm start
 ```
 
@@ -88,11 +104,13 @@ once a minute to run the monitor.
 
 Trade-off against a long-lived host: price is checked once a minute
 instead of every 10 s, so an SL/TP touch is reported up to a minute late.
-**Fast mode** covers the one step that cannot wait a minute: while an
-entry zone is ready, each `/tick` is answered at once (cron-job.org gives
-up after 30 s) and the function keeps checking every 15 s for 50 s more
-(`waitUntil`), so a retrace into the zone is caught within ~15 s. Wicks
-between ticks are still seen through the closed M1 bars. If
+**Fast mode** covers what cannot wait a minute: while a confirmed setup
+waits on a gate or a trade is open, each `/tick` is answered at once
+(cron-job.org gives up after 30 s) and the function keeps checking every
+15 s for 50 s more (`waitUntil`). Wicks between ticks are still seen
+through the closed M1 bars. `/health` answers 503 `stale` when watches are
+active and no tick ran for 3 minutes, so an uptime check can alert (see
+[docs/operations.md](docs/operations.md)). If
 the cron stops for more than `MAX_TICK_GAP_MS`, the next tick sends
 `MONITOR GAP` and the watches resume as after a restart.
 
@@ -131,6 +149,9 @@ the cron stops for more than `MAX_TICK_GAP_MS`, the next tick sends
 | `ACCEPTANCE_ATR_FRACTION` | `0.5` | acceptance buffer beyond the entry, capped by `ACCEPTANCE_RISK_FRACTION` |
 | `ACCEPTANCE_RISK_FRACTION` | `0.35` | ceiling as a fraction of entry-to-invalidation |
 | `MIN_RR_AT_ENTRY` | `1` | R:R to TP1 at the market price below which ENTER NOW waits (do not chase) |
+| `MAX_QUOTE_AGE_MS` | `30000` | a quote older than this advances no evidence and sends no ENTER NOW; safety checks still use it |
+| `ENTER_STALE_MS` | `60000` | an ENTER NOW delivered later than this is prefixed `⏱ LATE — re-check the price` |
+| `TELEGRAM_API_URL` | `https://api.telegram.org` | tests point it at a local fake, so they never reach the real chat |
 | `WATCH_DEFAULT_EXPIRY_MIN` | `720` | expiry for a watch registered without one; 0 disables |
 | `NEWS_FAIL_CLOSED` | `true` | blocks only when no calendar covering today is cached |
 | `MAX_ACTIVE_WATCHES` | `25` | registration refuses beyond this |
@@ -145,15 +166,19 @@ the cron stops for more than `MAX_TICK_GAP_MS`, the next tick sends
   PKCE and dynamic client registration, stateless (signed with the password).
 - `GET /ctrader/connect`, `/ctrader/callback` — one-time Open API account linking (read-only scope).
 - `GET|POST /tick` — one scheduler pass (bearer token, `CRON_SECRET`, or `?token=`).
-- `GET /health` — full detail when authenticated, minimal otherwise.
+- `GET /health` — full detail when authenticated, minimal otherwise (version, watches, last tick); 503 `stale` when watches are active and the last tick is over 3 min old.
+- `GET /debug/requests` — the last 50 MCP requests (tool names, client), token required.
 - `POST /register_watch` — REST mirror sharing the tool's code path.
 - `GET /test-telegram`, `/test-news`.
 
 ## Tools
 
 `get_market_snapshot` (one call: prices, D1→M1 candles, SMT partners,
-session, news, liquidity map, IDM + POIs), `register_watch` (requires
-`sweep_level`), `list_watches`, `cancel_watch`, `get_news_calendar`,
+session, news, liquidity map, IDM + POIs), `register_watch` (contract
+`setup/1`; answers with `monitor_line`, `plan` and `warnings`),
+`list_watches` (each watch's `waiting_for`, the thresholds in force,
+recent outcomes; with `watch_id`, one watch in full with its decision
+`history`), `cancel_watch`, `get_news_calendar`,
 `set_news_lockout`, `clear_news_lockout`, plus the read-only cTrader tools
 `get_version`, `get_symbols`, `get_spot_prices`, `get_trendbars`. Read-only
 tools carry `readOnlyHint`, so clients that honour MCP annotations need not

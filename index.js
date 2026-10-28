@@ -1,5 +1,5 @@
 /**
- * Watch Monitor MCP — v6.1
+ * Watch Monitor MCP — v6.19
  *
  * A market-data-only MCP server that monitors ICT sniper setups to a
  * deterministic conclusion, and notifies a human. It never places,
@@ -9,10 +9,15 @@
  *
  * One state machine, one scheduler:
  *
- *   SETUP WATCH   ARMED → TOUCHED → CONFIRMING → RESOLVING → RESOLVED
- *                 resolutions: CONFIRMED | FAILED | EXPIRED | CANCELLED
- *                 plus QUARANTINED, a non-terminal state entered when the
- *                 feed cannot be trusted to describe this instrument.
+ *   SETUP WATCH   ARMED → TOUCHED → CONFIRMING → IN_TRADE → RESOLVING → RESOLVED
+ *                 resolutions: FAILED | EXPIRED | CANCELLED before entry,
+ *                 WIN | LOSS | BREAKEVEN after it; plus QUARANTINED, a
+ *                 non-terminal state entered when the feed cannot be
+ *                 trusted to describe this instrument.
+ *
+ * The decisions live in lib/engine.mjs; this file is the plumbing around
+ * them: the HTTP and MCP surface, the cTrader feed, Telegram, the news
+ * calendar, Redis and the scheduler.
  *
  * Two ways to run: as a long-lived Node process (Railway, a VPS, `npm
  * start`), where an in-process timer drives the scheduler and state lives
@@ -34,37 +39,19 @@ import {
   PERIOD_MS,
   barIsClosed,
   calcATR,
-  advanceGeneration,
-  chaseLimit,
-  checkAcceptance,
-  checkCISD,
-  checkSMT,
-  classifyEngulfing,
-  classifyWick,
   closedSeries,
-  evaluateConfirmation,
-  evaluateSafety,
-  finiteNumber,
   formatLevel,
   inducement,
   killZoneStatus,
   liquidityMap,
-  liquidityTaken,
-  obstacles,
-  zoneVerdict,
-  manageTrade,
-  marketRR,
-  nyClock,
   newsBlackout,
   numericTimestampMs,
+  nyClock,
   periodMs,
   priceTolerance,
-  quotesWithGap,
   symbolCurrencies,
-  updateSpreadHealth,
-  validateWatchInput,
-  watchKey,
 } from "./lib/core.mjs";
+import { CONTRACT, RULES, SMT_BUNDLES, createEngine, htmlEscape, waitingFor } from "./lib/engine.mjs";
 import { CTraderMcpClient, MarketData, asArray } from "./lib/upstream.mjs";
 import { Notifier } from "./lib/notify.mjs";
 import { WatchStore, publicWatch } from "./lib/store.mjs";
@@ -139,6 +126,12 @@ const CONFIG = {
   acceptanceAtrFraction: num(process.env.ACCEPTANCE_ATR_FRACTION, 0.5, 0.05),
   acceptanceRiskFraction: num(process.env.ACCEPTANCE_RISK_FRACTION, 0.35, 0.05),
   evidenceFadeAtrFraction: num(process.env.EVIDENCE_FADE_ATR_FRACTION, 0.25, 0),
+  // A live quote older than this cannot confirm anything (a stalled or
+  // closed market); it still counts for the stop.
+  maxQuoteAgeMs: num(process.env.MAX_QUOTE_AGE_MS, 30_000, 1000),
+  // An ENTER NOW delivered later than this after it was written goes out
+  // marked LATE.
+  enterStaleMs: num(process.env.ENTER_STALE_MS, 60_000, 1000),
   // ENTER NOW means "enter at market when you read this": below this R:R
   // to TP1 at the live price, the move already happened.
   minRrAtEntry: num(process.env.MIN_RR_AT_ENTRY, 1, 0),
@@ -173,6 +166,14 @@ const CONFIG = {
   maxSetupWatches: num(process.env.MAX_ACTIVE_WATCHES, 25, 1),
   resolvedLimit: num(process.env.RESOLVED_WATCH_LIMIT, 60, 10),
 
+  // SPREAD_CAP_<SYMBOL> overrides the derived spread cap for that symbol.
+  spreadCaps: Object.fromEntries(
+    Object.entries(process.env)
+      .filter(([key]) => key.startsWith("SPREAD_CAP_"))
+      .map(([key, value]) => [key.slice("SPREAD_CAP_".length), value]),
+  ),
+  telegramApiUrl: process.env.TELEGRAM_API_URL || "https://api.telegram.org",
+
   statePath: process.env.STATE_FILE || "./data/watch-state.json",
   authToken: String(process.env.WATCH_MONITOR_AUTH_TOKEN || ""),
   cronSecret: String(process.env.CRON_SECRET || ""),
@@ -182,7 +183,8 @@ const CONFIG = {
 // Degradation must be measured against the real cadence, not a fixed
 // wall-clock constant: on Vercel a tick only arrives once a minute.
 const SERVERLESS = Boolean(process.env.VERCEL) || process.env.SERVERLESS === "true";
-const staleBudget = () => Math.max(SERVERLESS ? 180_000 : 120_000, CONFIG.setupIntervalMs * 8);
+CONFIG.staleBudgetMs = Math.max(SERVERLESS ? 180_000 : 120_000, CONFIG.setupIntervalMs * 8);
+const VERSION = "6.19.0";
 
 function log(message, ...args) {
   console.error(`[watch-monitor] ${message}`, ...args);
@@ -232,6 +234,7 @@ const market = new MarketData({ client, config: CONFIG, log });
 const notifier = new Notifier({
   token: process.env.TELEGRAM_BOT_TOKEN,
   chatId: process.env.TELEGRAM_CHAT_ID,
+  apiBase: CONFIG.telegramApiUrl,
   log,
 });
 const store = new WatchStore({
@@ -247,6 +250,16 @@ let manualNewsLockout = { active: false, reason: null, setAt: null };
 let newsCache = { events: [], fetchedAt: 0, expiresAt: 0, lastError: null };
 let newsRefreshInFlight = null;
 const watchSessions = new Map();
+
+const engine = createEngine({
+  store,
+  market,
+  notify,
+  config: CONFIG,
+  gates: applyExternalGates,
+  log,
+  persist: scheduleSave,
+});
 
 const app = express();
 // Behind Vercel's (or Railway's) proxy: req.protocol must say https, or
@@ -282,7 +295,8 @@ async function logRequest(entry) {
   }
 }
 app.use(async (req, _res, next) => {
-  if (["/tick", "/health", "/debug/requests", "/favicon.ico"].includes(req.path)) return next();
+  // Noise: the cron, health checks, and clients closing MCP sessions.
+  if (["/tick", "/health", "/debug/requests", "/favicon.ico"].includes(req.path) || req.method === "DELETE") return next();
   const body = req.body && typeof req.body === "object" ? req.body : {};
   await logRequest({
     method: req.method,
@@ -306,7 +320,8 @@ app.use(async (req, _res, next) => {
   });
   next();
 });
-app.get("/debug/requests", async (_req, res) => {
+app.get("/debug/requests", async (req, res) => {
+  if (rejectUnauthorized(req, res)) return;
   try {
     res.json(kv ? await kv.list(REQUEST_LOG_KEY) : requestLog);
   } catch (error) {
@@ -320,14 +335,6 @@ const verifyOAuthAccess = CONFIG.authToken
   ? installOAuth(app, { password: CONFIG.authToken, cors: setupCors })
   : () => false;
 if (OPEN_API) installOpenApiConnect(app, { client, authorized, tokenStore: ctraderTokens });
-
-function htmlEscape(value) {
-  return String(value ?? "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
-}
 
 function notify(text, options = {}) {
   return notifier.enqueue(text, options);
@@ -352,344 +359,7 @@ function scheduleSave(immediate = false) {
 }
 
 // ---------------------------------------------------------------------------
-// §3 Resolution paths
-//
-// Every terminal transition funnels through resolveWatch. It is
-// idempotent by construction: store.beginResolution() is the only door,
-// and it can be walked through once. Notification is enqueued, never
-// awaited, so a slow or failing Telegram cannot hold a watch in
-// RESOLVING — but the delivery outcome is recorded against the
-// resolution so a silent non-delivery is visible in list_watches.
-
-function resolveWatch(watch, status, extra = {}, message = null, priority = "critical") {
-  if (!store.beginResolution(watch.id)) return false;
-  try {
-    const record = store.finalize(watch, status, extra);
-    if (message) {
-      const result = notify(message, { dedupeKey: `${watch.id}:${status}`, priority });
-      record.notification = { queued: result.queued, at: new Date().toISOString() };
-    }
-    scheduleSave(true);
-    return true;
-  } finally {
-    store.endResolution(watch.id);
-  }
-}
-
-function nyTime(nowMs = Date.now()) {
-  const { minutes } = nyClock(nowMs);
-  return `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
-}
-
-// Written to be acted on from a phone: everything MT5 needs, the price
-// beyond which not to chase, and why it fired. The watch is not resolved
-// here: from now on it is the trade the human took, managed tick by tick.
-function confirmWatch(watch, quote, result, gates, rr, walls = []) {
-  const buy = watch.direction === "buy";
-  const fmt = (value) => htmlEscape(formatLevel(value));
-  const targets = [watch.tp1, watch.tp2, watch.tp3].filter(Number.isFinite);
-  watch.lifecycle = "IN_TRADE";
-  watch.status = "IN_TRADE";
-  watch.lastReason = "in_trade";
-  watch.lastGateBlockReason = null;
-  watch.trade = {
-    direction: watch.direction,
-    entry: quote.executable,
-    sl: watch.sl,
-    risk: Math.abs(quote.executable - watch.sl),
-    targets,
-    hit: 0,
-    best: quote.executable,
-    enteredAt: Date.now(),
-    rr_at_entry: Number(rr.toFixed(2)),
-    signals: result.signals,
-    strength: result.strength,
-    gates: gates.summary,
-    obstacles: walls,
-  };
-  store.dirty = true;
-  scheduleSave(true);
-  notify(
-    `<b>🟢 REAL CONFIRMATION — ENTER NOW</b>\n` +
-      `<b>${htmlEscape(watch.symbol)} ${buy ? "BUY" : "SELL"} at market</b> ≈ ${fmt(quote.executable)} (${buy ? "ask" : "bid"})\n` +
-      `<b>SL:</b> ${fmt(watch.sl)} (risk ${fmt(watch.trade.risk)})\n` +
-      targets.map((level, index) => `<b>TP${index + 1}:</b> ${fmt(level)}`).join(" | ") +
-      `\n<b>R:R to TP1 now:</b> ${htmlEscape(rr.toFixed(2))}\n` +
-      `<b>Do not enter ${buy ? "above" : "below"}:</b> ${fmt(chaseLimit(watch, CONFIG.minRrAtEntry))} ` +
-      `(R:R under ${htmlEscape(CONFIG.minRrAtEntry)})\n` +
-      `<b>Checklist</b>\n` +
-      (watch.liquidityTaken ? `✅ Liquidity ${fmt(watch.sweep_level)} taken\n` : `▫️ Liquidity ${fmt(watch.sweep_level)} not taken yet\n`) +
-      `✅ Price reached ${watch.entry_zone_low != null ? `the zone ${fmt(watch.entry_zone_low)} – ${fmt(watch.entry_zone_high)}` : fmt(watch.entry)}\n` +
-      `✅ ${htmlEscape(result.signals.join(" + "))}\n` +
-      `✅ ${htmlEscape(gates.zone || "outside the kill zones")} · news clear · spread ${fmt(quote.spread)}\n` +
-      (watch.liquidity && watch.liquidity !== "N/A" ? `<b>Liquidity:</b> ${htmlEscape(watch.liquidity)}\n` : "") +
-      `<b>Setup:</b> ${htmlEscape(watch.setup_model)} · conviction ${htmlEscape(watch.conviction)} · ${htmlEscape(result.strength)}\n` +
-      (walls.length
-        ? `<b>Obstacles to target:</b>\n` +
-          walls.map((zone) => `🧱 ${zone.tf} ${zone.kind} (${zone.pattern}) ${fmt(zone.low)} – ${fmt(zone.high)}`).join("\n") +
-          "\n"
-        : `<b>Obstacles to target:</b> none on M5–H4\n`) +
-      `<i>Sent ${nyTime()} New York. Use exactly this SL and TP in MT5. The monitor now manages the trade: ` +
-      `TP alerts, SL to breakeven after TP1, and CLOSE NOW if price stops and turns back ` +
-      `or an obstacle holds.</i>`,
-    { dedupeKey: `${watch.id}:enter`, priority: "critical" },
-  );
-  return true;
-}
-
-// The trade after ENTER NOW, on every tick (fast mode keeps it at ~15 s):
-// the stop, each target, the stop at breakeven after the first, and the
-// exit where price stopped and turned back.
-async function manageOpenTrade(watch, { mainId, mid, executable, protective, now }) {
-  const trade = watch.trade;
-  const buy = trade.direction === "buy";
-  // M1 only to see a wick touch the stop or a target between ticks; the
-  // turn that closes the trade is read on the entry timeframe.
-  const tf = CONFIG.entryTimeframe;
-  const [m1raw, tfRaw] = await Promise.all([
-    market.bars(watch.symbol, mainId, "M1", 80),
-    tf === "M1" ? null : market.bars(watch.symbol, mainId, tf, 100),
-  ]);
-  const m1 = closedSeries(m1raw || [], "M1", { nowMs: now, staleBars: Infinity }).bars;
-  const bars = tf === "M1" ? m1 : closedSeries(tfRaw || [], tf, { nowMs: now, staleBars: Infinity }).bars;
-  const sinceMs = Math.max(trade.enteredAt, watch.lastTickAt ? Date.parse(watch.lastTickAt) : 0);
-  const seen = quotesWithGap(watch.direction, { mid, executable, protective }, m1, sinceMs);
-  const result = manageTrade(trade, bars, seen, { armR: CONFIG.exitArmR });
-  trade.best = result.best;
-  store.dirty = true;
-  noteDataQuality(watch, true);
-
-  const fmt = (value) => htmlEscape(formatLevel(value));
-  const inR = (price) => (buy ? price - trade.entry : trade.entry - price) / trade.risk;
-  const signedR = (price) => `${inR(price) >= 0 ? "+" : ""}${inR(price).toFixed(2)}R`;
-  const head = `<b>${htmlEscape(watch.symbol)} ${buy ? "BUY" : "SELL"}</b> from ${fmt(trade.entry)}`;
-
-  if (result.action === "HOLD") {
-    watch.lastReason = "in_trade";
-    const held = await checkObstacles(watch, { mainId, mid, seen, sinceMs, now, head, fmt });
-    if (!held) return;
-    const r = inR(protective);
-    resolveWatch(
-      watch,
-      r > 0 ? "WIN" : r < 0 ? "LOSS" : "BREAKEVEN",
-      { resolvedPrice: protective, exit_reason: "OBSTACLE", result_r: Number(r.toFixed(2)), trade },
-      `<b>🔴 CLOSE NOW — ${htmlEscape(held.tf)} ${htmlEscape(held.kind.toUpperCase())} HELD</b>\n${head}\n` +
-        `<b>Close at market</b> ≈ ${fmt(protective)} — price reached the ${htmlEscape(held.tf)} ${htmlEscape(held.kind)} ` +
-        `${fmt(held.low)} – ${fmt(held.high)} and an M5 ${htmlEscape(held.type)} held it\n` +
-        `<b>Result:</b> ${signedR(protective)} on what is still open` +
-        (trade.hit ? ` (after TP${trade.hit}; SL was at breakeven)` : ""),
-    );
-    return;
-  }
-  if (result.action === "TARGET") {
-    trade.hit += 1;
-    const first = trade.hit === 1;
-    if (first) trade.sl = trade.entry;
-    watch.lastReason = `tp${trade.hit}_hit`;
-    notify(
-      `<b>🎯 TP${trade.hit} HIT</b>\n${head}\n` +
-        `<b>At:</b> ${fmt(result.price)} (${signedR(result.price)})\n` +
-        (first
-          ? `<b>Close 50–80% and move the SL to breakeven ${fmt(trade.entry)}.</b>\n`
-          : `<b>Close part; the SL stays at breakeven.</b>\n`) +
-        `<i>Next: TP${trade.hit + 1} ${fmt(trade.targets[trade.hit])}</i>`,
-      { dedupeKey: `${watch.id}:tp${trade.hit}`, priority: "critical" },
-    );
-    return;
-  }
-
-  // STOP, FINAL or REVERSAL: the trade is over.
-  const exit = result.price;
-  const r = inR(exit);
-  const status = result.action === "STOP" && trade.hit > 0 ? "BREAKEVEN" : r > 0 ? "WIN" : r < 0 ? "LOSS" : "BREAKEVEN";
-  const title = {
-    STOP: trade.hit > 0 ? "⚪ STOPPED AT BREAKEVEN" : "❌ SL HIT",
-    FINAL: "🏁 FINAL TARGET HIT — CLOSE ALL",
-    REVERSAL: "🔴 CLOSE NOW — PRICE TURNED BACK",
-  }[result.action];
-  resolveWatch(
-    watch,
-    status,
-    { resolvedPrice: exit, exit_reason: result.action, result_r: Number(r.toFixed(2)), trade },
-    `<b>${title}</b>\n${head}\n` +
-      (result.action === "REVERSAL"
-        ? `<b>Close at market</b> ≈ ${fmt(exit)} — price stopped at ${fmt(result.best)} and an ${tf} candle closed back ` +
-          `${buy ? "below" : "above"} ${fmt(result.level)}\n`
-        : `<b>At:</b> ${fmt(exit)}\n`) +
-      `<b>Result:</b> ${signedR(exit)} on what is still open` +
-      (trade.hit ? ` (after TP${trade.hit}; SL was at breakeven)` : ""),
-  );
-}
-
-// The zones mapped at ENTER NOW. Reaching one is seen on the live price
-// (with the M1 wicks between ticks); the hold is M5 price action, the
-// break only a closed candle of the zone's own timeframe (zoneVerdict).
-// Returns the zone that held, or null.
-async function checkObstacles(watch, { mainId, mid, seen, sinceMs, now, head, fmt }) {
-  const buy = watch.direction === "buy";
-  const live = (watch.trade.obstacles || []).filter((zone) => !zone.done);
-  const reached = live.filter((zone) => !zone.reachedAt && (buy ? seen.mid >= zone.low : seen.mid <= zone.high));
-  for (const zone of reached) zone.reachedAt = sinceMs;
-  if (reached.length) {
-    store.dirty = true;
-    notify(
-      `<b>⚠️ PRICE AT ${reached.map((zone) => `${htmlEscape(zone.tf)} ${htmlEscape(zone.kind.toUpperCase())}`).join(" + ")}</b>\n${head}\n` +
-        reached.map((zone) => `🧱 ${htmlEscape(zone.tf)} ${htmlEscape(zone.kind)} (${htmlEscape(zone.pattern)}) ${fmt(zone.low)} – ${fmt(zone.high)}`).join("\n") +
-        `\n<i>Watching M5: an engulfing or rejection that holds it → CLOSE NOW. Broken only when a candle of the ` +
-        `zone's own timeframe closes ${buy ? "above" : "below"} it → the trade goes on.</i>`,
-      { dedupeKey: `${watch.id}:at:${reached.map((zone) => `${zone.tf}:${zone.low}`).join(",")}`, priority: "critical" },
-    );
-  }
-  const watching = live.filter((item) => item.reachedAt);
-  if (!watching.length) return null;
-  const tolerance = priceTolerance(watch.symbol, mid);
-  const closedOf = async (tf) => closedSeries((await market.bars(watch.symbol, mainId, tf, 100)) || [], tf, { nowMs: now, staleBars: Infinity }).bars;
-  const m5 = await closedOf("M5");
-  for (const zone of watching) {
-    const own = zone.tf === "M5" ? m5 : await closedOf(zone.tf);
-    const verdict = zoneVerdict(m5, own, PERIOD_MS[zone.tf], watch.direction, zone, zone.reachedAt, tolerance);
-    if (!verdict) continue;
-    zone.done = verdict.verdict;
-    store.dirty = true;
-    if (verdict.verdict === "HELD") return { ...zone, type: verdict.type };
-    notify(
-      `<b>✅ ${htmlEscape(zone.tf)} ${htmlEscape(zone.kind.toUpperCase())} BROKEN</b>\n${head}\n` +
-        `A closed ${htmlEscape(zone.tf)} candle went through ${fmt(zone.low)} – ${fmt(zone.high)}. The trade goes on.`,
-      { dedupeKey: `${watch.id}:broken:${zone.tf}:${zone.low}` },
-    );
-  }
-  return null;
-}
-
-function failWatch(watch, price, reason) {
-  return resolveWatch(
-    watch,
-    "FAILED",
-    { resolvedPrice: price, reason },
-    `<b>SETUP FAILED</b>\n` +
-      `<b>Symbol:</b> ${htmlEscape(watch.symbol)} (${htmlEscape(watch.direction)})\n` +
-      `<b>Reason:</b> ${htmlEscape(reason)}\n` +
-      `<b>Price:</b> ${htmlEscape(formatLevel(price))}\n<b>Action:</b> Do not enter.`,
-  );
-}
-
-function expireWatch(watch, reason, price) {
-  return resolveWatch(
-    watch,
-    "EXPIRED",
-    { reason, resolvedPrice: price ?? null },
-    `<b>SETUP EXPIRED</b>\n` +
-      `<b>Symbol:</b> ${htmlEscape(watch.symbol)} (${htmlEscape(watch.direction)})\n` +
-      `<b>Reason:</b> ${htmlEscape(reason)}\n` +
-      (Number.isFinite(price) ? `<b>Price:</b> ${htmlEscape(formatLevel(price))}\n` : "") +
-      `<b>Action:</b> Do not enter.`,
-  );
-}
-
-function cancelWatchById(watchId, reason) {
-  const watch = store.get(watchId);
-  if (!watch) {
-    // Idempotent by design: cancelling an already-resolved watch is a
-    // reportable no-op, not an error. mcp_contract.md §7 previously
-    // warned this was unverified; it is now specified.
-    const resolved = store.resolved.get(watchId);
-    if (resolved) {
-      return { status: "ALREADY_RESOLVED", watch_id: watchId, resolution: resolved.status };
-    }
-    return null;
-  }
-  const kind = watch.kind || "SETUP";
-  const ok = resolveWatch(
-    watch,
-    "CANCELLED",
-    { reason },
-    `<b>WATCH CANCELLED</b>\n` +
-      `<b>${htmlEscape(watch.symbol)}</b> (${htmlEscape(kind)})\n` +
-      `<b>Reason:</b> ${htmlEscape(reason)}`,
-    "normal",
-  );
-  return ok
-    ? { status: "CANCELLED", watch_id: watchId, kind }
-    : { status: "ALREADY_RESOLVING", watch_id: watchId, kind };
-}
-
-// ---------------------------------------------------------------------------
-// §4 Data quality
-//
-// A watch whose feed is unreliable is not a watch that has failed and not
-// a watch that is fine. It is a watch that cannot be evaluated, and the
-// human is told so once, with a recovery message when it clears.
-
-function noteDataQuality(watch, ok, detail = null) {
-  const now = Date.now();
-  if (ok) {
-    watch.lastGoodUpdateAt = now;
-    watch.degradedSince = null;
-    if (watch.degradedNotified) {
-      watch.degradedNotified = false;
-      notify(
-        `<b>MONITORING RECOVERED</b>\n<b>${htmlEscape(watch.symbol)}</b> live data is stable again.`,
-        { dedupeKey: `${watch.id}:recovered:${Math.floor(now / 60000)}` },
-      );
-    }
-    return;
-  }
-  if (!watch.degradedSince) watch.degradedSince = now;
-  if (now - watch.degradedSince >= staleBudget(watch) && !watch.degradedNotified) {
-    watch.degradedNotified = true;
-    notify(
-      `<b>LIVE DATA DEGRADED</b>\n` +
-        `<b>${htmlEscape(watch.symbol)}</b> confirmation is paused` +
-        `${detail ? `: ${htmlEscape(detail)}` : ""}.\n` +
-        `<i>Safety checks continue whenever a usable price is available.</i>`,
-      { dedupeKey: `${watch.id}:degraded`, priority: "critical" },
-    );
-  }
-}
-
-/**
- * Quarantine — the feed produced a price that cannot be reconciled with
- * the levels this watch was registered against. Nothing about this watch
- * can be evaluated safely, including its stop, so the only honest action
- * is to stop pretending it is monitored and say so loudly.
- */
-function quarantine(watch, detail) {
-  if (watch.lifecycle === "QUARANTINED") return;
-  watch.lifecycle = "QUARANTINED";
-  watch.lastReason = "quarantined_scale_mismatch";
-  watch.quarantine = { detail, at: new Date().toISOString() };
-  store.dirty = true;
-  notify(
-    `<b>⚠ WATCH QUARANTINED — NOT MONITORED</b>\n` +
-      `<b>${htmlEscape(watch.symbol)}</b> (${htmlEscape(watch.kind || "SETUP")})\n` +
-      `<b>Problem:</b> ${htmlEscape(detail)}\n` +
-      `<b>Action:</b> this watch is NOT being monitored. Treat any position as unwatched, ` +
-      `cancel the watch and re-run the pipeline.`,
-    { dedupeKey: `${watch.id}:quarantine`, priority: "critical" },
-  );
-}
-
-/**
- * Record the moment the watch's liquidity is taken, once. Called with the
- * live protective price on every tick and with closed-bar extremes once
- * candles are loaded, so a wick between two ticks is not missed.
- */
-function noteLiquidity(watch, extremes, price) {
-  if (watch.liquidityTaken || !liquidityTaken(watch, extremes)) return;
-  watch.liquidityTaken = true;
-  watch.liquidityTakenAt = new Date().toISOString();
-  store.dirty = true;
-  notify(
-    `<b>LIQUIDITY TAKEN</b>\n` +
-      `<b>${htmlEscape(watch.symbol)}</b> ${htmlEscape(watch.direction.toUpperCase())}\n` +
-      `<b>Swept:</b> ${htmlEscape(formatLevel(watch.sweep_level))} | <b>Price:</b> ${htmlEscape(formatLevel(price))}\n` +
-      `<i>Stops are in. Waiting for entry touch and confirmation — not an entry yet.</i>`,
-    { dedupeKey: `${watch.id}:liquidity` },
-  );
-}
-
-// ---------------------------------------------------------------------------
-// §5 Gates
+// §3 Gates
 
 async function fetchNewsCalendar() {
   for (const url of CONFIG.newsFeedUrls) {
@@ -716,7 +386,8 @@ async function fetchNewsCalendar() {
             timestamp,
           };
         })
-        .filter(Boolean);
+        // Only what can gate: the cache rides in the state every tick reads.
+        .filter((event) => event && CONFIG.newsImpacts.has(event.impact));
     } catch (error) {
       log(`news ${url} failed: ${error.message}`);
     } finally {
@@ -808,325 +479,7 @@ async function applyExternalGates(watch, spread) {
 }
 
 // ---------------------------------------------------------------------------
-// §6 Setup watch engine
-
-const SMT_BUNDLES = {
-  XAUUSD: [{ symbol: "XAGUSD" }, { symbol: "EURUSD", inverse: true }],
-  XAGUSD: [{ symbol: "XAUUSD" }, { symbol: "EURUSD", inverse: true }],
-  BTCUSD: [{ symbol: "ETHUSD" }],
-  ETHUSD: [{ symbol: "BTCUSD" }],
-  USTEC: [{ symbol: "US500" }, { symbol: "US30" }],
-  US30: [{ symbol: "US500" }, { symbol: "USTEC" }],
-  US500: [{ symbol: "USTEC" }, { symbol: "US30" }],
-  NAS100: [{ symbol: "US500" }],
-  SPX500: [{ symbol: "USTEC" }],
-  EURUSD: [{ symbol: "GBPUSD" }],
-  GBPUSD: [{ symbol: "EURUSD" }],
-};
-
-async function tickSetupWatch(watch) {
-  const now = Date.now();
-
-  // Expiry is checked before anything that can fail, so an unreachable
-  // upstream can never keep a watch alive past its own deadline.
-  if (watch.lifecycle !== "IN_TRADE" && watch.expiresAt && now >= watch.expiresAt) {
-    watch.lastReason = "expired";
-    expireWatch(watch, "Watch expiration reached");
-    return;
-  }
-
-  const bundle = SMT_BUNDLES[watch.symbol] || [];
-  const ids = await market.resolveSymbols([watch.symbol, ...bundle.map((item) => item.symbol)]);
-  const mainId = ids.get(watch.symbol);
-  if (mainId === undefined) {
-    watch.lastReason = "symbol_unavailable";
-    noteDataQuality(watch, false, "symbol is unavailable from cTrader");
-    return;
-  }
-
-  const spot = await market.spot(watch.symbol, mainId);
-  if (!spot) {
-    watch.lastReason = "spot_unavailable";
-    noteDataQuality(watch, false, "live spot price unavailable");
-    return;
-  }
-
-  const mid = (spot.bid + spot.ask) / 2;
-
-  // Falsify the price scale against the level the pipeline computed
-  // independently. If gold quotes come back at 0.044 against an entry of
-  // 4414.69, every comparison below is meaningless and the watch must
-  // stop, not "keep waiting for a touch that never comes".
-  const scale = market.checkScale(mid, watch.entry);
-  if (!scale.ok) {
-    quarantine(
-      watch,
-      `feed price ${formatLevel(mid)} is irreconcilable with registered entry ${formatLevel(watch.entry)}` +
-        (scale.impliedFactor ? ` (implied scale factor ${scale.impliedFactor})` : ""),
-    );
-    return;
-  }
-
-  const spread = spot.ask - spot.bid;
-  const tolerance = priceTolerance(watch.symbol, mid);
-  const executable = watch.direction === "buy" ? spot.ask : spot.bid;
-  const protective = watch.direction === "buy" ? spot.bid : spot.ask;
-
-  const spreadHealth = updateSpreadHealth(watch, spread, tolerance, mid, {
-    enabled: CONFIG.spreadEnabled,
-    baselineSamples: CONFIG.spreadBaselineSamples,
-    historyMax: CONFIG.spreadHistoryMax,
-    anomalyMultiplier: CONFIG.spreadAnomalyMultiplier,
-    capOverride: finiteNumber(process.env[`SPREAD_CAP_${watch.symbol}`]),
-  });
-  watch.spreadSamples = spreadHealth.spreadSamples;
-
-  // After ENTER NOW the watch is the trade: its own stop, targets and exit.
-  if (watch.lifecycle === "IN_TRADE") {
-    await manageOpenTrade(watch, { mainId, mid, executable, protective, now });
-    return;
-  }
-
-  // -- Safety first, in every lifecycle state -------------------------------
-  //
-  // v5 gated the entire tick on lifecycle ∈ {ARMED, TOUCHED}, so a watch
-  // that reached CONFIRMING and was held by a gate stopped checking its
-  // own stop loss, its invalidation, and its expiry — permanently. Safety
-  // now runs before the entry model, on every tick, in ARMED, TOUCHED and
-  // CONFIRMING alike, and it runs even when the spread is abnormal: a bad
-  // quote must not make the service ignore an adverse move.
-  const lastSeenMs = watch.lastTickAt ? Date.parse(watch.lastTickAt) : watch.armedAtMs;
-  // Until the touch, every M1 bar since registration: a touch must never
-  // be lost to a tick that missed its bars.
-  const sinceMs = watch.entryTouched ? lastSeenMs : watch.armedAtMs;
-  let gapBars = [];
-  if (now - sinceMs > 15_000) {
-    const raw = await market.bars(watch.symbol, mainId, "M1", 80);
-    gapBars = closedSeries(raw || [], "M1", { nowMs: now, staleBars: Infinity }).bars;
-  }
-  const seen = quotesWithGap(watch.direction, { mid, executable, protective }, gapBars, sinceMs);
-  const safety = evaluateSafety(watch, { ...seen, tolerance });
-  if (safety.action === "FAIL") {
-    watch.lastReason = "risk_line_breached";
-    failWatch(watch, safety.price, safety.reason);
-    return;
-  }
-  if (safety.action === "EXPIRE") {
-    watch.lastReason = "tp1_reached";
-    expireWatch(watch, safety.reason, safety.price);
-    return;
-  }
-  noteLiquidity(
-    watch,
-    { low: Math.min(protective, seen.protective), high: Math.max(protective, seen.protective) },
-    protective,
-  );
-  if (safety.action === "TOUCH") {
-    // Touched in a wick since the last tick rather than on the live quote:
-    // date it to that window, so the structure shift is read from the
-    // reaction low and not from after it.
-    const touchedLive = evaluateSafety(watch, { mid, executable, protective, tolerance }).action === "TOUCH";
-    watch.entryTouched = true;
-    watch.entryTouchedAt = new Date(touchedLive ? now : lastSeenMs).toISOString();
-    watch.lifecycle = "TOUCHED";
-    watch.lastReason = "entry_touched";
-    store.dirty = true;
-    notify(
-      `<b>ENTRY TOUCHED</b>\n` +
-        `<b>${htmlEscape(watch.symbol)}</b> ${htmlEscape(watch.direction.toUpperCase())}\n` +
-        (watch.entry_zone_low != null
-          ? `<b>Zone:</b> ${htmlEscape(formatLevel(watch.entry_zone_low))} – ${htmlEscape(formatLevel(watch.entry_zone_high))}`
-          : `<b>Entry:</b> ${htmlEscape(formatLevel(watch.entry))}`) +
-        ` | <b>Price:</b> ${htmlEscape(formatLevel(safety.price))}\n` +
-        `<i>Waiting for persistent live confirmation: live acceptance plus CISD, SMT, engulfing or rejection, ` +
-        `held over a new M1 candle → ENTER NOW.</i>`,
-      { dedupeKey: `${watch.id}:touched` },
-    );
-  } else if (safety.action === "WAIT") {
-    watch.lastReason = "armed_waiting_for_touch";
-    noteDataQuality(watch, !spreadHealth.abnormal);
-    return;
-  }
-
-  // -- Evidence -------------------------------------------------------------
-  //
-  // The v6.0 REAL CONFIRMATION, back by the owner's choice (28 Oct): the
-  // analysis has done the hard work, the monitor only has to see the turn.
-  // Price at the zone, then live acceptance and at least one of CISD, SMT,
-  // an engulfing or rejection, held over a new M1 bar. One layer: no
-  // liquidity or structure-shift gate on top (v6.1–v6.17). R:R to TP1 at
-  // market >= 1 only stops a chase.
-  const [m5raw, m1raw] = await Promise.all([
-    market.bars(watch.symbol, mainId, "M5", 60),
-    market.bars(watch.symbol, mainId, "M1", 80),
-  ]);
-  const m5 = closedSeries(m5raw || [], "M5", { nowMs: now });
-  const m1 = closedSeries(m1raw || [], "M1", { nowMs: now, staleBars: 5 });
-  if (m5.status !== "OK" || m1.status !== "OK" || m5.bars.length < 20 || m1.bars.length < 20) {
-    watch.lastReason = `candles_${(m5.status !== "OK" ? m5.status : m1.status).toLowerCase()}`;
-    noteDataQuality(
-      watch,
-      false,
-      m5.status === "NO_TIMESTAMP" || m1.status === "NO_TIMESTAMP"
-        ? "candle feed omitted bar timestamps; closure cannot be verified"
-        : "insufficient or stale candle history",
-    );
-    return;
-  }
-
-  // Candle bodies and the live quote must describe the same instrument.
-  // Disagreement here means one of the two feeds is wrong and neither can
-  // be used as evidence.
-  const barVsSpot = market.checkScale(m5.bars.at(-1).close, mid);
-  if (!barVsSpot.ok) {
-    watch.lastReason = "candle_spot_divergence";
-    noteDataQuality(
-      watch,
-      false,
-      `candle close ${formatLevel(m5.bars.at(-1).close)} disagrees with live mid ${formatLevel(mid)}`,
-    );
-    return;
-  }
-
-  const partners = [];
-  for (const item of bundle) {
-    const partnerId = ids.get(item.symbol);
-    if (partnerId === undefined) continue;
-    const bars = await market.bars(item.symbol, partnerId, "M5", 45);
-    const series = closedSeries(bars || [], "M5", { nowMs: now });
-    if (series.status === "OK" && series.bars.length >= 20) {
-      partners.push({ symbol: item.symbol, bars: series.bars, inverse: item.inverse === true });
-    }
-  }
-
-  // Only stops run after registration count, unless the caller said the
-  // sweep had already printed; then the M5 history must show it.
-  const sweepBars = [...m5.bars, ...m1.bars].filter(
-    (bar) => watch.liquidity_taken || bar.timestampMs >= watch.armedAtMs,
-  );
-  if (sweepBars.length) {
-    noteLiquidity(
-      watch,
-      { low: Math.min(...sweepBars.map((bar) => bar.low)), high: Math.max(...sweepBars.map((bar) => bar.high)) },
-      mid,
-    );
-  }
-
-  watch.generation = advanceGeneration(watch.generation || { generation: 0 }, m1.latestCloseMs);
-  const atrM5 = calcATR(m5.bars, 14);
-  // How far price may pull back before a seen signal counts as faded. The
-  // raw quote tolerance (0.10 on gold) is noise inside the 60s hold, so in
-  // v6.0 gold evidence was wiped before it could ever graduate.
-  const fadeBand = Math.max(tolerance, atrM5 * CONFIG.evidenceFadeAtrFraction);
-
-  const signals = {
-    cisd: checkCISD(m1.bars, watch.direction),
-    smt: checkSMT(m5.bars, partners, watch.direction),
-    engulfM5: classifyEngulfing(m5.bars, watch.direction, "M5"),
-    engulfM1: classifyEngulfing(m1.bars, watch.direction, "M1"),
-    wick: classifyWick(m5.bars.at(-1), atrM5, watch.direction),
-    acceptance: checkAcceptance(watch, mid, protective, atrM5, tolerance, {
-      atrFraction: CONFIG.acceptanceAtrFraction,
-      riskFraction: CONFIG.acceptanceRiskFraction,
-    }),
-  };
-
-  if (spreadHealth.abnormal) {
-    // Evidence is not advanced on a bad quote — the acceptance term is
-    // derived from bid/ask and would be measuring the spread, not the
-    // market.
-    watch.lastReason = "spread_abnormal";
-    noteDataQuality(watch, false, `spread ${formatLevel(spread)} exceeds cap ${formatLevel(spreadHealth.cap)}`);
-    return;
-  }
-  noteDataQuality(watch, true);
-
-  const result = evaluateConfirmation(watch, signals, {
-    mid,
-    tolerance: fadeBand,
-    nowMs: now,
-    generation: watch.generation.generation,
-    hasBarTime: watch.generation.hasBarTime,
-    minHoldMs: CONFIG.minConfirmationHoldMs,
-    requireNewBar: CONFIG.requireNewBar,
-  });
-  watch.evidence = result.evidence;
-  watch.lastSignals = result.signals;
-  store.dirty = true;
-
-  if (!result.enter) {
-    // Evidence that had graduated and then decayed must walk the
-    // lifecycle backwards, visibly, rather than leaving the watch parked
-    // in CONFIRMING with nothing behind it.
-    if (watch.lifecycle === "CONFIRMING") {
-      watch.lifecycle = "TOUCHED";
-      watch.lastReason = "evidence_decayed";
-      watch.lastGateBlockReason = null;
-    } else {
-      watch.lastReason = "evidence_pending";
-    }
-    return;
-  }
-
-  watch.lifecycle = "CONFIRMING";
-  watch.lastReason = "awaiting_gates";
-
-  const gates = await applyExternalGates(watch, spread);
-  const rr = marketRR(watch, executable);
-  watch.rrAtMarket = Number(rr.toFixed(2));
-  if (rr < CONFIG.minRrAtEntry) {
-    gates.pass = false;
-    // Stable wording: the block notice is sent once per distinct reason,
-    // and a live number in it would resend it every tick.
-    gates.reasons.unshift(
-      `R:R at market below ${CONFIG.minRrAtEntry} (price ran past ${formatLevel(chaseLimit(watch, CONFIG.minRrAtEntry))}) — do not chase; waiting for a pullback`,
-    );
-  }
-  if (gates.pass) {
-    watch.lastReason = "confirming";
-    const furthest = [watch.tp1, watch.tp2, watch.tp3].filter(Number.isFinite);
-    const walls = await obstaclesFor(watch, mainId, executable, watch.direction === "buy" ? Math.max(...furthest) : Math.min(...furthest));
-    confirmWatch(watch, { executable, spread }, result, gates, rr, walls);
-    return;
-  }
-  const reasonText = gates.reasons.join(" | ");
-  if (watch.lastGateBlockReason !== reasonText) {
-    watch.lastGateBlockReason = reasonText;
-    watch.lastReason = "gate_blocked";
-    notify(
-      `<b>TECHNICALLY CONFIRMED — WAITING ON GATE</b>\n` +
-        `<b>${htmlEscape(watch.symbol)}</b> ${htmlEscape(watch.direction.toUpperCase())}\n` +
-        `<b>Evidence:</b> ${htmlEscape(result.signals.join(" + "))}\n` +
-        `<b>Blocked by:</b> ${htmlEscape(reasonText)}`,
-      { dedupeKey: `${watch.id}:gate:${reasonText}` },
-    );
-  }
-}
-
-// The zones that can stop the trade on its way to the furthest target, on
-// every timeframe from M5 to H4, nearest first. A failure leaves them out
-// rather than delaying the entry.
-const OBSTACLE_TIMEFRAMES = ["M5", "M15", "M30", "H1", "H4"];
-async function obstaclesFor(watch, symbolId, entry, target) {
-  try {
-    const nowMs = Date.now();
-    const perTf = await Promise.all(
-      OBSTACLE_TIMEFRAMES.map(async (tf) => {
-        const raw = await market.bars(watch.symbol, symbolId, tf, 100);
-        const bars = closedSeries(raw || [], tf, { nowMs, staleBars: Infinity }).bars;
-        return obstacles(bars, watch.direction, entry, target).map((zone) => ({ tf, ...zone, reachedAt: null, done: null }));
-      }),
-    );
-    const buy = watch.direction === "buy";
-    return perTf.flat().sort((a, b) => (buy ? a.low - b.low : b.high - a.high));
-  } catch (error) {
-    log(`obstacles for ${watch.id} unavailable: ${error.message}`);
-    return [];
-  }
-}
-
-// ---------------------------------------------------------------------------
-// §6b Market snapshot
+// §4 Market snapshot
 //
 // One tool call instead of ~15. The skill used to call get_symbols,
 // get_spot_prices, six get_trendbars, six more for the SMT partners and
@@ -1254,12 +607,12 @@ async function marketSnapshot(args) {
     candles: Object.fromEntries(requested.map((tf) => [tf, packCandles(raw[tf], tf, nowMs)])),
     smt_partners: smtPartners,
     rule:
-      "No liquidity taken, no trade. Reversal (Model A): trade away from the pool in liquidity.last_sweep (best when stop_hunt is true) toward the strongest untaken pool on the other side. If nothing was taken (Model B), the untaken pool is the draw — prefer higher strength, EQH/EQL, reachable distance_atr_h1: trade toward it from a POI between liquidity.inducement.<tf>.<dir>.level and its leg_origin, which price can only reach by taking that IDM. Buys from discount, sells from premium (liquidity.dealing_range). h1_imbalances are internal-range draws. register_watch needs sweep_level = the liquidity that must be taken before entry (the IDM level, or the swept pool with liquidity_taken: true).",
+      "No liquidity taken, no trade. Reversal (Model A): trade away from the pool in liquidity.last_sweep (best when stop_hunt is true) toward the strongest untaken pool on the other side. If nothing was taken (Model B), the untaken pool is the draw — prefer higher strength, EQH/EQL, reachable distance_atr_h1: trade toward it from a POI between liquidity.inducement.<tf>.<dir>.level and its leg_origin, which price can only reach by taking that IDM. Buys from discount, sells from premium (liquidity.dealing_range). h1_imbalances are internal-range draws. register_watch needs sweep_level = the liquidity the setup expects taken (the IDM level, or the swept pool with liquidity_taken: true); the monitor reports when it is taken, and its ENTER NOW does not wait for it.",
   };
 }
 
 // ---------------------------------------------------------------------------
-// §7 Scheduler
+// §5 Scheduler
 //
 // One timer for the whole service. v5 created a setInterval per watch,
 // which meant N watches produced N uncoordinated upstream bursts, N
@@ -1288,21 +641,7 @@ async function runDueWatches() {
         watch.lifecycle !== "QUARANTINED" &&
         (watch.nextDueAt ?? 0) <= now,
     );
-    for (const watch of due) {
-      watch.monitorRunning = true;
-      try {
-        await tickSetupWatch(watch);
-      } catch (error) {
-        log(`watch ${watch.id} failed safely: ${error.message}`);
-        noteDataQuality(watch, false, "monitor tick failed");
-      } finally {
-        watch.monitorRunning = false;
-        watch.lastTickAt = new Date().toISOString();
-        // Scheduled from completion, not from start: a slow upstream
-        // cannot cause ticks to pile up on top of each other.
-        watch.nextDueAt = Date.now() + CONFIG.setupIntervalMs;
-      }
-    }
+    for (const watch of due) await engine.runWatch(watch);
     await notifier.drain();
     if (store.dirty) scheduleSave();
   } finally {
@@ -1316,7 +655,7 @@ function startScheduler() {
 }
 
 // ---------------------------------------------------------------------------
-// §8 Vercel request lifecycle
+// §6 Vercel request lifecycle
 //
 // On Vercel every request may land on a fresh instance and nothing runs
 // after the response, so each request that touches monitor state takes
@@ -1326,6 +665,10 @@ function startScheduler() {
 
 const STATE_KEY = "watch-monitor:state";
 const LOCK_KEY = "watch-monitor:lock";
+// Resolved watches, newest first, capped. Kept out of STATE_KEY so the
+// snapshot every tick reads and writes holds only the live watches: the
+// Upstash free tier allows 10 GB of traffic a month.
+const RESOLVED_KEY = "watch-monitor:resolved";
 
 async function withState(fn, { tick = false } = {}) {
   if (!SERVERLESS) return fn();
@@ -1348,6 +691,9 @@ async function withState(fn, { tick = false } = {}) {
     const gapMs = parsed?.lastTickAt ? now - parsed.lastTickAt : null;
     const keepEvidence = !tick || gapMs === null || gapMs <= CONFIG.maxTickGapMs;
     const recovery = store.restore(parsed, { nowMs: now, keepEvidence });
+    // A snapshot from before 6.19 still carries the resolved history: move
+    // it to its list once.
+    const legacyResolved = parsed?.resolved?.length ? parsed.resolved : [];
     notifier.restore(recovery.outbox);
     if (parsed?.news) newsCache = parsed.news;
     manualNewsLockout = parsed?.lockout || { active: false, reason: null, setAt: null };
@@ -1365,9 +711,13 @@ async function withState(fn, { tick = false } = {}) {
     const result = await fn();
 
     await notifier.drain();
+    for (const record of [...legacyResolved, ...store.takeResolved()]) {
+      await kv.push(RESOLVED_KEY, record, CONFIG.resolvedLimit);
+    }
     await kv.set(
       STATE_KEY,
       store.snapshot({
+        withResolved: false,
         outbox: notifier.serialize(),
         news: newsCache,
         lockout: manualNewsLockout,
@@ -1381,13 +731,13 @@ async function withState(fn, { tick = false } = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// §9 Tool surface
+// §7 Tool surface
 
 const CUSTOM_TOOLS = [
   {
     name: "register_watch",
     description:
-      "Registers a trading setup for live monitoring. The monitor confirms it on live candles — price reaches the zone, then live acceptance beyond the entry plus at least one of CISD, SMT divergence, an M5 / M1 engulfing or an M5 rejection holds over a new M1 candle — and sends ENTER NOW on Telegram with the registered SL and TPs, when R:R to TP1 at market is ≥ 1 and news and spread are clear (no session filter). Then it manages the trade: TP alerts, SL to breakeven after TP1, CLOSE NOW where price turns back or an M5–H4 zone in the way holds. Never places an order.",
+      "Registers a trading setup (contract setup/1) for live validation. The monitor confirms it on live data — price reaches the zone, then live acceptance beyond the entry plus at least one of CISD (M1), SMT divergence (M5), an M5 / M1 engulfing or an M5 rejection, held over a new closed M1 candle — and sends ENTER NOW on Telegram with the registered SL and TPs, only when R:R to TP1 at market is ≥ 1, news and spread are clear and the quote is fresh (no session filter). Then it follows the trade: TP alerts, SL to breakeven after TP1, CLOSE NOW where price turns back or an M5–H4 zone in the way holds. The answer carries `monitor_line`, the monitor's own one-line statement of what it will check with this setup's prices — print it verbatim — and `warnings`. A malformed setup is refused with the broken rule. Never places an order.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -1427,6 +777,15 @@ const CUSTOM_TOOLS = [
             "true if sweep_level was already swept before registering (reversal off a fresh sweep); the monitor verifies it on the last ~5h of M5. Default false: only a sweep after registration counts.",
         },
         expiration_minutes: { type: "number" },
+        contract: {
+          type: "string",
+          enum: [CONTRACT],
+          description: "The setup contract version the analysis wrote this for. Optional; any other value is refused.",
+        },
+        snapshot_as_of: {
+          type: "string",
+          description: "The as_of of the get_market_snapshot the analysis used (ISO UTC). Optional; an analysis older than 20 min is flagged.",
+        },
       },
       required: ["symbol", "direction", "entry", "sl", "tp1", "sweep_level"],
     },
@@ -1456,8 +815,14 @@ const CUSTOM_TOOLS = [
   {
     name: "list_watches",
     description:
-      "Returns active setup watches, quarantined watches, bounded recent outcomes with their real status, entry model and zone, and the monitor's own health (restart recovery, undelivered notifications, feed quality).",
-    inputSchema: { type: "object", additionalProperties: false, properties: {} },
+      "Returns active setup watches (each with `waiting_for`: the condition it waits on, with prices), quarantined watches, bounded recent outcomes with their real status, entry model and zone, and the monitor's own health (thresholds in force, restart recovery, undelivered notifications, feed quality). With `watch_id`: that one watch, active or recently resolved, in full with its decision `history`.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        watch_id: { type: "string", description: "Optional: one watch, active or recently resolved, in full with its decision history." },
+      },
+    },
     annotations: { readOnlyHint: true, openWorldHint: false },
   },
   {
@@ -1520,42 +885,11 @@ function filterToMarketData(tools) {
     .map((tool) => ({ ...tool, annotations: { ...tool.annotations, readOnlyHint: true } }));
 }
 
-function createSetupWatch(args) {
-  const input = validateWatchInput(args);
-  const dedupeKey = watchKey(input);
-  const existing = store.findByDedupeKey(dedupeKey);
-  if (existing) return { watch: existing, duplicate: true };
-  const now = Date.now();
-  const expiryMinutes = input.expiration_minutes ?? (CONFIG.defaultExpiryMinutes || null);
-  const watch = store.add({
-    id: `${input.symbol}_${now}_${randomUUID().slice(0, 8)}`,
-    kind: "SETUP",
-    lifecycle: "ARMED",
-    status: "ARMED",
-    dedupeKey,
-    ...input,
-    entryTouched: false,
-    entryTouchedAt: null,
-    liquidityTaken: false,
-    liquidityTakenAt: null,
-    evidence: {},
-    generation: { lastBarTimeMs: null, generation: 0, hasBarTime: false },
-    spreadSamples: [],
-    lastGoodUpdateAt: null,
-    degradedSince: null,
-    degradedNotified: false,
-    lastGateBlockReason: null,
-    createdAt: new Date(now).toISOString(),
-    armedAtMs: now,
-    expiresAt: expiryMinutes ? now + expiryMinutes * 60_000 : null,
-    lastReason: "armed",
-    monitorRunning: false,
-    nextDueAt: now,
-  });
-  scheduleSave(true);
-  // On Vercel the next /tick (within a minute) runs the first check.
-  if (!SERVERLESS) void runDueWatches();
-  return { watch, duplicate: false };
+// Newest first: what this request resolved, then the stored history.
+async function recentResolved() {
+  const stored = SERVERLESS && kv ? await kv.list(RESOLVED_KEY) : [];
+  const seen = new Set();
+  return [...store.recent(), ...stored].filter((record) => !seen.has(record.id) && seen.add(record.id));
 }
 
 function textResult(payload) {
@@ -1565,6 +899,23 @@ function textResult(payload) {
 function monitorHealth() {
   return {
     schema: "watch-monitor/6.1",
+    version: VERSION,
+    // The thresholds actually in force: env overrides included.
+    confirmation: {
+      contract: CONTRACT,
+      rules: RULES,
+      min_hold_ms: CONFIG.minConfirmationHoldMs,
+      require_new_m1_candle: CONFIG.requireNewBar,
+      acceptance_atr_fraction: CONFIG.acceptanceAtrFraction,
+      acceptance_risk_fraction: CONFIG.acceptanceRiskFraction,
+      evidence_fade_atr_fraction: CONFIG.evidenceFadeAtrFraction,
+      min_rr_at_entry: CONFIG.minRrAtEntry,
+      max_quote_age_ms: CONFIG.maxQuoteAgeMs,
+      news_window_min: { before: CONFIG.newsBeforeMs / 60000, after: CONFIG.newsAfterMs / 60000 },
+      news_impacts: [...CONFIG.newsImpacts],
+      exit_arm_r: CONFIG.exitArmR,
+      fast_mode: { interval_ms: CONFIG.fastIntervalMs, window_ms: CONFIG.fastWindowMs },
+    },
     recovered_at: store.recoveredAt,
     storage: SERVERLESS ? (kv ? "redis" : "MISSING — add Upstash Redis") : "file",
     state_persisted: SERVERLESS ? Boolean(kv) : Boolean(CONFIG.statePath),
@@ -1581,26 +932,21 @@ function monitorHealth() {
 
 async function handleCustomTool(name, args = {}) {
   if (name === "register_watch") {
-    const { watch, duplicate } = createSetupWatch(args);
-    if (!duplicate) {
-      notify(
-        `<b>WATCH ACTIVE</b>\n` +
-          `<b>${htmlEscape(watch.symbol)}</b> — ${htmlEscape(watch.direction.toUpperCase())}\n` +
-          `<b>Entry:</b> ${htmlEscape(formatLevel(watch.entry))} | <b>SL:</b> ${htmlEscape(formatLevel(watch.sl))} | <b>TP1:</b> ${htmlEscape(formatLevel(watch.tp1))}\n` +
-          (watch.entry_zone_low != null
-            ? `<b>Entry zone:</b> ${htmlEscape(formatLevel(watch.entry_zone_low))} – ${htmlEscape(formatLevel(watch.entry_zone_high))} (watched: price reaching the zone is the touch)\n`
-            : "") +
-          `<b>Liquidity to take:</b> ${htmlEscape(formatLevel(watch.sweep_level))}\n` +
-          `<i>Waiting for price in the ${watch.entry_zone_low != null ? "zone" : "entry"}, then live acceptance plus CISD, SMT, ` +
-          `engulfing or rejection, held over a new M1 candle.</i>`,
-        { dedupeKey: `${watch.id}:armed` },
-      );
-    }
+    const events = await getNewsCalendar().catch(() => []);
+    const { watch, duplicate, warnings, plan } = engine.register(args, { events });
+    // As a long-lived process the first check runs now; on Vercel the next
+    // /tick (at most a minute away) runs it.
+    if (!SERVERLESS && !duplicate) void runDueWatches();
     return textResult({
       status: duplicate ? "ALREADY_WATCHING" : "WATCHING",
       watch_id: watch.id,
       lifecycle: watch.lifecycle,
+      contract: watch.contract || CONTRACT,
+      rules: watch.rules || RULES,
       expires_at: watch.expiresAt ? new Date(watch.expiresAt).toISOString() : null,
+      monitor_line: plan.summary,
+      plan,
+      warnings,
       message: duplicate
         ? "This setup is already being monitored."
         : SERVERLESS
@@ -1617,7 +963,11 @@ async function handleCustomTool(name, args = {}) {
     const watchId = String(args.watch_id || "").trim();
     if (!watchId) throw new Error("watch_id is required");
     const reason = args.reason ? String(args.reason).slice(0, 300) : "Cancelled by request";
-    const result = cancelWatchById(watchId, reason);
+    let result = engine.cancelWatchById(watchId, reason);
+    if (!result) {
+      const resolved = (await recentResolved()).find((record) => record.id === watchId);
+      if (resolved) result = { status: "ALREADY_RESOLVED", watch_id: watchId, resolution: resolved.status };
+    }
     if (!result) {
       return textResult({
         status: "NOT_FOUND",
@@ -1629,13 +979,24 @@ async function handleCustomTool(name, args = {}) {
   }
 
   if (name === "list_watches") {
+    const nowMs = Date.now();
+    const shown = (watch) => ({ ...publicWatch(watch), waiting_for: waitingFor(watch, CONFIG, nowMs) });
+    const recent = await recentResolved();
+    if (args.watch_id) {
+      const watchId = String(args.watch_id).trim();
+      const active = store.get(watchId);
+      const found = active ? shown(active) : recent.find((record) => record.id === watchId);
+      return textResult(found ? { watch: found } : { status: "NOT_FOUND", watch_id: watchId });
+    }
     return textResult({
-      active: store.active().map(publicWatch),
+      active: store.active().map(shown),
       quarantined: store
         .active()
         .filter((watch) => watch.lifecycle === "QUARANTINED")
-        .map(publicWatch),
-      recent: store.recent(),
+        .map(shown),
+      // Each record's decision trail is one list_watches { watch_id } away:
+      // inlined for every record, it would swamp the analysis's context.
+      recent: recent.map(({ history: _history, ...record }) => record),
       monitor_health: monitorHealth(),
     });
   }
@@ -1676,7 +1037,7 @@ async function handleCustomTool(name, args = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// §10 HTTP / MCP surface
+// §8 HTTP / MCP surface
 
 // `?token=` is for what cannot set a header: a phone browser opening
 // /test-telegram, a cron service calling /tick, an MCP client with no auth
@@ -1802,7 +1163,7 @@ async function handleMcpRequest(req, res) {
       result: {
         protocolVersion: body.params?.protocolVersion || CONFIG.protocolVersion,
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.18.1" },
+        serverInfo: { name: "cTrader + Watch Monitor MCP", version: VERSION },
       },
     });
     return;
@@ -1872,6 +1233,11 @@ for (const path of ["/icmarkets/mcp", "/mcp", "/watch-mcp"]) {
     setupCors(res);
     res.status(204).end();
   });
+  // A client ending its session: there is no server-side session to end.
+  app.delete(path, (_req, res) => {
+    setupCors(res);
+    res.status(405).set("Allow", "GET, POST, OPTIONS").end();
+  });
   app.get(path, (req, res) => void handleMcpRequest(req, res));
   app.post(path, (req, res) => void handleMcpRequest(req, res));
 }
@@ -1894,22 +1260,27 @@ app.get("/health", async (req, res) => {
   }
   const setups = saved ? saved.setups || [] : store.active();
   const lastTickAt = saved?.lastTickAt ? new Date(saved.lastTickAt).toISOString() : null;
+  // Watches waiting and no tick for 3 minutes: the cron has stopped and
+  // nothing is being checked. 503, so a free uptime monitor can alert.
+  const stale = SERVERLESS && setups.length > 0 && (!saved?.lastTickAt || Date.now() - saved.lastTickAt > 180_000);
   const base = {
-    status: SERVERLESS && !kv ? "storage_missing" : "ok",
+    status: SERVERLESS && !kv ? "storage_missing" : stale ? "stale" : "ok",
     service: "watch-monitor-mcp",
-    version: "6.18.1",
+    version: VERSION,
     runtime: SERVERLESS ? "vercel" : "node",
     watches: setups.length,
     last_tick_at: SERVERLESS ? lastTickAt : undefined,
     uptime_seconds: Math.floor(process.uptime()),
   };
   if (!detailed && CONFIG.authToken) {
-    res.json(base);
+    res.status(stale ? 503 : 200).json(base);
     return;
   }
-  res.json({
+  let resolvedCount = store.resolved.size;
+  if (SERVERLESS && kv) resolvedCount = await kv.len(RESOLVED_KEY).catch(() => null);
+  res.status(stale ? 503 : 200).json({
     ...base,
-    resolved_recent: saved ? (saved.resolved || []).length : store.resolved.size,
+    resolved_recent: resolvedCount,
     quarantined: setups.filter((watch) => watch.lifecycle === "QUARANTINED").length,
     scheduler_tick_ms: SERVERLESS ? "external cron → /tick" : CONFIG.tickMs,
     setup_interval_seconds: CONFIG.setupIntervalMs / 1000,
@@ -1980,9 +1351,9 @@ app.all("/tick", async (req, res) => {
 
 async function runTick() {
   await runDueWatches();
-  // A ready zone or an open trade makes the watch hot: the retrace into
-  // the zone and the turn that closes the trade are what a once-a-minute
-  // check can miss.
+  // A confirmed setup held by a gate or an open trade makes the watch
+  // hot: the gate's release, a target or the stop can come between two
+  // minutes, and fast mode checks every FAST_MODE_INTERVAL_MS meanwhile.
   return {
     watches: store.setups.size,
     hot: store.active().some((watch) => watch.lifecycle === "CONFIRMING" || watch.lifecycle === "IN_TRADE"),
@@ -2007,7 +1378,7 @@ async function fastChecks() {
 }
 
 // ---------------------------------------------------------------------------
-// §11 Boot and shutdown
+// §9 Boot and shutdown
 
 const sessionCleanup = SERVERLESS
   ? null
