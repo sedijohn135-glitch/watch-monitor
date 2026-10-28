@@ -146,6 +146,7 @@ Recommendation: keep the v6.0 confirmation for at least 20 entered setups before
 |---|---|---|
 | Unit tests, v6.0 evidence functions and validation, strict engulfing | `npm test` (`test/adversarial.test.mjs`, 66) | pass |
 | Lifecycle tests on a fake clock (`test/harness.mjs`): long, short, touch without acceptance, acceptance without a technical signal, fade, SL before confirmation, same-tick race, wick through the SL, TP1 before the touch, expiry, news, R:R chase, stale quote, stale candles, abnormal spread, quarantine, no quote, wick-only touch, restart, duplicate, two watches, cancel, plan, contract, TP1 → breakeven, Telegram order, LATE prefix | `npm test` (`test/engine.test.mjs`, 29) | pass |
+| Historical replay, 28 Oct XAUUSD buy (`test/fixtures/xauusd-2026-10-28-buy.json`, the live 20:02 setup) | `npm test` (1) | pass |
 | Replay capture: a resolved setup's candles, replayed, give the same ENTER NOW | `npm test` (1) | pass |
 | Historical replay, 28 Oct XAUUSD sell (`test/fixtures/xauusd-2026-10-28-sell.json`, real cTrader candles) | `npm test` (1), `npm run replay -- test/fixtures/xauusd-2026-10-28-sell.json` | pass |
 | End to end: HTTP, OAuth, MCP tools, Redis, `/tick`, fake Telegram, restart, replay capture | `npm run smoke` | 86 checks pass |
@@ -260,6 +261,19 @@ The sign flips with the timeframes counted, so there is no usable signal yet.
   was 4050.52, $0.33 under the 4050.85 stop on the bid; the ask is higher by
   the spread.
 - Undecidable.
+
+**E7 — the live 28 Oct 20:02 buy, after the 6.19 deploy.**
+- Gemini registered it with `contract: "setup/1"` and `snapshot_as_of`, so
+  the new skill's registration is in use.
+- 6.19 sent ENTER NOW at 20:34:07, at 4062.02 with R:R 1.30, on "M1
+  engulfing (soft) 20:32". The 20:32 bar is bullish after a bullish 20:31
+  bar: a continuation bar, the A-9 defect.
+- The replay with the 6.19 engulfing reproduces it: 20:34:06, R:R 1.29. That
+  checks the replay against a second live decision.
+- With 6.20 it is confirmed only at 20:46, when price was past the chase
+  level 4065.48. It is held as "do not chase" (R:R 0.79) and stays CONFIRMING.
+- The live trade was still open at the daily break (best 4070.90, +0.39R).
+- Regression test: `test/fixtures/xauusd-2026-10-28-buy.json`.
 
 **E6 — where the losses came from.**
 - #2 and #5 would have hit their registered stops before TP1 under any
