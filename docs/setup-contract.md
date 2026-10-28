@@ -124,9 +124,10 @@ setup waits on a gate), safety first.
   - an M5 engulfing;
   - an M1 engulfing;
   - an M5 rejection wick.
-- Each piece must hold for `MIN_CONFIRMATION_HOLD_MS` (50 s on Vercel; the
-  effective value is in `list_watches → monitor_health.confirmation`) and
-  survive into a new closed M1 bar.
+- Each piece must hold for `MIN_CONFIRMATION_HOLD_MS` and survive into a
+  new closed M1 bar. The coded default is 50 s on Vercel; production
+  overrides it to 5 s (requirements A-5). The effective value is in
+  `list_watches → monitor_health.confirmation` and in `monitor_line`.
 - Evidence that price pulls back through by more than ¼ ATR M5 fades and has
   to start again. Evidence is never carried across a restart or a gap of more
   than 5 min.
