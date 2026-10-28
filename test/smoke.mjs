@@ -37,9 +37,8 @@ function bars(count, span, base) {
 
 // A scripted M1 path around minute `scenarioMinute` (bar A): a pullback
 // with one lower high (4419.60) into the POI, then bar A wicks to 4411 —
-// through the entry and the 4412 sell-side liquidity — and closes 4419.80,
-// above 4419.30, the open of the run down into it: sweep + M1 CISD +
-// engulfing in one bar.
+// through the entry and the 4412 sell-side liquidity — and closes 4419.80:
+// sweep + engulfing in one bar.
 let scenarioMinute = null;
 const SCRIPT = {
   "-6": [4419, 4419.2, 4418, 4418.3],
@@ -630,7 +629,6 @@ await nextMinute(3000);
 await tick();
 const midway = (await scenarioWatch()).active;
 assert(midway?.liquidityTaken === true, "bar A closed: its wick took the 4412 liquidity");
-assert(midway?.structureShift?.shifted === true, `bar A closed above 4419.30, the open of the run down into the sweep: M1 CISD (${midway?.lastReason})`);
 assert(midway?.lifecycle !== "IN_TRADE", `one observation is not a confirmation: evidence must survive a new M1 bar (${midway?.lastReason})`);
 
 await nextMinute(3000);
