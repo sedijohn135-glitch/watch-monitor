@@ -207,13 +207,13 @@ data:
 | L-16 | Bias label "DOL above → sell" (G1v5) vs trade toward the draw (G1v3, V11, K11) | Contradiction inside the legacy set | G1v5 says its label is not a trade direction; K11 keeps "trade toward the draw" |
 | L-17 | Sweep before entry (V11 §5.8, G2 State 1, T25) vs a lower score only (V14) | Resolved with evidence | E1, C-1 |
 | L-18 | Keep a setup whose TP1 printed before entry unless a body closes beyond TP2/TP3 (OM) vs TP1 consumed = dead (V14, S6) | Current rule kept | E2 |
-| L-19 | Zone invalidated by a body close beyond it (T25, OM, G1v5 `invalid_if`, G2 `anchor_not_defended`, RW) | Owner, 28 Oct: **not** in the monitor (v6.0 kept). Analysis side, K11 6.20: a zone already closed through is not selected (G1v5 zone validity) | E3 |
+| L-19 | Zone invalidated by a body close beyond it (T25, OM, G1v5 `invalid_if`, G2 `anchor_not_defended`, RW) | Owner, 28 Oct: **not** in the monitor (v6.0 kept). Analysis side: prepared in skill 6.20.1, not installed | E3 |
 | L-20 | Engulfing = the body swallows the previous opposite candle's body (OM) | Not adopted: tried in 6.20.0, reverted in 6.20.1 (owner) — it would have blocked the live 20:02 sniper entry | A-9, E7 |
-| L-21 | Trouble ahead: no fresh HTF zone within 0.8 × the TP1 distance (T25); FTA < 3R = management level (G2); TP1 = nearest level (OM, V14) | Needs evidence | E4. 6.20: the monitor manages at the obstacle (owner); K11 names the FTA |
+| L-21 | Trouble ahead: no fresh HTF zone within 0.8 × the TP1 distance (T25); FTA < 3R = management level (G2); TP1 = nearest level (OM, V14) | Needs evidence | E4. 6.20: the monitor manages at the obstacle (owner). An FTA line is prepared in skill 6.20.1, not installed |
 | L-22 | Close early when 3 PD arrays break between entry and SL (V14) | Open proposal | the prompt does not say which arrays or timeframe; needs a definition and replays |
 | L-23 | Time exits near London close / late NY; macros (G2) | Open proposal | no evidence |
-| L-24 | DOL tie-break hierarchy D1 > H4 > H1 > internal; 3-day PDH/PDL as external liquidity (G1v5) | Added to K11 (6.20) | analysis only |
-| L-25 | A stop never inside a clear liquidity pool (G2: reject; K11 had both "never" and a −2 score) | Made consistent in K11 (6.20): repair, else NO TRADE | analysis only |
+| L-24 | DOL tie-break hierarchy D1 > H4 > H1 > internal; 3-day PDH/PDL as external liquidity (G1v5) | Prepared in skill 6.20.1, not installed | analysis only |
+| L-25 | A stop never inside a clear liquidity pool (G2: reject; K11 had both "never" and a −2 score) | Prepared in skill 6.20.1 (repair, else NO TRADE), not installed | analysis only |
 | L-26 | Short pending life: 8 entry-TF candles (T25), no-fill time decay (G2) | Unchanged | analysis parameter (`expiration_minutes`) |
 
 ### Evidence
@@ -296,12 +296,14 @@ The sign flips with the timeframes counted, so there is no usable signal yet.
   L-22 and C-1 can then be decided on replays of real setups instead of on 7
   trades.
 
-**Skill:**
-- DOL tie-break and the 3-day PDH/PDL (L-24).
-- Zone validity: a zone a body has closed through is not selected (L-19,
-  analysis side).
-- Stops clear of liquidity pools (L-25).
-- The FTA is named as a management level (L-21).
-- The monitor's obstacle handling is described.
+**Skill.** Gemini keeps the 6.19 analysis: the owner did not install 6.20,
+and it produced the 20:02 sniper entry.
+- **6.19.1** (the recommended update) is 6.19 with one change: the
+  description of the monitor's new obstacle handling (§7.6 and the Telegram
+  steps). The analysis is identical.
+- **6.20.1** (prepared, not installed) adds L-19 zone validity, L-21 FTA,
+  L-24 DOL tie-break and the 3-day highs/lows, and L-25 stops clear of
+  pools. These change which setups Gemini publishes, so they wait for the
+  owner and for replays.
 
 **Kept, owner 28 Oct:** no zone-invalidation rule in the monitor.
