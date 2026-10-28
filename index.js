@@ -1,5 +1,5 @@
 /**
- * Watch Monitor MCP — v6.19
+ * Watch Monitor MCP — v6.20
  *
  * A market-data-only MCP server that monitors ICT sniper setups to a
  * deterministic conclusion, and notifies a human. It never places,
@@ -184,7 +184,7 @@ const CONFIG = {
 // wall-clock constant: on Vercel a tick only arrives once a minute.
 const SERVERLESS = Boolean(process.env.VERCEL) || process.env.SERVERLESS === "true";
 CONFIG.staleBudgetMs = Math.max(SERVERLESS ? 180_000 : 120_000, CONFIG.setupIntervalMs * 8);
-const VERSION = "6.19.0";
+const VERSION = "6.20.0";
 
 function log(message, ...args) {
   console.error(`[watch-monitor] ${message}`, ...args);
@@ -669,6 +669,9 @@ const LOCK_KEY = "watch-monitor:lock";
 // snapshot every tick reads and writes holds only the live watches: the
 // Upstash free tier allows 10 GB of traffic a month.
 const RESOLVED_KEY = "watch-monitor:resolved";
+// One replay fixture per resolved setup (engine.captureReplay), 30 days.
+const REPLAY_PREFIX = "watch-monitor:replay:";
+const REPLAY_TTL_S = 30 * 86_400;
 
 async function withState(fn, { tick = false } = {}) {
   if (!SERVERLESS) return fn();
@@ -711,7 +714,8 @@ async function withState(fn, { tick = false } = {}) {
     const result = await fn();
 
     await notifier.drain();
-    for (const record of [...legacyResolved, ...store.takeResolved()]) {
+    const resolvedNow = store.takeResolved();
+    for (const record of [...legacyResolved, ...resolvedNow]) {
       await kv.push(RESOLVED_KEY, record, CONFIG.resolvedLimit);
     }
     await kv.set(
@@ -724,6 +728,17 @@ async function withState(fn, { tick = false } = {}) {
         lastTickAt: tick ? Date.now() : parsed?.lastTickAt ?? null,
       }),
     );
+    // The candles of each setup this request resolved, for replays: best
+    // effort, after the state is saved, at most 12 s each.
+    for (const record of resolvedNow.filter((item) => item.status !== "CANCELLED")) {
+      try {
+        const fixture = await Promise.race([engine.captureReplay(record, { version: VERSION }), sleep(12_000, null, { ref: false })]);
+        if (fixture) await kv.set(`${REPLAY_PREFIX}${record.id}`, fixture, { ttlSeconds: REPLAY_TTL_S });
+        else log(`replay for ${record.id} not captured (no candles in time)`);
+      } catch (error) {
+        log(`replay for ${record.id} not captured: ${error.message}`);
+      }
+    }
     return result;
   } finally {
     await release();
@@ -737,7 +752,7 @@ const CUSTOM_TOOLS = [
   {
     name: "register_watch",
     description:
-      "Registers a trading setup (contract setup/1) for live validation. The monitor confirms it on live data — price reaches the zone, then live acceptance beyond the entry plus at least one of CISD (M1), SMT divergence (M5), an M5 / M1 engulfing or an M5 rejection, held over a new closed M1 candle — and sends ENTER NOW on Telegram with the registered SL and TPs, only when R:R to TP1 at market is ≥ 1, news and spread are clear and the quote is fresh (no session filter). Then it follows the trade: TP alerts, SL to breakeven after TP1, CLOSE NOW where price turns back or an M5–H4 zone in the way holds. The answer carries `monitor_line`, the monitor's own one-line statement of what it will check with this setup's prices — print it verbatim — and `warnings`. A malformed setup is refused with the broken rule. Never places an order.",
+      "Registers a trading setup (contract setup/1) for live validation. The monitor confirms it on live data — price reaches the zone, then live acceptance beyond the entry plus at least one of CISD (M1), SMT divergence (M5), an M5 / M1 engulfing or an M5 rejection, held over a new closed M1 candle — and sends ENTER NOW on Telegram with the registered SL and TPs, only when R:R to TP1 at market is ≥ 1, news and spread are clear and the quote is fresh (no session filter). Then it follows the trade: TP alerts, SL to breakeven after TP1, CLOSE NOW where price turns back, and close part + SL to breakeven where an M5–H4 zone in the way holds. The answer carries `monitor_line`, the monitor's own one-line statement of what it will check with this setup's prices — print it verbatim — and `warnings`. A malformed setup is refused with the broken rule. Never places an order.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -815,12 +830,13 @@ const CUSTOM_TOOLS = [
   {
     name: "list_watches",
     description:
-      "Returns active setup watches (each with `waiting_for`: the condition it waits on, with prices), quarantined watches, bounded recent outcomes with their real status, entry model and zone, and the monitor's own health (thresholds in force, restart recovery, undelivered notifications, feed quality). With `watch_id`: that one watch, active or recently resolved, in full with its decision `history`.",
+      "Returns active setup watches (each with `waiting_for`: the condition it waits on, with prices), quarantined watches, bounded recent outcomes with their real status, entry model and zone, and the monitor's own health (thresholds in force, restart recovery, undelivered notifications, feed quality). With `watch_id`: that one watch, active or recently resolved, in full with its decision `history`; add `replay: true` for the candles it was decided on (a test/replay.mjs fixture, kept 30 days; audits only, the analysis does not need it).",
     inputSchema: {
       type: "object",
       additionalProperties: false,
       properties: {
         watch_id: { type: "string", description: "Optional: one watch, active or recently resolved, in full with its decision history." },
+        replay: { type: "boolean", description: "With watch_id: also return the recorded candles of a resolved watch, as a replay fixture." },
       },
     },
     annotations: { readOnlyHint: true, openWorldHint: false },
@@ -986,7 +1002,9 @@ async function handleCustomTool(name, args = {}) {
       const watchId = String(args.watch_id).trim();
       const active = store.get(watchId);
       const found = active ? shown(active) : recent.find((record) => record.id === watchId);
-      return textResult(found ? { watch: found } : { status: "NOT_FOUND", watch_id: watchId });
+      if (!found) return textResult({ status: "NOT_FOUND", watch_id: watchId });
+      const replay = args.replay === true && SERVERLESS && kv ? await kv.get(`${REPLAY_PREFIX}${watchId}`) : undefined;
+      return textResult(args.replay === true ? { watch: found, replay: replay ?? null } : { watch: found });
     }
     return textResult({
       active: store.active().map(shown),

@@ -4,7 +4,7 @@ What the analysis (Gemini, skill `ict-sniper-v11`) sends to `register_watch`,
 what the monitor checks for it, and what it promises back. The code is the
 authority: `lib/core.mjs validateWatchInput`, `lib/engine.mjs`
 (`register`, `validationPlan`, `tickSetupWatch`). This file describes
-monitor 6.19.0, confirmation rules `v6.0-acceptance`.
+monitor 6.20.0, confirmation rules `v6.0-acceptance/strict-engulfing`.
 
 Every watch stores the contract and rule versions it was armed under
 (`contract`, `rules`), so a later rule change can tell old watches from new.
@@ -56,7 +56,7 @@ A malformed setup is refused with the broken rule, never repaired:
   "watch_id": "XAUUSD_1793198887317_1ee06516",
   "lifecycle": "ARMED",
   "contract": "setup/1",
-  "rules": "v6.0-acceptance",
+  "rules": "v6.0-acceptance/strict-engulfing",
   "expires_at": "2026-10-28T18:48:07.317Z",
   "monitor_line": "Touch bid ≥ 4044.88 → ENTER NOW after live acceptance (≤ 4044.03 at most) + one of …",
   "plan": { "touch": "…", "confirmation": "…", "blocks": ["…"], "invalidation": "…",
@@ -122,7 +122,8 @@ setup waits on a gate), safety first.
   - CISD on M1 (strong);
   - SMT divergence on M5 against the partners (XAUUSD: XAGUSD, EURUSD inverted);
   - an M5 engulfing;
-  - an M1 engulfing;
+  - an M1 engulfing — in both, the bar before is the opposite colour and
+    its body is swallowed (6.20; v6.0 also counted a same-colour bar);
   - an M5 rejection wick.
 - Each piece must hold for `MIN_CONFIRMATION_HOLD_MS` and survive into a
   new closed M1 bar. The coded default is 50 s on Vercel; production
@@ -163,10 +164,10 @@ while the evidence still holds.
 
 | Event | Rule | Message / result |
 |---|---|---|
-| Stop | The protective side touches the SL | `❌ SL HIT` (LOSS), or `⚪ STOPPED AT BREAKEVEN` after TP1 |
+| Stop | The protective side touches the SL | `❌ SL HIT` (LOSS), or `⚪ STOPPED AT BREAKEVEN` once the SL is at the entry (after TP1 or a held obstacle) |
 | Targets | Mid reaches the next target | `🎯 TPn HIT`; after TP1, close 50–80% and move the SL to the entry. The last target sends `🏁 FINAL TARGET HIT — CLOSE ALL`. |
 | Reversal | After 1R in favour, an M5 CISD against the trade | `🔴 CLOSE NOW — PRICE TURNED BACK` |
-| Obstacles | Price at an M5–H4 zone in the way: `⚠️ PRICE AT …`. An M5 engulfing or rejection off that zone closes the trade; a close through it on the zone's own timeframe sends `✅ … BROKEN` and the trade goes on. | `🔴 CLOSE NOW — <TF> <ZONE> HELD` |
+| Obstacles | Price at an M5–H4 zone in the way: `⚠️ PRICE AT …`. An M5 engulfing or rejection off that zone holds it: close part and move the SL to breakeven (if the trade is in profit); the trade stays open. Zones reached together count once. A close through it on the zone's own timeframe sends `✅ … BROKEN` and the trade goes on. (6.20, owner's decision; until 6.19 a held zone closed the trade.) | `⚠️ <TF> <ZONE> HELD — CLOSE PART` |
 
 Every watch message ends with its UTC time and the watch id's last 8
 characters.
@@ -194,6 +195,9 @@ characters.
     returns one watch, active or resolved, with its history; the plain
     `list_watches` leaves the history of resolved records out to stay
     small.
+  - Every resolved setup (cancelled ones aside) also keeps the candles it
+    was decided on, as a `test/replay.mjs` fixture, for 30 days:
+    `list_watches { watch_id, replay: true }`.
   - `list_watches` gives every active watch a `waiting_for` line with the
     missing condition and its price.
 
@@ -204,7 +208,7 @@ characters.
   - A new optional field that changes nothing for existing callers does not
     bump it.
   - The monitor refuses a contract it does not read, rather than guessing.
-- **`rules`** (`v6.0-acceptance`) names the confirmation rules. Changing
+- **`rules`** (`v6.0-acceptance/strict-engulfing` since 6.20; `v6.0-acceptance` in 6.19) names the confirmation rules. Changing
   them changes this name and `docs/requirements.md` together.
   - Watches already armed keep the name they were armed under, so the audit
     trail says which rules decided.

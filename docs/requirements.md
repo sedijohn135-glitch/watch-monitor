@@ -1,6 +1,6 @@
 # Requirements, diagnosis and decisions
 
-Status as of 28 Oct 2026, monitor v6.18.1 → v6.19.0. This file tells which
+Status as of 28 Oct 2026, monitor v6.18.1 → v6.19.0 → v6.20.0. This file tells which
 rules are the system's own, where each comes from, what the deployed code
 does, and what is still open. Each requirement has an ID.
 
@@ -15,6 +15,7 @@ does, and what is still open. Each requirement has an ID.
 | U | The owner's decisions in chat (dated) |
 | G | Git history of this repository |
 | L | Live evidence: `list_watches` records, the request log, `/health` |
+| T25 · O26 · G1v3 · G2 · RS · RW · OM · V14 · G1v5 | The owner's earlier prompts and research, uploaded 28 Oct; audited in §7 |
 
 ---
 
@@ -60,7 +61,7 @@ entry, or can stop monitoring; **M** degrades timeliness or auditability;
 | A-6 | H | **Contract mismatch on `sweep_level`.** K11, V11 r17, S6 r15 and the snapshot's `rule` text say the liquidity must be taken before entry, and Gemini's MONITOR line promises "waiting for sweep / M5 CISD". Since 6.18.0 the monitor does not wait for it. | K11 §7; Gemini output of 28 Oct 14:42; `index.js` snapshot `rule`. | Open decision (§4 C-1). Meanwhile the contract states exactly what the monitor checks, registration echoes it (`setup-contract.md`), and the refusal for a missing `sweep_level` no longer says "no liquidity taken, no trade". |
 | A-7 | M | **Target order not validated.** `tp2`/`tp3` only had to be beyond the entry, so TP2 < TP1 for a buy was accepted and trade management would hit targets out of order. | `validateWatchInput` | 6.19: rejected with a diagnosable error. |
 | A-8 | — | Property, not a defect: a retroactive touch (A-1 fix) followed by acceptance can send ENTER NOW below a sell zone or above a buy zone. That is v6.0 acceptance by design ("price back beyond the entry"); R:R ≥ 1 at market still blocks a chase. | 28 Oct: ENTER NOW 15:16 at 4043.33, zone 4044.98–4046.66. | Documented. |
-| A-9 | M | **Loose engulfing (v6.0 as uploaded).** `classifyEngulfing` checks only that the bar has the trade's colour, opens beyond the previous close and closes beyond the previous open. The previous bar's colour and the body sizes are not checked, so a small continuation bar inside the previous body counts as a "soft engulfing". Trade management (`candleSignal`) uses the strict definition: opposite colours and a larger body. | Replay of 28 Oct: the M1 bar 15:04 (4043.08 → 4042.79, body 0.29) after the bearish 15:03 bar (4043.45 → 4043.04, body 0.41) counted as an M1 engulfing and was one of the two price patterns behind ENTER NOW 15:06. | Not changed: it is the v6.0 rule the owner chose, and tightening it changes live entries. Proposal §5.6. |
+| A-9 | M | **Loose engulfing (v6.0 as uploaded).** `classifyEngulfing` checks only that the bar has the trade's colour, opens beyond the previous close and closes beyond the previous open. The previous bar's colour and the body sizes are not checked, so a small continuation bar inside the previous body counts as a "soft engulfing". Trade management (`candleSignal`) uses the strict definition: opposite colours and a larger body. | Replay of 28 Oct: the M1 bar 15:04 (4043.08 → 4042.79, body 0.29) after the bearish 15:03 bar (4043.45 → 4043.04, body 0.41) counted as an M1 engulfing and was one of the two price patterns behind ENTER NOW 15:06. | **6.20, owner's decision (28 Oct): strict.** The bar engulfed must be an opposite candle, as in the owner's own definition (OM §5) and in the exits. |
 
 ### B. Reliability and infrastructure
 
@@ -81,7 +82,7 @@ entry, or can stop monitoring; **M** degrades timeliness or auditability;
 |---|---|---|---|
 | C-1 | H | K11 §7 still describes the 6.16 flow (CISD retrace, M5 hold, sweep gate, 🟡 CISD CONFIRMED). Gemini repeats it to the owner, who then expects events the monitor never sends. | Skill updated to the real rules. The MONITOR line now prints the monitor's own acknowledgement verbatim. |
 | C-2 | M | Registration answered only `WATCHING` and an id: nothing said what would be checked, against which thresholds, or until when. | 6.19: `register_watch` returns the contract version and the validation plan with concrete prices, plus warnings (ignored fields, an opposite active watch, an old analysis). |
-| C-3 | L | No contract version on a watch: a future rule change could not tell old watches from new. | 6.19: every watch stores `contract: "setup/1"` and `rules: "v6.0-acceptance"`. |
+| C-3 | L | No contract version on a watch: a future rule change could not tell old watches from new. | 6.19: every watch stores `contract: "setup/1"` and `rules` (`v6.0-acceptance`; `v6.0-acceptance/strict-engulfing` from 6.20). |
 
 ### D. Observability
 
@@ -123,37 +124,166 @@ Recommendation: keep the v6.0 confirmation for at least 20 entered setups before
 
 | ID | Contradiction | What runs today | Needs |
 |---|---|---|---|
-| C-1 | **The sweep.** The analysis rules (S6 r15, V11 r17 "Before every bearish entry → confirm BSL has been taken", K11 r6) require the opposing liquidity taken before entry. The monitor (6.18+) does not wait for it. | ENTER NOW without the sweep, as the owner chose on 28 Oct. | Owner's decision: keep it, or make the sweep a requirement again (globally, or per setup with a `require_sweep` field). |
+| C-1 | **The sweep.** The analysis rules (S6 r15, V11 r17 "Before every bearish entry → confirm BSL has been taken", K11 r6, G2 State 1, T25) require the opposing liquidity taken before entry; V14 only lowers confidence without it. The monitor (6.18+) does not wait for it. | ENTER NOW without the sweep, as the owner chose on 28 Oct. | **Evidence (§7 E1): a sweep gate would have changed none of the 18 recorded setups.** No change; revisit only if a replay shows a case. |
 | C-2 | **Invalidation basis.** V11 and K11 say "if price *closes* beyond the level". The monitor fails the watch on a *touch* of the protective quote. | Touch (stricter). Normally invalidation = SL, so the touch is the stop. | Documented in the contract. A close-based pre-entry invalidation would be a new rule. |
 | C-3 | **News after-window.** ±15 min is symmetric. An FOMC press conference runs about an hour. | ±15 min, the S6/M6 default. | Owner's decision: a longer after-window for speeches and press conferences. |
-| C-4 | **Management.** S6 risk §7: at TP1 close 50–80% and move to BE; time stop 4 h; exit on an M5 close past CE. The monitor: BE after TP1, CLOSE NOW on a CISD against the trade after 1R, and CLOSE NOW when an obstacle holds. | Monitor rules. | Owner's decision whether to keep obstacle exits (2 of 2 so far closed near BE: +0.24R, +0.02R). |
+| C-4 | **Management.** S6 risk §7: at TP1 close 50–80% and move to BE; time stop 4 h; exit on an M5 close past CE. The monitor: BE after TP1, CLOSE NOW on a CISD against the trade after 1R, and CLOSE NOW when an obstacle holds. | Monitor rules. | **Resolved, owner 28 Oct (6.20): an obstacle that holds is managed, not exited** — close part, SL to breakeven, the trade stays open (G2's First Trouble Area as a management level). |
 | C-5 | **Minimum R:R.** The analysis requires ≥ 1:2 (S6 r20, V11, K11). The monitor rejects < 1R at registration and blocks ENTER NOW below 1R at market. | Both apply; not contradictory, but a 1.5R setup passes the monitor. | None; documented. |
 
 ## 5. Proposals that need evidence or approval (not implemented)
 
-1. **C-1 sweep gate.** Per-setup `require_sweep` (default off, today's behaviour), so a setup whose thesis needs the raid can say so and the monitor enforces it.
+1. **C-1 sweep gate.** Per-setup `require_sweep` (default off, today's behaviour). The 18 recorded setups give no case where it would matter (§7 E1); not worth its code until a replay shows one.
 2. **C-3 news.** `NEWS_BLACKOUT_AFTER_MIN` for speeches and press conferences (e.g. 60), configurable.
-3. **C-4 obstacle exits.** Keep, or turn into a warning only.
+3. **C-4 obstacle exits.** Done in 6.20 (owner's decision): warning only.
 4. **Infrastructure.** If the Vercel usage page shows provisioned memory or active CPU above 50% of the Hobby limit, or Upstash shows bandwidth above 50%, move to the paid tiers (Vercel Pro $20/month, Upstash pay-as-you-go). The owner has to read these numbers; this session has no access to the Vercel dashboard.
 5. **`MIN_CONFIRMATION_HOLD_MS` = 5000 in Vercel** (verified). The v6.0 value is 60 000, and 50 000 is the coded Vercel default. With once-a-minute ticks the difference is at most one tick: the new-M1-candle rule already spaces graduation a bar apart, and the 28 Oct replay enters at 15:06:06 with 5, 50 or 60 s alike. Keep it, or delete the variable in Vercel → Settings → Environment Variables to return to 50 s. The owner's decision.
-6. **A-9 engulfing.** Use the strict definition for entries too (the previous bar of the opposite colour, the current body larger and swallowing it), as trade management already does. It would remove the 15:04 "engulfing" of the replay; a replay with the strict definition still sends ENTER NOW at 15:06:06, on the M5 rejection wick alone. Needs the owner's approval: it changes which entries fire.
+6. **A-9 engulfing.** Done in 6.20 (owner's decision): strict. The replay still sends ENTER NOW at 15:06:06, on the M5 rejection wick alone.
 7. **B-2 fast mode bound.** Fast mode only for the first 20 min of a gate hold, and none in a trade. TP / SL alerts would then come with the once-a-minute tick, up to ~45 s later; CLOSE NOW decisions, read on M5 closes, would not be delayed. Worth it only if the Vercel usage page shows provisioned memory above about half of 360 GB-h.
 
-## 6. Verification of 6.19
+## 6. Verification of 6.19 and 6.20
 
 | Check | Command | Result |
 |---|---|---|
-| Unit tests, v6.0 evidence functions and validation | `npm test` (`test/adversarial.test.mjs`, 65) | pass |
-| Lifecycle tests on a fake clock (`test/harness.mjs`): long, short, touch without acceptance, acceptance without a technical signal, fade, SL before confirmation, same-tick race, wick through the SL, TP1 before the touch, expiry, news, R:R chase, stale quote, stale candles, abnormal spread, quarantine, no quote, wick-only touch, restart, duplicate, two watches, cancel, plan, contract, TP1 → breakeven, Telegram order, LATE prefix | `npm test` (`test/engine.test.mjs`, 28) | pass |
+| Unit tests, v6.0 evidence functions and validation, strict engulfing | `npm test` (`test/adversarial.test.mjs`, 66) | pass |
+| Lifecycle tests on a fake clock (`test/harness.mjs`): long, short, touch without acceptance, acceptance without a technical signal, fade, SL before confirmation, same-tick race, wick through the SL, TP1 before the touch, expiry, news, R:R chase, stale quote, stale candles, abnormal spread, quarantine, no quote, wick-only touch, restart, duplicate, two watches, cancel, plan, contract, TP1 → breakeven, Telegram order, LATE prefix | `npm test` (`test/engine.test.mjs`, 29) | pass |
+| Replay capture: a resolved setup's candles, replayed, give the same ENTER NOW | `npm test` (1) | pass |
 | Historical replay, 28 Oct XAUUSD sell (`test/fixtures/xauusd-2026-10-28-sell.json`, real cTrader candles) | `npm test` (1), `npm run replay -- test/fixtures/xauusd-2026-10-28-sell.json` | pass |
-| End to end: HTTP, OAuth, MCP tools, Redis, `/tick`, fake Telegram, restart | `npm run smoke` | 83 checks pass |
+| End to end: HTTP, OAuth, MCP tools, Redis, `/tick`, fake Telegram, restart, replay capture | `npm run smoke` | 86 checks pass |
 
 Replay against what happened live:
 
-| | Live (6.18.0 → 6.18.1) | Replay (6.19.0) |
+| | Live (6.18.0 → 6.18.1) | Replay (6.19.0; 6.20.0 where it differs) |
 |---|---|---|
 | Touch (15:00 M1 wick to 4045.11) | missed by 6.18.0; seen 15:10:20 after the 6.18.1 deploy | 15:01:06, the first tick after the bar closed |
-| ENTER NOW | 15:16:07 at 4043.33, R:R 2.03 | 15:06:06 at 4043.91, R:R 2.28; evidence: M1 engulfing (soft) 15:04 + M5 rejection wick (soft) 15:00, acceptance mid 4043.02 ≤ 4044.03 |
-| Exit | 15:35:27 CLOSE NOW, M15 demand held, +0.02R | 15:35:06 CLOSE NOW, M15 demand held, +0.03R |
+| ENTER NOW | 15:16:07 at 4043.33, R:R 2.03 | 15:06:06 at 4043.91, R:R 2.28; evidence: M1 engulfing (soft) 15:04 + M5 rejection wick (soft) 15:00, acceptance mid 4043.02 ≤ 4044.03. 6.20: the same, on the M5 rejection wick alone (the 15:04 bar no longer counts as an engulfing) |
+| Exit | 15:35:27 CLOSE NOW, M15 demand held, +0.02R | 6.19: 15:35:06 CLOSE NOW, +0.03R. 6.20: 15:35:06 "M15 DEMAND HELD — CLOSE PART" (part off at +0.03R, SL to breakeven), 15:39:06 stopped at breakeven |
 
 What a replay cannot show: the quote at each tick (the open of the minute stands in for it), fast-mode checks between ticks, and Telegram delivery. One recorded setup is a regression check, not evidence that the rules make money.
+
+## 7. Legacy prompts — audit (28 Oct, second batch)
+
+Nine more files from the owner, read in full. Dates come from the file names.
+
+| Tag | File | Date | What it is |
+|---|---|---|---|
+| T25 | `trap_prompt_gpt5` | 2025-11-24 | "Alpha Hunter": Mapper v2 + Executor v2, trap taxonomy, screenshots |
+| O26 | `Old_sniper_prompt` | 2026-01-08 | One setup in JSON: SMC core, sweeps, classical patterns |
+| G1v3 | `mapuesi2` | 2026-04-27 | GEM 1, Structure Mapper v3: HTF map, DOL, PD-array scoring |
+| G2 | `ekzekutuesi2` | 2026-04-27 | GEM 2, Executor: P1–P4 Iron Gate, fiduciary SL, TP and pay-the-trader |
+| RS | `raporti_i_sl_dhe_ict` | 2026-04-29 | Research: gold sweep depths, ATR-based stops, ICT model backtests |
+| RW | `sniper_entry_raporti` | 2026-05-01 | Research: wick entries, CE, refinement, XAU/BTC specifics |
+| OM | `Omisoion` | 2026-06-01 | One setup in JSON: models, refinement, TP hierarchy, cancellation |
+| V14 | `v14md` | 2026-06-15 | Analysis prompt: Kurthi engine, viability check, NO TRADE filter |
+| G1v5 | `Notes` | 2026-06-20 | GEM 1, Mapper v5.4: observability, DOL tie-break, zone validity |
+
+**Architecture.** The current system is the same GEM 1 → GEM 2 split, on live
+data:
+
+- The Gemini skill K11 is GEM 1 plus the setup (V11/V14 analysis).
+- The monitor is GEM 2, reading cTrader instead of screenshots.
+- So G2 is the closest original specification of the monitor's job.
+- V14, OM, O26 and T25 do both jobs in one prompt.
+
+### Rules matrix
+
+| ID | Rule (source) | Status | Where / why |
+|---|---|---|---|
+| L-1 | One setup; NO TRADE when unclear; no invented level (all) | ✅ in the system | K11 §5, §10 |
+| L-2 | Entry only after LTF confirmation, never before it (V14, G2, OM, O26) | ✅ | monitor confirmation |
+| L-3 | SL beyond the sweep wick or zone, plus a buffer (T25 ≥ 3 ticks; G2 spread; RW 2–5 pips; RS ATR × 1.5–2) | ✅ | K11 STOP: + max(0.5 × ATR_M5, 2 × spread) |
+| L-4 | R:R ≥ 1:2 (V11, V14) | ✅ | K11; monitor ≥ 1 at market (C-5) |
+| L-5 | Pay the trader at TP1: close 50–80%, SL to BE only after TP1 (G2, OM) | ✅ | monitor TP alerts, in G2's own words |
+| L-6 | Avoid news; check the spread (V14, RW) | ✅ | news gate ±15 min; spread gate |
+| L-7 | PD-array hierarchy, breaker precedence, 3-candle swings, CE, entry models (V11, V14) | ✅ | K11 playbook |
+| L-8 | Kill zones, NY Lunch, time distortion as NO TRADE (V14, V11, G1v3, G2 time gate) | Superseded | U 23 Oct: time is context and score only |
+| L-9 | Body-close acceptance (P4) and the raid → MSS → FVG → retest sequence (G2, T25, OM) | Superseded | U 28 Oct: v6.0 live acceptance in the monitor |
+| L-10 | Screenshots, OCR, price-line exclusion, `user_time_v0` (all prompts) | Superseded | live data: `get_market_snapshot`, `session.ny_time` |
+| L-11 | Confidence percentages (V14) | Superseded | G1v5 removed them itself (observability rule); K11 uses a checklist score |
+| L-12 | Position sizing, lot formulas (RS, RW) | Excluded | owner's rule: no money management |
+| L-13 | BTC funding rate, liquidation heatmaps (RW) | Not available | no data source |
+| L-14 | Gold SL at most 10 pips ($1.00), TP1 ≥ 15 pips (V14 viability) | Conflict; not adopted | RS and RW: gold stops under $1.5–2 do not survive noise; live SLs were $5–8; K11 needs ≥ 1 × ATR_M5 |
+| L-15 | TP1 ≥ 3R (G2) vs 1:2 (V14) | Resolved by the later source | K11: 2R |
+| L-16 | Bias label "DOL above → sell" (G1v5) vs trade toward the draw (G1v3, V11, K11) | Contradiction inside the legacy set | G1v5 says its label is not a trade direction; K11 keeps "trade toward the draw" |
+| L-17 | Sweep before entry (V11 §5.8, G2 State 1, T25) vs a lower score only (V14) | Resolved with evidence | E1, C-1 |
+| L-18 | Keep a setup whose TP1 printed before entry unless a body closes beyond TP2/TP3 (OM) vs TP1 consumed = dead (V14, S6) | Current rule kept | E2 |
+| L-19 | Zone invalidated by a body close beyond it (T25, OM, G1v5 `invalid_if`, G2 `anchor_not_defended`, RW) | Owner, 28 Oct: **not** in the monitor (v6.0 kept). Analysis side, K11 6.20: a zone already closed through is not selected (G1v5 zone validity) | E3 |
+| L-20 | Engulfing = the body swallows the previous opposite candle's body (OM) | Implemented in 6.20 (owner) | A-9 |
+| L-21 | Trouble ahead: no fresh HTF zone within 0.8 × the TP1 distance (T25); FTA < 3R = management level (G2); TP1 = nearest level (OM, V14) | Needs evidence | E4. 6.20: the monitor manages at the obstacle (owner); K11 names the FTA |
+| L-22 | Close early when 3 PD arrays break between entry and SL (V14) | Open proposal | the prompt does not say which arrays or timeframe; needs a definition and replays |
+| L-23 | Time exits near London close / late NY; macros (G2) | Open proposal | no evidence |
+| L-24 | DOL tie-break hierarchy D1 > H4 > H1 > internal; 3-day PDH/PDL as external liquidity (G1v5) | Added to K11 (6.20) | analysis only |
+| L-25 | A stop never inside a clear liquidity pool (G2: reject; K11 had both "never" and a −2 score) | Made consistent in K11 (6.20): repair, else NO TRADE | analysis only |
+| L-26 | Short pending life: 8 entry-TF candles (T25), no-fill time decay (G2) | Unchanged | analysis parameter (`expiration_minutes`) |
+
+### Evidence
+
+**Data used:**
+
+- the 18 production records from `list_watches`;
+- the 28 Oct M1 fixture;
+- `get_market_snapshot` candles: M5 back to 28 Oct 01:55, M15 to 26 Oct 14:30, H1 to 22 Oct 10:00.
+
+**Data not available:** older M1 history. cTrader's `get_trendbars` is not
+exposed to the session, and the public feeds refused (HTTP 429 and 451).
+
+**E1 — sweep gate (C-1).**
+- 7 setups had already swept (Model A).
+- 6 had the sweep level between price and the zone, so the touch itself takes it.
+- Of the other 5, 2 were never touched and 3 printed the sweep at or before the touch.
+- A gate changes none of the 18.
+
+**E2 — keeping a setup after TP1 printed first (L-18).**
+- #3, 28 Oct buy: back in the zone at 14:25, then SL at 16:00. A loss.
+- #6, 26 Oct buy: back in the zone at 19:00, then TP1 the next day at 04:15.
+- #15 and #18: undecidable on H1 candles.
+- Mixed, so the current rule stays.
+
+**E3 — zone closed through (L-19).**
+- #1, 28 Oct sell: no close through before the entry.
+- #2, 28 Oct buy: an M5 close under the zone at 13:30, after its 13:11 entry.
+- #5, 27 Oct sell: no M15 close above the zone before the loss.
+- The rule changes none of the three.
+
+**E4 — an obstacle within 0.8 × the TP1 distance (L-21),** on the 7 entries
+with obstacle data:
+
+| Timeframes counted | Within 0.8× | Not within |
+|---|---|---|
+| Any M5–H4 zone | 6 entries, −3.74R | 1 entry, −1R |
+| H1/H4 only (T25's "HTF zone") | 3 entries, −0.74R | 4 entries, −4R |
+
+The sign flips with the timeframes counted, so there is no usable signal yet.
+
+**E5 — the obstacle exit (C-4),** 28 Oct sell:
+- The exit at 15:35 made +0.02R.
+- Held instead, TP1 4028.09 printed in the 18:30 FOMC M5 bar. That bar's high
+  was 4050.52, $0.33 under the 4050.85 stop on the bid; the ask is higher by
+  the spread.
+- Undecidable.
+
+**E6 — where the losses came from.**
+- #2 and #5 would have hit their registered stops before TP1 under any
+  confirmation (14:05 and 12:30).
+- The v6.1 entry of 23 Oct (#16) hit its stop at 09:00.
+- The zones failed, and no confirmation rule rescues a failed zone. The
+  leverage is in zone selection (the analysis) and in evidence.
+
+### What 6.20 changes because of this audit
+
+**Monitor:**
+- Strict engulfing (L-20).
+- An obstacle that holds is managed, not exited (C-4).
+- Every resolved setup, cancelled ones aside, stores its candles as a replay
+  fixture for 30 days (`list_watches { watch_id, replay: true }`). L-19, L-21,
+  L-22 and C-1 can then be decided on replays of real setups instead of on 7
+  trades.
+
+**Skill:**
+- DOL tie-break and the 3-day PDH/PDL (L-24).
+- Zone validity: a zone a body has closed through is not selected (L-19,
+  analysis side).
+- Stops clear of liquidity pools (L-25).
+- The FTA is named as a management level (L-21).
+- The monitor's obstacle handling and strict engulfing are described.
+
+**Kept, owner 28 Oct:** no zone-invalidation rule in the monitor.

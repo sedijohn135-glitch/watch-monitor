@@ -1,7 +1,7 @@
 # Operations
 
 How the deployed monitor runs, what can stop it, how to notice and how to
-recover. Monitor 6.19.0 on Vercel (Hobby), state in Upstash Redis.
+recover. Monitor 6.20.0 on Vercel (Hobby), state in Upstash Redis.
 
 ## 1. Architecture
 
@@ -30,7 +30,7 @@ cron-job.org ── GET /tick?token=… every minute ──▶ Vercel function
 | Service | Plan | Limit | What happens over it | This monitor's use |
 |---|---|---|---|---|
 | Vercel | Hobby | 4 CPU-h active CPU, 360 GB-h provisioned memory, 1M invocations a month; 300 s per invocation | The project is paused for up to 30 days | ~43,200 ticks a month, plus fast mode: ~1.7 GB-h per hot hour (2 GB function) |
-| Upstash Redis | Free | 500K commands, 10 GB bandwidth a month, 10 MB per request | Redis stops answering; ticks fail with `storage_error` | 4 commands a tick (lock, read, write, unlock), about 200K a month, plus fast mode. The state holds active watches only; resolved records go to their own list. |
+| Upstash Redis | Free | 500K commands, 10 GB bandwidth a month, 10 MB per request | Redis stops answering; ticks fail with `storage_error` | 4 commands a tick (lock, read, write, unlock), about 200K a month, plus fast mode. The state holds active watches only; resolved records go to their own list. Replays: one key per resolved setup, 10–130 KB, 30 days (a few MB of the 256 MB). |
 | cron-job.org | Free | 30 s request timeout | The job is marked failed; after repeated failures it can be disabled | 1 request a minute |
 | Telegram | Bot API | about 1 message a second to one chat | 429; the outbox backs off and retries in order | a few messages per watch |
 
@@ -70,7 +70,33 @@ Inside the system:
 - **`/debug/requests`** (token): the last 50 MCP calls. Use it to see
   whether Gemini actually called `get_market_snapshot` / `register_watch`.
 
-## 4. Deploy and verify
+## 4. Replays: deciding rule changes on real setups
+
+Every setup that resolves stores the candles it was decided on, unless it was
+cancelled:
+
+- **What is stored:**
+  - M1 from 90 minutes before registration to the resolution;
+  - M5, M15, M30, H1 and H4 with the history a tick reads;
+  - the SMT partners' M5;
+  - the registration arguments;
+  - what the monitor did.
+- **Where:** Redis `watch-monitor:replay:<id>`, for 30 days. The format is
+  the `test/fixtures` one. The capture runs after the state is saved, and at
+  most 12 s per setup; a failure is only logged.
+
+To replay a production setup:
+
+1. MCP `list_watches { "watch_id": "<id>", "replay": true }`.
+2. Save the `replay` object as `setup.json`.
+3. Run `npm run replay -- setup.json` to see what this version of the monitor
+   sends, minute by minute, next to what the live monitor did.
+
+A rule change (`docs/requirements.md` §5, §7) is then measured on the same
+setups before it ships. Commit a replay to `test/fixtures` when it should
+guard against a regression.
+
+## 5. Deploy and verify
 
 - **Deploy.** A push to the production branch deploys it.
   - First run `npm test` and `npm run smoke`, locally or in CI.
@@ -85,7 +111,7 @@ Inside the system:
   3. `GET /debug/requests` without a token → 401.
   4. The next minute's `/tick` in cron-job.org's history → 200.
 
-## 5. Rollback
+## 6. Rollback
 
 1. **Vercel → Deployments.** Pick the previous production deployment →
    **Instant Rollback**. No build; the state in Redis is untouched.
@@ -100,12 +126,15 @@ The state is compatible both ways between 6.18.x and 6.19:
   The list stays in Redis, and 6.19 picks it up again.
 - **Watch fields.** Fields 6.18.x does not know (`history`, `contract`,
   `evidenceSeen`, …) are carried along unread.
+- **6.20 → 6.19.** Same state. The replay keys stay in Redis unread until
+  they expire. A watch armed under 6.20 keeps its `rules` label, but 6.19
+  reads its engulfing and obstacle exits the 6.19 way.
 
 **Never bump `SCHEMA_VERSION` or the schema string without a migration.**
 A mismatch starts an empty store, and the next save erases every active
 watch.
 
-## 6. Recovery
+## 7. Recovery
 
 | Symptom | Cause | Do |
 |---|---|---|
@@ -118,7 +147,7 @@ watch.
 | `monitor_health.notifications.stats.failed` grows | Telegram token or chat id wrong, or the bot blocked | `GET /test-telegram` with the token. |
 | Gemini says it registered, no WATCH ACTIVE | The call never reached the monitor | `/debug/requests`: no `register_watch` line → the client did not call it. |
 
-## 7. Configuration
+## 8. Configuration
 
 Environment variables are listed in the README.
 

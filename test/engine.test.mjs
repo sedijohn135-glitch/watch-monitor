@@ -396,7 +396,7 @@ test("Registration answers with what the monitor will check, in this setup's pri
   const h = createHarness({ start: T0, series: buySeries() });
   const { plan, warnings } = h.register({ ...BUY, snapshot_as_of: new Date(T0 - 45 * MIN).toISOString(), score: 9 });
   assert.equal(plan.contract, "setup/1");
-  assert.equal(plan.rules, "v6.0-acceptance");
+  assert.equal(plan.rules, "v6.0-acceptance/strict-engulfing");
   assert.match(plan.touch, /^ask ≤ 4415\.10 \(zone high 4415\.00/);
   assert.match(plan.invalidation, /^bid ≤ 4405\.00/);
   assert.match(plan.sweep, /not wait/);
@@ -488,7 +488,7 @@ test("Telegram: the API base is configurable, so tests never reach the real chat
 // ---------------------------------------------------------------------------
 // Recorded markets
 
-test("REPLAY 28 Oct XAUUSD sell: the 15:00 wick is the touch, ENTER NOW at 15:06, out at the M15 demand", async () => {
+test("REPLAY 28 Oct XAUUSD sell: the 15:00 wick is the touch, ENTER NOW at 15:06, part off at the M15 demand, out at breakeven", async () => {
   const fixture = JSON.parse(readFileSync(new URL("./fixtures/xauusd-2026-10-28-sell.json", import.meta.url), "utf8"));
   const { watch, messages } = await replay(fixture);
   const when = (pattern) => {
@@ -502,6 +502,41 @@ test("REPLAY 28 Oct XAUUSD sell: the 15:00 wick is the touch, ENTER NOW at 15:06
   assert.equal(watch.trade.entry, 4043.91); // the bid at 15:06:06, the open of that minute
   assert.equal(watch.trade.rr_at_entry, 2.28);
   assert.match(messages.find((message) => /REAL CONFIRMATION/.test(message.text)).text, /M5 rejection wick \(soft\) 15:00 UTC/);
-  assert.equal(watch.exit_reason, "OBSTACLE");
-  assert.equal(when(/🔴 CLOSE NOW/), "15:35:06");
+  // The M15 demand in the way holds: managed, not exited (owner, 28 Oct).
+  // The overlapping M5 demand reached with it gives no second warning.
+  assert.equal(when(/M15 DEMAND HELD — CLOSE PART/), "15:35:06");
+  assert.equal(messages.filter((message) => /HELD — CLOSE PART/.test(message.text)).length, 1);
+  assert.match(messages.find((message) => /HELD — CLOSE PART/.test(message.text)).text, /move the SL to breakeven 4043\.91/);
+  assert.equal(messages.filter((message) => /^<b>🔴 CLOSE NOW/.test(message.text)).length, 0, "no full exit at the obstacle");
+  assert.equal(watch.status, "BREAKEVEN");
+  assert.equal(watch.exit_reason, "STOP");
+  assert.equal(when(/STOPPED AT BREAKEVEN/), "15:39:06");
+});
+
+test("REPLAY CAPTURE — a resolved setup leaves its candles, and replaying them reaches the same ENTER NOW", async () => {
+  const { h, id } = buyHarness();
+  await runBuy(h);
+  h.quote("XAUUSD", 4404); // through the 4405 stop
+  await h.tickAt(at(5));
+  const record = h.watch(id);
+  assert.equal(record.status, "LOSS");
+
+  const fixture = await h.engine.captureReplay(record, { version: "test" });
+  assert.equal(fixture.watch.entry, BUY.entry);
+  assert.equal(fixture.watch.entry_zone_high, BUY.entry_zone_high);
+  assert.equal(fixture.watch.sweep_level, BUY.sweep_level);
+  assert.equal(fixture.registered_at, record.createdAt);
+  assert.equal(fixture.live.result.status, "LOSS");
+  assert.ok(fixture.live.events.some((event) => /^enter_now/.test(event.what)), "the live decisions travel with it");
+  const m1 = fixture.bars["XAUUSD:M1"];
+  assert.ok(Date.parse(m1[0][0]) <= record.armedAtMs - 80 * MIN, "M1 from well before registration (what a tick reads)");
+  assert.ok(fixture.bars["XAUUSD:M5"].length >= 20, "M5 enough for the engine (it needs 20 closed bars)");
+
+  // Round trip: through test/replay.mjs, whose quote is the open of each
+  // minute, the recorded candles alone give the same decision at 15:03:06.
+  const replayed = await replay(JSON.parse(JSON.stringify(fixture)));
+  const enter = replayed.messages.find((message) => /REAL CONFIRMATION/.test(message.text));
+  assert.ok(enter, "the replay confirms too");
+  assert.equal(new Date(enter.at).toISOString().slice(11, 19), "15:03:06");
+  assert.match(enter.text, /M1 engulfing \(soft\) 15:01 UTC/);
 });

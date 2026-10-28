@@ -397,7 +397,7 @@ const ack = JSON.parse(registered.result.content[0].text);
 const watchId = ack.watch_id;
 assert(Boolean(watchId), `watch registered (${watchId})`);
 assert(
-  ack.contract === "setup/1" && ack.rules === "v6.0-acceptance" && /Touch ask ≤ 4414\.6/.test(ack.monitor_line) && /4400/.test(ack.plan.invalidation),
+  ack.contract === "setup/1" && ack.rules === "v6.0-acceptance/strict-engulfing" && /Touch ask ≤ 4414\.6/.test(ack.monitor_line) && /4400/.test(ack.plan.invalidation),
   `the answer states what the monitor will check, with this setup's prices (${ack.monitor_line})`,
 );
 assert(ack.warnings.some((warning) => /expires in 720 min/.test(warning)), "a missing expiry is reported, not silently defaulted");
@@ -585,7 +585,7 @@ assert(!vWatch?.recovered, "back-to-back ticks keep the watch as saved instead o
 
 const health = await (await fetch("http://127.0.0.1:9804/health", { headers: { authorization: "Bearer secret" } })).json();
 assert(health.storage === "redis" && health.last_tick_at, `health reports Redis and the last tick (${health.storage})`);
-assert(health.confirmation?.rules === "v6.0-acceptance" && health.confirmation.min_hold_ms === 0, "health reports the thresholds actually in force");
+assert(health.confirmation?.rules === "v6.0-acceptance/strict-engulfing" && health.confirmation.min_hold_ms === 0, "health reports the thresholds actually in force");
 assert(typeof vWatch?.waiting_for === "string" && vWatch.waiting_for.length > 10, `list_watches says what each watch waits for (${vWatch?.waiting_for})`);
 
 // The cron stops with a watch waiting: /health must say so, for an uptime check.
@@ -744,6 +744,17 @@ assert(
   `list_watches { watch_id } returns the resolved record with its decision trail (${trail.join(" → ")})`,
 );
 assert(closed && !("spreadSamples" in closed), "the resolved record drops the per-tick working state");
+const withReplay = JSON.parse(
+  (await rpc("tools/call", { name: "list_watches", arguments: { watch_id: closed?.id, replay: true } }, 1, 9804)).result.content[0].text,
+);
+assert(
+  withReplay.replay?.bars?.["XAUUSD:M1"]?.length > 0 && withReplay.replay.watch?.entry === closed?.entry,
+  `a resolved setup leaves its candles as a replay fixture (${withReplay.replay?.bars?.["XAUUSD:M1"]?.length ?? 0} M1 bars)`,
+);
+const withoutReplay = JSON.parse(
+  (await rpc("tools/call", { name: "list_watches", arguments: { watch_id: closed?.id } }, 1, 9804)).result.content[0].text,
+);
+assert(withoutReplay.watch && !("replay" in withoutReplay), "the candles come only when asked for");
 assert(
   JSON.parse(kvData.get("watch-monitor:state")).resolved.length === 0 && kvData.get("watch-monitor:resolved")?.length >= 1,
   "resolved watches live in their own list, not in the snapshot every tick reads",
