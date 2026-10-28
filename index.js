@@ -1068,16 +1068,23 @@ async function tickSetupWatch(watch) {
       (model.zone ? ` + ${zoneLabel(model.zone)} ${formatLevel(model.zone.low)} – ${formatLevel(model.zone.high)}` : "")
     : "";
 
-  // Each way in: { name, zone, swing (the stop goes beyond it), fresh,
-  // confirmed (what confirmed it) }.
-  const routes = [];
+  // The entry is the CISD model (the owner's CISD and CISD × SMT charts):
+  // after the sweep, a CISD, backed by SMT divergence or an M5 / M15
+  // engulfing or rejection, then the retrace to the CISD level or its gap.
+  // An engulfing or rejection alone never enters: 24–27 Oct, four entries
+  // on a candle in the zone without a CISD or with a stop inside the zone,
+  // four stops.
+  const backing = [
+    turnCandle && `${turnCandle.tf} ${turnCandle.type} ${hhmm(turnCandle.at)} UTC`,
+    smt?.divergent && `SMT divergence vs ${smt.partner} at ${hhmm(smt.at)} UTC`,
+  ].filter(Boolean);
+  let cisdHolds = validated;
   if (prepared) {
-    // The validator. The analysis found the zone and the setup; from the
-    // sweep on, price action in the zone on M5 and M15 decides: an
-    // engulfing or rejection that holds it arms the setup, a close through
-    // it or price action against it disarms it — no entry, and the watch
-    // goes on until the invalidation. A CISD confirms too. SMT divergence
-    // is not price action at the zone: it backs the CISD retrace only.
+    // The validator. From the sweep on, price action in the analysis's
+    // zone on M5 and M15: a close through the zone's far edge, or an
+    // engulfing or rejection against the trade in it, means the setup is
+    // failing — no entry until a new CISD, and the watch goes on until the
+    // invalidation.
     const extra = [
       validated &&
         model.mss.at >= sweptFrom && {
@@ -1102,128 +1109,80 @@ async function tickSetupWatch(watch) {
     const describe = (event) => `${event.tf} ${event.type} ${hhmm(event.at - event.span)} UTC`;
     const was = watch.validator?.state ?? null;
     watch.validator = { state: read.state, last: read.last };
-    if (read.state === "failing" && was !== "failing") {
+    if (read.state === "failing") {
       // Once per failing spell, not on every candle of it.
-      notify(
-        `<b>⚠️ PRICE ACTION AGAINST THE SETUP — NO ENTRY</b>\n` +
-          `<b>${htmlEscape(watch.symbol)} ${buy ? "BUY" : "SELL"}</b>\n` +
-          `<b>Seen:</b> ${htmlEscape(describe(read.last))}\n` +
-          `<b>Zone:</b> ${htmlEscape(formatLevel(preparedZone.low))} – ${htmlEscape(formatLevel(preparedZone.high))}\n` +
-          `<i>No entry while it fails. Watching until the invalidation ${htmlEscape(formatLevel(watch.invalidation ?? watch.sl))}: ` +
-          `ENTER NOW comes only if price action confirms again.</i>`,
-        { dedupeKey: `${watch.id}:failing:${read.last.tf}:${read.last.at}` },
-      );
-    }
-    if (read.state === "armed") {
-      const confirmed = [read.confirmations[0], read.last]
-        .filter((event, index, all) => all.indexOf(event) === index)
-        .map(describe)
-        .join(" + ");
-      const since = m5.bars.filter((bar) => bar.timestampMs >= sweptFrom);
-      routes.push({
-        name: "prepared zone",
-        key: `prepared:${read.confirmations[0].tf}:${read.confirmations[0].at}`,
-        zone: preparedZone,
-        swing: buy ? Math.min(protective, ...since.map((bar) => bar.low)) : Math.max(protective, ...since.map((bar) => bar.high)),
-        // At the close of the confirming candle, as a trader enters, while
-        // price is still within that candle; after that, only in the zone.
-        fresh:
-          read.last.fresh &&
-          read.last.low !== undefined &&
-          executable >= read.last.low - tolerance &&
-          executable <= read.last.high + tolerance,
-        confirmed,
-      });
-      // The CISD's retrace, while nothing has failed since the CISD, with a
-      // strong confirmation beside it.
-      const cisdSince = read.confirmations.some((event) => event.type === "CISD");
-      const strong = turnCandle || smt?.divergent || read.confirmations.some((event) => event.type !== "CISD");
-      if (validated && cisdSwing && cisdSince && strong) {
-        routes.push({ name: "CISD retrace", key: cisdKey, zone: cisdZone, swing: cisdSwing, fresh: false, confirmed: `${cisdText} · ${confirmed}` });
+      if (was !== "failing") {
+        notify(
+          `<b>⚠️ PRICE ACTION AGAINST THE SETUP — NO ENTRY</b>\n` +
+            `<b>${htmlEscape(watch.symbol)} ${buy ? "BUY" : "SELL"}</b>\n` +
+            `<b>Seen:</b> ${htmlEscape(describe(read.last))}\n` +
+            `<b>Zone:</b> ${htmlEscape(formatLevel(preparedZone.low))} – ${htmlEscape(formatLevel(preparedZone.high))}\n` +
+            `<i>No entry while it fails. Watching until the invalidation ${htmlEscape(formatLevel(watch.invalidation ?? watch.sl))}: ` +
+            `ENTER NOW comes only after a new CISD.</i>`,
+          { dedupeKey: `${watch.id}:failing:${read.last.tf}:${read.last.at}` },
+        );
       }
-    } else {
       watch.lifecycle = "TOUCHED";
       watch.lastGateBlockReason = null;
-      watch.lastReason = read.state === "failing" ? "price_action_against_setup" : "awaiting_price_action_in_zone";
+      watch.lastReason = "price_action_against_setup";
       return;
     }
-  } else {
-    // Without a prepared zone: the CISD model, with a strong confirmation —
-    // an M5 or M15 engulfing or rejection from the turn on, or SMT
-    // divergence at the sweep.
-    if (!validated || !cisdSwing) {
-      watch.lifecycle = "TOUCHED";
-      watch.lastGateBlockReason = null;
-      watch.lastReason = "awaiting_cisd";
-      return;
-    }
-    const confirmations = [
-      turnCandle && `${turnCandle.tf} ${turnCandle.type} ${hhmm(turnCandle.at)} UTC`,
-      smt?.divergent && `SMT divergence vs ${smt.partner} at ${hhmm(smt.at)} UTC`,
-    ].filter(Boolean);
-    if (!confirmations.length) {
-      watch.lifecycle = "TOUCHED";
-      watch.lastGateBlockReason = null;
-      watch.lastReason = "awaiting_engulfing_rejection_or_smt";
-      return;
-    }
-    routes.push({
-      name: "CISD retrace",
-      key: cisdKey,
-      zone: cisdZone,
-      swing: cisdSwing,
-      fresh: false,
-      confirmed: `${cisdText} · ${confirmations.join(" + ")}`,
-    });
+    // The CISD counts while nothing has failed since it.
+    cisdHolds = read.confirmations.some((event) => event.type === "CISD");
+    backing.push(...read.confirmations.filter((event) => event.type !== "CISD").slice(-1).map((event) => `${describe(event)} in the zone`));
   }
-
-  const zoneText = (route) => `${formatLevel(route.zone.low)} – ${formatLevel(route.zone.high)} (${route.name})`;
-  // The stop beyond the route's swing, plus spread and tolerance, never
-  // wider than the registered SL.
+  if (!cisdHolds || !cisdSwing) {
+    watch.lifecycle = "TOUCHED";
+    watch.lastGateBlockReason = null;
+    watch.lastReason = "awaiting_cisd";
+    return;
+  }
+  if (!backing.length) {
+    watch.lifecycle = "TOUCHED";
+    watch.lastGateBlockReason = null;
+    watch.lastReason = "awaiting_engulfing_rejection_or_smt";
+    return;
+  }
+  // The stop beyond the reaction's extreme and, with a prepared zone,
+  // beyond the zone's far edge too — a retest of the zone is not a reason
+  // to be out — plus spread and tolerance, never wider than the registered
+  // SL.
+  const swing = prepared ? (buy ? Math.min(cisdSwing, preparedZone.low) : Math.max(cisdSwing, preparedZone.high)) : cisdSwing;
   const buffer = tolerance + spread;
-  const stopFor = (route) => (buy ? Math.max(route.swing - buffer, watch.sl) : Math.min(route.swing + buffer, watch.sl));
-  const swingSide = buy ? "below the swing low" : "above the swing high";
+  const modelStop = buy ? Math.max(swing - buffer, watch.sl) : Math.min(swing + buffer, watch.sl);
+  const swingSide = prepared ? (buy ? "below the zone and the swing low" : "above the zone and the swing high") : buy ? "below the swing low" : "above the swing high";
+  const entryZone = cisdZone;
+  const zoneText = `${formatLevel(entryZone.low)} – ${formatLevel(entryZone.high)} (CISD level${model.zone ? " + gap" : ""})`;
+  const candleText = `${cisdText} · ${backing.join(" + ")}`;
+  const validation = candleText;
   const inZone = (zone) => executable >= zone.low - tolerance && executable <= zone.high + tolerance;
   watch.lifecycle = "CONFIRMING";
-  const zoneKey = routes.map((route) => route.key).join("|");
-  // The target is looked up once per arming, not on every fast check.
-  if (watch.targetKey !== zoneKey) {
-    watch.targetKey = zoneKey;
+  // The target is looked up once per CISD, not on every fast check.
+  if (watch.targetKey !== cisdKey) {
+    watch.targetKey = cisdKey;
     watch.target = await targetFor(watch, mainId, mid);
   }
-  const route = routes.find((item) => inZone(item.zone) || item.fresh);
-  const validation = route ? route.confirmed : routes.map((item) => item.confirmed).join(" | ");
-  // Once per arming, and only while there is a retrace to wait for: the
+  // Once per CISD, and only while there is a retrace to wait for: the
   // notifier's dedupe does not outlive a Vercel request.
-  if (!route && watch.zoneNotified !== zoneKey) {
-    watch.zoneNotified = zoneKey;
+  if (!inZone(entryZone) && watch.zoneNotified !== cisdKey) {
+    watch.zoneNotified = cisdKey;
+    const tp = firstTarget(watch, watch.target, buy ? entryZone.high : entryZone.low, modelStop);
     notify(
-      `<b>🟡 ${prepared ? "PRICE ACTION CONFIRMED" : "CISD CONFIRMED"} — ENTRY ZONE READY</b>\n` +
+      `<b>🟡 CISD CONFIRMED — ENTRY ZONE READY</b>\n` +
         `<b>${htmlEscape(watch.symbol)} ${htmlEscape(watch.direction.toUpperCase())}</b>\n` +
-        routes
-          .map((item) => {
-            const sl = stopFor(item);
-            const tp = firstTarget(watch, watch.target, buy ? item.zone.high : item.zone.low, sl);
-            return (
-              `<b>Entry:</b> ${htmlEscape(zoneText(item))}\n` +
-              `<b>Confirmed by:</b> ${htmlEscape(item.confirmed)}\n` +
-              `<b>SL:</b> ${htmlEscape(formatLevel(sl))} (${swingSide}) · <b>TP1:</b> ${htmlEscape(formatLevel(tp.level))} (${htmlEscape(tp.what)})\n`
-            );
-          })
-          .join("") +
-        `<i>Not an entry yet. ENTER NOW comes when price retraces into ${routes.length > 1 ? "either" : "the"} zone.</i>`,
+        `<b>Entry:</b> ${htmlEscape(zoneText)}\n` +
+        `<b>Confirmed by:</b> ${htmlEscape(candleText)}\n` +
+        `<b>SL:</b> ${htmlEscape(formatLevel(modelStop))} (${swingSide}) · <b>TP1:</b> ${htmlEscape(formatLevel(tp.level))} (${htmlEscape(tp.what)})\n` +
+        `<i>Not an entry yet. ENTER NOW comes when price retraces to the CISD level.</i>`,
     );
   }
 
-  // Step 4: enter in a zone (or on the confirming candle's close) — never
-  // on the move away.
-  if (!route) {
+  // Step 4: enter on the retrace to the CISD level or its gap — never on
+  // the move away.
+  if (!inZone(entryZone)) {
     watch.lastReason = "awaiting_retrace";
     return;
   }
-  const entryZone = route.zone;
-  const modelStop = stopFor(route);
-  const candleText = route.confirmed;
 
   watch.lastReason = "awaiting_gates";
   // A stop within three spreads of the fill is noise, not a stop.
@@ -1252,11 +1211,10 @@ async function tickSetupWatch(watch) {
     watch.lastReason = "confirming";
     const furthest = [tp.level, watch.tp1, watch.tp2, watch.tp3].filter(Number.isFinite);
     const walls = await obstaclesFor(watch, mainId, executable, buy ? Math.max(...furthest) : Math.min(...furthest));
-    const where = inZone(entryZone) ? "Price in the entry zone" : "At the close of the confirming candle, at the zone";
     confirmWatch(
       watch,
       { executable, spread },
-      { ...model, entryZone, zoneText: zoneText(route), candleText, where },
+      { ...model, entryZone, zoneText, candleText, where: "Price retraced to" },
       gates,
       rr,
       stop,
@@ -1668,7 +1626,7 @@ const CUSTOM_TOOLS = [
         entry_zone_low: {
           type: "number",
           description:
-            "The prepared entry zone's lower edge (the FVG / OB / breaker range the entry sits in). Send it with entry_zone_high whenever the analysis has a zone: ENTER NOW then comes only when price retraces into this zone, This is the PD array where price must react. After the sweep, the monitor validates price action in it on M5 and M15 (engulfing or rejection that holds it; a close through it or price action against it means no entry until it confirms again, watched until the invalidation) and enters in this zone, or on the retrace to the CISD level / gap after a CISD. The entry must lie inside the zone and the SL beyond it.",
+            "The prepared entry zone's lower edge (the FVG / OB / breaker range the entry sits in). Send it with entry_zone_high whenever the analysis has a zone: ENTER NOW then comes only when price retraces into this zone, This is the PD array where price must react; reaching it is the entry touch. After the sweep the monitor needs a CISD (backed by SMT divergence or an M5 / M15 engulfing or rejection) and enters on the retrace to the CISD level; a close through this zone or price action against the trade in it means no entry until a new CISD, watched until the invalidation. The entry must lie inside the zone and the SL beyond it.",
         },
         entry_zone_high: {
           type: "number",
@@ -2053,7 +2011,7 @@ async function handleMcpRequest(req, res) {
       result: {
         protocolVersion: body.params?.protocolVersion || CONFIG.protocolVersion,
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.13.1" },
+        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.14.0" },
       },
     });
     return;
@@ -2148,7 +2106,7 @@ app.get("/health", async (req, res) => {
   const base = {
     status: SERVERLESS && !kv ? "storage_missing" : "ok",
     service: "watch-monitor-mcp",
-    version: "6.13.1",
+    version: "6.14.0",
     runtime: SERVERLESS ? "vercel" : "node",
     watches: setups.length,
     last_tick_at: SERVERLESS ? lastTickAt : undefined,
