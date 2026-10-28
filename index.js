@@ -1072,16 +1072,21 @@ async function tickSetupWatch(watch) {
         .sort((x, y) => x.closes - y.closes)[0]
     : null;
   watch.m5Confirmation = turnCandle ?? null;
-  const cisdZone = validated && {
-    low: Math.min(model.zone?.low ?? Infinity, model.mss.level),
-    high: Math.max(model.zone?.high ?? -Infinity, model.mss.level),
-  };
   const extremeBar = validated ? cisdBars.find((bar) => bar.timestampMs === model.extremeAt) : null;
   const cisdSwing = model.zone?.stop ?? (extremeBar && (buy ? extremeBar.low : extremeBar.high));
-  const cisdKey = validated ? `cisd:${model.mss.level}:${model.zone?.low ?? ""}` : "";
+  // The gap counts only on the trade's side of the swing: one the
+  // displacement left, not an older one beyond the extreme (28 Oct XAUUSD:
+  // an inversion gap at 4047 under the 4050.46 low stretched the entry
+  // zone down to it).
+  const gap = model.zone && cisdSwing && (buy ? model.zone.low > cisdSwing : model.zone.high < cisdSwing) ? model.zone : null;
+  const cisdZone = validated && {
+    low: Math.min(gap?.low ?? Infinity, model.mss.level),
+    high: Math.max(gap?.high ?? -Infinity, model.mss.level),
+  };
+  const cisdKey = validated ? `cisd:${model.mss.level}:${gap?.low ?? ""}` : "";
   const cisdText = validated
     ? `${cisdTf} CISD ${formatLevel(model.mss.level)}` +
-      (model.zone ? ` + ${zoneLabel(model.zone)} ${formatLevel(model.zone.low)} – ${formatLevel(model.zone.high)}` : "")
+      (gap ? ` + ${zoneLabel(gap)} ${formatLevel(gap.low)} – ${formatLevel(gap.high)}` : "")
     : "";
 
   // The entry is the CISD model (the owner's CISD and CISD × SMT charts):
@@ -1168,19 +1173,57 @@ async function tickSetupWatch(watch) {
   const modelStop = buy ? Math.max(swing - buffer, watch.sl) : Math.min(swing + buffer, watch.sl);
   const swingSide = prepared ? (buy ? "below the zone and the swing low" : "above the zone and the swing high") : buy ? "below the swing low" : "above the swing high";
   const entryZone = cisdZone;
-  const zoneText = `${formatLevel(entryZone.low)} – ${formatLevel(entryZone.high)} (CISD level${model.zone ? " + gap" : ""})`;
-  const candleText = `${cisdText} · ${backing.join(" + ")}`;
-  const validation = candleText;
+  const zoneText = `${formatLevel(entryZone.low)} – ${formatLevel(entryZone.high)} (CISD level${gap ? " + gap" : ""})`;
   const inZone = (zone) => executable >= zone.low - tolerance && executable <= zone.high + tolerance;
+  // ENTER NOW needs price action at the CISD level, not just price there:
+  // after the CISD, an M5 engulfing or rejection that traded into the level
+  // (or its gap) and closed holding it. An M5 close through it, or an
+  // engulfing or rejection against the trade there, means the CISD failed —
+  // no entry until price action reclaims it (28 Oct XAUUSD: ENTER NOW on
+  // the first touch of the level while that M5 candle engulfed it from
+  // above, and price kept falling).
+  const atLevel = zonePriceAction(
+    [{ tf: "M5", span: PERIOD_MS.M5, bars: m5.bars }],
+    watch.direction,
+    entryZone,
+    model.mss.at + PERIOD_MS[cisdTf],
+    tolerance,
+  );
+  watch.cisdRetrace = { state: atLevel.state, last: atLevel.last };
+  const held = atLevel.state === "armed" ? atLevel.last : null;
+  // Entered in the zone, or at the close of the candle that held it while
+  // price is still within that candle.
+  const ready =
+    held &&
+    (inZone(entryZone) ||
+      (held.fresh &&
+        (buy
+          ? executable >= entryZone.low - tolerance && executable <= Math.max(entryZone.high, held.high) + tolerance
+          : executable <= entryZone.high + tolerance && executable >= Math.min(entryZone.low, held.low) - tolerance)));
+  const candleText =
+    `${cisdText} · ${backing.join(" + ")}` +
+    (held ? ` · M5 ${held.type} holding the CISD level ${hhmm(held.at - held.span)} UTC` : "");
+  const validation = candleText;
   watch.lifecycle = "CONFIRMING";
   // The target is looked up once per CISD, not on every fast check.
   if (watch.targetKey !== cisdKey) {
     watch.targetKey = cisdKey;
     watch.target = await targetFor(watch, mainId, mid);
   }
+  if (atLevel.state === "failing" && watch.cisdFailNotified !== `${cisdKey}:${atLevel.last.at}`) {
+    watch.cisdFailNotified = `${cisdKey}:${atLevel.last.at}`;
+    notify(
+      `<b>⚠️ CISD LEVEL LOST — NO ENTRY</b>\n` +
+        `<b>${htmlEscape(watch.symbol)} ${buy ? "BUY" : "SELL"}</b>\n` +
+        `<b>Seen:</b> M5 ${htmlEscape(atLevel.last.type)} ${hhmm(atLevel.last.at - atLevel.last.span)} UTC at ${htmlEscape(zoneText)}\n` +
+        `<i>No entry unless an M5 engulfing or rejection takes the level back, or a new CISD forms. ` +
+        `Watching until the invalidation ${htmlEscape(formatLevel(watch.invalidation ?? watch.sl))}.</i>`,
+      { dedupeKey: `${watch.id}:cisd-lost:${cisdKey}:${atLevel.last.at}` },
+    );
+  }
   // Once per CISD, and only while there is a retrace to wait for: the
   // notifier's dedupe does not outlive a Vercel request.
-  if (!inZone(entryZone) && watch.zoneNotified !== cisdKey) {
+  if (!ready && atLevel.state !== "failing" && watch.zoneNotified !== cisdKey) {
     watch.zoneNotified = cisdKey;
     const tp = firstTarget(watch, watch.target, buy ? entryZone.high : entryZone.low, modelStop);
     notify(
@@ -1189,14 +1232,15 @@ async function tickSetupWatch(watch) {
         `<b>Entry:</b> ${htmlEscape(zoneText)}\n` +
         `<b>Confirmed by:</b> ${htmlEscape(candleText)}\n` +
         `<b>SL:</b> ${htmlEscape(formatLevel(modelStop))} (${swingSide}) · <b>TP1:</b> ${htmlEscape(formatLevel(tp.level))} (${htmlEscape(tp.what)})\n` +
-        `<i>Not an entry yet. ENTER NOW comes when price retraces to the CISD level.</i>`,
+        `<i>Not an entry yet. ENTER NOW comes when price retraces to the CISD level and an M5 engulfing or rejection holds it.</i>`,
     );
   }
 
-  // Step 4: enter on the retrace to the CISD level or its gap — never on
-  // the move away.
-  if (!inZone(entryZone)) {
-    watch.lastReason = "awaiting_retrace";
+  // Step 4: enter on the retrace to the CISD level or its gap, once an M5
+  // candle has held it — never on the move away, never on a bare touch.
+  if (!ready) {
+    watch.lastReason =
+      atLevel.state === "failing" ? "cisd_level_lost" : inZone(entryZone) ? "awaiting_m5_hold_at_cisd" : "awaiting_retrace";
     return;
   }
 
@@ -1614,7 +1658,7 @@ const CUSTOM_TOOLS = [
   {
     name: "register_watch",
     description:
-      "Registers a trading setup for live monitoring. The monitor validates it on live candles — price reaches the zone, the liquidity at sweep_level is taken, then a CISD on M1, M5 or M15 (the first to close beyond its level) backed by SMT divergence or an M5 / M15 engulfing or rejection — and sends ENTER NOW on Telegram on the retrace to the CISD level, with R:R ≥ 1, news and spread clear (no session filter). A close through the zone or price action against the trade in it means no entry until a new CISD, watched until the invalidation. Then it manages the trade: TP alerts, SL to breakeven after TP1, CLOSE NOW where price turns back or an M5–H4 zone in the way holds. Never places an order.",
+      "Registers a trading setup for live monitoring. The monitor validates it on live candles — price reaches the zone, the liquidity at sweep_level is taken, then a CISD on M1, M5 or M15 (the first to close beyond its level) backed by SMT divergence or an M5 / M15 engulfing or rejection — and sends ENTER NOW on Telegram when price retraces to the CISD level and an M5 engulfing or rejection holds it, with R:R ≥ 1, news and spread clear (no session filter). A close through the zone or price action against the trade in it means no entry until a new CISD, watched until the invalidation. Then it manages the trade: TP alerts, SL to breakeven after TP1, CLOSE NOW where price turns back or an M5–H4 zone in the way holds. Never places an order.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -1642,7 +1686,7 @@ const CUSTOM_TOOLS = [
         entry_zone_low: {
           type: "number",
           description:
-            "The prepared zone's lower edge: the PD array (FVG / OB / breaker) where price must react. Send it with entry_zone_high whenever the analysis has a zone. Price reaching it is the entry touch; after the sweep the monitor needs a CISD on M1, M5 or M15 (backed by SMT divergence or an M5 / M15 engulfing or rejection) and enters on the retrace to the CISD level; a close through this zone or price action against the trade in it means no entry until a new CISD, watched until the invalidation. The entry must lie inside the zone and the SL beyond it.",
+            "The prepared zone's lower edge: the PD array (FVG / OB / breaker) where price must react. Send it with entry_zone_high whenever the analysis has a zone. Price reaching it is the entry touch; after the sweep the monitor needs a CISD on M1, M5 or M15 (backed by SMT divergence or an M5 / M15 engulfing or rejection) and enters on the retrace to the CISD level once an M5 engulfing or rejection holds it; a close through this zone or price action against the trade in it means no entry until a new CISD, watched until the invalidation. The entry must lie inside the zone and the SL beyond it.",
         },
         entry_zone_high: {
           type: "number",
@@ -2027,7 +2071,7 @@ async function handleMcpRequest(req, res) {
       result: {
         protocolVersion: body.params?.protocolVersion || CONFIG.protocolVersion,
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.15.0" },
+        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.16.0" },
       },
     });
     return;
@@ -2122,7 +2166,7 @@ app.get("/health", async (req, res) => {
   const base = {
     status: SERVERLESS && !kv ? "storage_missing" : "ok",
     service: "watch-monitor-mcp",
-    version: "6.15.0",
+    version: "6.16.0",
     runtime: SERVERLESS ? "vercel" : "node",
     watches: setups.length,
     last_tick_at: SERVERLESS ? lastTickAt : undefined,

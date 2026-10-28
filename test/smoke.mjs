@@ -52,6 +52,17 @@ const SCRIPT = {
   0: [4414.6, 4420, 4411, 4419.8],
   1: [4419.8, 4426, 4419.6, 4425.5],
   2: [4425.5, 4428, 4421.5, 4427],
+  // Price holds up, then the retrace: into the gap during minutes 6–8 and
+  // back up — the M5 bar of minutes 6–10 is a hammer holding the CISD
+  // level, the confirmation ENTER NOW waits for.
+  3: [4427, 4427.5, 4425.8, 4426.5],
+  4: [4426.5, 4427.8, 4426, 4427.2],
+  5: [4427.2, 4428, 4426.9, 4427],
+  6: [4427, 4427.2, 4421.2, 4421.4],
+  7: [4421.4, 4421.6, 4420.3, 4420.6],
+  8: [4420.6, 4421, 4420.2, 4420.8],
+  9: [4420.8, 4422.5, 4420.7, 4422.3],
+  10: [4422.3, 4426.5, 4422.2, 4426.2],
 };
 function scriptedM1(count) {
   const lastOpen = Math.floor(NOW() / 60_000) * 60_000;
@@ -564,7 +575,7 @@ assert(!vWatch?.recovered, "back-to-back ticks keep the watch as saved instead o
 const health = await (await fetch("http://127.0.0.1:9804/health", { headers: { authorization: "Bearer secret" } })).json();
 assert(health.storage === "redis" && health.last_tick_at, `health reports Redis and the last tick (${health.storage})`);
 
-console.log("\n— a real ENTER NOW, end to end on M1 time (3 to 8 minutes) —");
+console.log("\n— a real ENTER NOW, end to end on M1 time (12 to 17 minutes) —");
 const nextMinute = (offsetMs) => sleep(60_000 - (Date.now() % 60_000) + offsetMs);
 const scenarioWatch = async () => {
   const listed = JSON.parse((await rpc("tools/call", { name: "list_watches" }, 1, 9804)).result.content[0].text);
@@ -665,12 +676,21 @@ assert(
 );
 assert(!(await scenarioWatch()).resolved, "the move away from the zone is never an entry");
 
-price = 4421; // the retrace into the FVG
+price = 4421; // the retrace into the FVG — a touch is not a confirmation
+await nextMinute(3000);
+await tick();
+assert(
+  (await scenarioWatch()).active?.lifecycle !== "IN_TRADE",
+  `price at the CISD level without an M5 candle holding it: no entry (${(await scenarioWatch()).active?.lastReason})`,
+);
+// The M5 bar of minutes 6–10 closes as a hammer at the level.
+while (Math.floor(Date.now() / 60_000) - scenarioMinute < 11) await nextMinute(3000);
+price = 4426; // still within that candle
 await sleep(3000); // past the spot cache and the fast checks
 await tick();
 const open = (await scenarioWatch()).active;
 const trade = open?.trade;
-assert(open?.lifecycle === "IN_TRADE", `retrace into the FVG: REAL CONFIRMATION — ENTER NOW, and the trade stays watched (${open?.lifecycle ?? (await scenarioWatch()).resolved?.status})`);
+assert(open?.lifecycle === "IN_TRADE", `the M5 hammer held the CISD level: REAL CONFIRMATION — ENTER NOW, and the trade stays watched (${open?.lifecycle ?? (await scenarioWatch()).resolved?.status} ${open?.lastReason} ${JSON.stringify(open?.cisdRetrace)})`);
 assert(trade?.rr_at_entry >= 1, `entered in the zone with R:R ${trade?.rr_at_entry} to TP1`);
 const zoneTrade = await zoneWatch();
 assert(
