@@ -1598,7 +1598,7 @@ const CUSTOM_TOOLS = [
   {
     name: "register_watch",
     description:
-      "Registers a trading setup for live monitoring. The monitor validates it on live M5 candles — liquidity taken, CISD, an ICT entry model (FVG / IFVG / Unicorn / OTE order block), an M5 engulfing, rejection or SMT divergence — and sends ENTER NOW on Telegram when price retraces into the entry zone, with R:R, news and spread clear (no session filter). Then it manages the trade: TP alerts, SL to breakeven after TP1, CLOSE NOW where price turns back or an M5–H4 zone in the way holds. Never places an order.",
+      "Registers a trading setup for live monitoring. The monitor validates it on live candles — price reaches the zone, the liquidity at sweep_level is taken, then a CISD on M5 (M15 when M5 has none) backed by SMT divergence or an M5 / M15 engulfing or rejection — and sends ENTER NOW on Telegram on the retrace to the CISD level, with R:R ≥ 1, news and spread clear (no session filter). A close through the zone or price action against the trade in it means no entry until a new CISD, watched until the invalidation. Then it manages the trade: TP alerts, SL to breakeven after TP1, CLOSE NOW where price turns back or an M5–H4 zone in the way holds. Never places an order.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -1626,7 +1626,7 @@ const CUSTOM_TOOLS = [
         entry_zone_low: {
           type: "number",
           description:
-            "The prepared entry zone's lower edge (the FVG / OB / breaker range the entry sits in). Send it with entry_zone_high whenever the analysis has a zone: ENTER NOW then comes only when price retraces into this zone, This is the PD array where price must react; reaching it is the entry touch. After the sweep the monitor needs a CISD (backed by SMT divergence or an M5 / M15 engulfing or rejection) and enters on the retrace to the CISD level; a close through this zone or price action against the trade in it means no entry until a new CISD, watched until the invalidation. The entry must lie inside the zone and the SL beyond it.",
+            "The prepared zone's lower edge: the PD array (FVG / OB / breaker) where price must react. Send it with entry_zone_high whenever the analysis has a zone. Price reaching it is the entry touch; after the sweep the monitor needs a CISD (backed by SMT divergence or an M5 / M15 engulfing or rejection) and enters on the retrace to the CISD level; a close through this zone or price action against the trade in it means no entry until a new CISD, watched until the invalidation. The entry must lie inside the zone and the SL beyond it.",
         },
         entry_zone_high: {
           type: "number",
@@ -2011,7 +2011,7 @@ async function handleMcpRequest(req, res) {
       result: {
         protocolVersion: body.params?.protocolVersion || CONFIG.protocolVersion,
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.14.0" },
+        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.14.1" },
       },
     });
     return;
@@ -2106,7 +2106,7 @@ app.get("/health", async (req, res) => {
   const base = {
     status: SERVERLESS && !kv ? "storage_missing" : "ok",
     service: "watch-monitor-mcp",
-    version: "6.14.0",
+    version: "6.14.1",
     runtime: SERVERLESS ? "vercel" : "node",
     watches: setups.length,
     last_tick_at: SERVERLESS ? lastTickAt : undefined,
