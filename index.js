@@ -1,28 +1,22 @@
 /**
- * Watch Monitor MCP — v6.20
+ * Watch Monitor MCP — v6.0
  *
- * A market-data-only MCP server that monitors ICT sniper setups to a
- * deterministic conclusion, and notifies a human. It never places,
- * modifies, or closes an order, and the account side of the upstream
- * cTrader connector is unreachable from here by construction (see
- * ALLOWLIST below).
+ * A market-data-only MCP server that monitors ICT sniper setups and
+ * TRAP_NOT_CONFIRMED reads to a deterministic conclusion, and notifies a
+ * human. It never places, modifies, or closes an order, and the account
+ * side of the upstream cTrader connector is unreachable from here by
+ * construction (see ALLOWLIST below).
  *
- * One state machine, one scheduler:
+ * Two state machines, one scheduler:
  *
- *   SETUP WATCH   ARMED → TOUCHED → CONFIRMING → IN_TRADE → RESOLVING → RESOLVED
- *                 resolutions: FAILED | EXPIRED | CANCELLED before entry,
- *                 WIN | LOSS | BREAKEVEN after it; plus QUARANTINED, a
- *                 non-terminal state entered when the feed cannot be
- *                 trusted to describe this instrument.
+ *   SETUP WATCH   ARMED → TOUCHED → CONFIRMING → RESOLVING → RESOLVED
+ *                 resolutions: CONFIRMED | FAILED | EXPIRED | CANCELLED
+ *                 plus QUARANTINED, a non-terminal state entered when the
+ *                 feed cannot be trusted to describe this instrument.
  *
- * The decisions live in lib/engine.mjs; this file is the plumbing around
- * them: the HTTP and MCP surface, the cTrader feed, Telegram, the news
- * calendar, Redis and the scheduler.
- *
- * Two ways to run: as a long-lived Node process (Railway, a VPS, `npm
- * start`), where an in-process timer drives the scheduler and state lives
- * in a file; or on Vercel, where nothing outlives a request, so state
- * lives in Redis and an external cron calls /tick once a minute (§8).
+ *   TRAP WATCH    ARMED → RESOLVING → RESOLVED
+ *                 resolutions: CONDITIONS_MET | FLIPPED | EXPIRED | CANCELLED
+ *                 A trap watch never produces an entry, SL or TP.
  *
  * The invariant the whole design serves: a transient infrastructure
  * failure must never be able to present itself as market confirmation,
@@ -32,34 +26,42 @@
 import express from "express";
 import "dotenv/config";
 import { randomUUID, timingSafeEqual } from "node:crypto";
-import { setTimeout as sleep } from "node:timers/promises";
-import { waitUntil } from "@vercel/functions";
 
 import {
   PERIOD_MS,
-  barIsClosed,
+  TRAP_TIMEFRAMES,
+  advanceGeneration,
+  barKey,
+  bodyClosedBeyond,
   calcATR,
+  checkAcceptance,
+  checkCISD,
+  checkSMT,
+  classifyEngulfing,
+  classifyWick,
   closedSeries,
+  displacementCheck,
+  evaluateConfirmation,
+  evaluateSafety,
+  finiteNumber,
   formatLevel,
-  inducement,
+  fvgCheck,
   killZoneStatus,
-  liquidityMap,
   newsBlackout,
   numericTimestampMs,
-  nyClock,
+  oppositeBias,
   periodMs,
   priceTolerance,
   symbolCurrencies,
+  trapWatchKey,
+  updateSpreadHealth,
+  validateTrapWatchInput,
+  validateWatchInput,
+  watchKey,
 } from "./lib/core.mjs";
-import { CONTRACT, RULES, SMT_BUNDLES, createEngine, htmlEscape, waitingFor } from "./lib/engine.mjs";
 import { CTraderMcpClient, MarketData, asArray } from "./lib/upstream.mjs";
 import { Notifier } from "./lib/notify.mjs";
 import { WatchStore, publicWatch } from "./lib/store.mjs";
-import { redisFromEnv } from "./lib/kv.mjs";
-import { installOAuth } from "./lib/oauth.mjs";
-import { OpenApiClient, installOpenApiConnect } from "./lib/openapi.mjs";
-import { readFile, writeFile, mkdir } from "node:fs/promises";
-import { dirname, join } from "node:path";
 
 // ---------------------------------------------------------------------------
 // §1 Configuration
@@ -78,23 +80,7 @@ const CONFIG = {
 
   tickMs: num(process.env.SCHEDULER_TICK_MS, 2500, 1000),
   setupIntervalMs: num(process.env.WATCH_INTERVAL_MS, 10000, 3000),
-  // Vercel only: a tick gap longer than this means the external cron
-  // stopped; the watches restart from live data as after a restart.
-  maxTickGapMs: num(process.env.MAX_TICK_GAP_MS, 5 * 60_000, 90_000),
-  // Vercel only: while an entry zone is ready, keep checking every
-  // FAST_MODE_INTERVAL_MS for FAST_MODE_WINDOW_MS after the cron's tick,
-  // so a retrace into the zone between two minutes is not missed.
-  fastIntervalMs: num(process.env.FAST_MODE_INTERVAL_MS, 15_000, 1000),
-  fastWindowMs: num(process.env.FAST_MODE_WINDOW_MS, 50_000, 0),
-  // After ENTER NOW: how far in R the trade must have run before an M1
-  // structure shift against it triggers CLOSE NOW.
-  exitArmR: num(process.env.EXIT_ARM_R, 1, 0),
-  // The timeframe CLOSE NOW (price turned back) is read on. M1 is noise;
-  // M5 by default. (M1 is still used, as data only, to see wicks touch the
-  // SL between ticks.)
-  entryTimeframe: ["M1", "M5", "M15"].includes(String(process.env.ENTRY_TIMEFRAME || "").toUpperCase())
-    ? String(process.env.ENTRY_TIMEFRAME).toUpperCase()
-    : "M5",
+  trapIntervalMs: num(process.env.TRAP_WATCH_INTERVAL_MS, 30000, 10000),
 
   priceScale: num(process.env.CTRADER_PRICE_SCALE, 100000, 1),
   scaleTolerance: num(process.env.SCALE_TOLERANCE, 0.35, 0.05),
@@ -114,34 +100,12 @@ const CONFIG = {
     ETHUSD: 10029,
   },
 
-  // Wall-clock hold before evidence graduates. On Vercel the ticks come
-  // about every 60 s with some jitter, so 50 s there: the new M1 bar is
-  // the market-time half of the hold either way.
-  minConfirmationHoldMs: num(
-    process.env.MIN_CONFIRMATION_HOLD_MS,
-    process.env.VERCEL || process.env.SERVERLESS === "true" ? 50_000 : 60_000,
-    0,
-  ),
+  minConfirmationHoldMs: num(process.env.MIN_CONFIRMATION_HOLD_MS, 60000, 0),
   requireNewBar: process.env.REQUIRE_NEW_M1_CANDLE !== "false",
   acceptanceAtrFraction: num(process.env.ACCEPTANCE_ATR_FRACTION, 0.5, 0.05),
   acceptanceRiskFraction: num(process.env.ACCEPTANCE_RISK_FRACTION, 0.35, 0.05),
-  evidenceFadeAtrFraction: num(process.env.EVIDENCE_FADE_ATR_FRACTION, 0.25, 0),
-  // A live quote older than this cannot confirm anything (a stalled or
-  // closed market); it still counts for the stop.
-  maxQuoteAgeMs: num(process.env.MAX_QUOTE_AGE_MS, 30_000, 1000),
-  // An ENTER NOW delivered later than this after it was written goes out
-  // marked LATE.
-  enterStaleMs: num(process.env.ENTER_STALE_MS, 60_000, 1000),
-  // ENTER NOW means "enter at market when you read this": below this R:R
-  // to TP1 at the live price, the move already happened.
-  minRrAtEntry: num(process.env.MIN_RR_AT_ENTRY, 1, 0),
-  // A setup registered without its own expiry stops being a setup after
-  // this long; 0 disables.
-  defaultExpiryMinutes: num(process.env.WATCH_DEFAULT_EXPIRY_MIN, 720, 0),
-  // ENTER NOW only on a return to the zone within this long of price last
-  // leaving it (a fresh zone); 0 turns the rule off.
-  freshZoneMaxMs: num(process.env.FRESH_ZONE_MAX_MIN, 35, 0) * 60_000,
 
+  killZoneEnabled: process.env.KILL_ZONE_FILTER_ENABLED !== "false",
   spreadEnabled: process.env.SPREAD_CHECK_ENABLED !== "false",
   spreadBaselineSamples: num(process.env.SPREAD_BASELINE_SAMPLES, 5, 3),
   spreadHistoryMax: num(process.env.SPREAD_HISTORY_MAX, 20, 5),
@@ -166,28 +130,24 @@ const CONFIG = {
       .filter(Boolean),
   ),
 
-  maxSetupWatches: num(process.env.MAX_ACTIVE_WATCHES, 25, 1),
-  resolvedLimit: num(process.env.RESOLVED_WATCH_LIMIT, 60, 10),
+  trapDisplacementMultiple: num(process.env.TRAP_DISPLACEMENT_MULTIPLE, 3, 1.5),
+  trapDisplacementLookback: num(process.env.TRAP_DISPLACEMENT_LOOKBACK, 10, 5),
+  trapApproachAtrFraction: num(process.env.TRAP_APPROACH_ATR_FRACTION, 0.5, 0),
+  trapExpiryMinutes: num(process.env.TRAP_WATCH_DEFAULT_EXPIRY_MIN, 720, 0),
 
-  // SPREAD_CAP_<SYMBOL> overrides the derived spread cap for that symbol.
-  spreadCaps: Object.fromEntries(
-    Object.entries(process.env)
-      .filter(([key]) => key.startsWith("SPREAD_CAP_"))
-      .map(([key, value]) => [key.slice("SPREAD_CAP_".length), value]),
-  ),
-  telegramApiUrl: process.env.TELEGRAM_API_URL || "https://api.telegram.org",
+  maxSetupWatches: num(process.env.MAX_ACTIVE_WATCHES, 25, 1),
+  maxTrapWatches: num(process.env.MAX_TRAP_WATCHES, 25, 1),
+  resolvedLimit: num(process.env.RESOLVED_WATCH_LIMIT, 60, 10),
 
   statePath: process.env.STATE_FILE || "./data/watch-state.json",
   authToken: String(process.env.WATCH_MONITOR_AUTH_TOKEN || ""),
-  cronSecret: String(process.env.CRON_SECRET || ""),
   allowedOrigin: process.env.ALLOWED_ORIGIN || "*",
 };
 
-// Degradation must be measured against the real cadence, not a fixed
-// wall-clock constant: on Vercel a tick only arrives once a minute.
-const SERVERLESS = Boolean(process.env.VERCEL) || process.env.SERVERLESS === "true";
-CONFIG.staleBudgetMs = Math.max(SERVERLESS ? 180_000 : 120_000, CONFIG.setupIntervalMs * 8);
-const VERSION = "6.21.0";
+// Degradation must be measured against the watch's own cadence, not a
+// fixed wall-clock constant, or a slow trap watch reports itself broken.
+const staleBudget = (watch) =>
+  Math.max(120_000, (watch.kind === "TRAP" ? CONFIG.trapIntervalMs : CONFIG.setupIntervalMs) * 8);
 
 function log(message, ...args) {
   console.error(`[watch-monitor] ${message}`, ...args);
@@ -196,48 +156,17 @@ function log(message, ...args) {
 // ---------------------------------------------------------------------------
 // §2 Wiring
 
-const kv = SERVERLESS ? redisFromEnv(process.env) : null;
-const ctraderEnvironment = String(process.env.CTRADER_ENVIRONMENT || "").trim().toLowerCase();
-
-// Market feed: cTrader Open API when an app is configured (CTRADER_CLIENT_ID
-// and _SECRET), else the remote cTrader MCP. Open API rotates its tokens on
-// refresh, so the current pair lives in Redis (or next to the state file),
-// not only in the env vars that seeded it.
-const OPEN_API = Boolean(process.env.CTRADER_CLIENT_ID && process.env.CTRADER_CLIENT_SECRET);
-const CTRADER_TOKENS_KEY = "watch-monitor:ctrader-tokens";
-const tokenFile = join(dirname(CONFIG.statePath), "ctrader-tokens.json");
-const ctraderTokens = {
-  load: async () => (kv ? kv.get(CTRADER_TOKENS_KEY) : JSON.parse(await readFile(tokenFile, "utf8"))),
-  save: async (tokens) => {
-    if (kv) return kv.set(CTRADER_TOKENS_KEY, tokens);
-    await mkdir(dirname(tokenFile), { recursive: true });
-    await writeFile(tokenFile, JSON.stringify(tokens), { mode: 0o600 });
-  },
-};
-const client = OPEN_API
-  ? new OpenApiClient({
-      clientId: process.env.CTRADER_CLIENT_ID.trim(),
-      clientSecret: process.env.CTRADER_CLIENT_SECRET.trim(),
-      accessToken: String(process.env.CTRADER_ACCESS_TOKEN || "").trim(),
-      refreshToken: String(process.env.CTRADER_REFRESH_TOKEN || "").trim(),
-      accountId: process.env.CTRADER_ACCOUNT_ID || null,
-      environment: ctraderEnvironment,
-      tokenStore: ctraderTokens,
-      log,
-    })
-  : new CTraderMcpClient({
-      url: CONFIG.upstreamUrl,
-      token: CONFIG.upstreamToken,
-      timeoutMs: CONFIG.mcpTimeoutMs,
-      protocolVersion: CONFIG.protocolVersion,
-      environment: ctraderEnvironment,
-      log,
-    });
+const client = new CTraderMcpClient({
+  url: CONFIG.upstreamUrl,
+  token: CONFIG.upstreamToken,
+  timeoutMs: CONFIG.mcpTimeoutMs,
+  protocolVersion: CONFIG.protocolVersion,
+  log,
+});
 const market = new MarketData({ client, config: CONFIG, log });
 const notifier = new Notifier({
   token: process.env.TELEGRAM_BOT_TOKEN,
   chatId: process.env.TELEGRAM_CHAT_ID,
-  apiBase: CONFIG.telegramApiUrl,
   log,
 });
 const store = new WatchStore({
@@ -245,6 +174,7 @@ const store = new WatchStore({
   log,
   limits: {
     setups: CONFIG.maxSetupWatches,
+    traps: CONFIG.maxTrapWatches,
     resolved: CONFIG.resolvedLimit,
   },
 });
@@ -254,20 +184,7 @@ let newsCache = { events: [], fetchedAt: 0, expiresAt: 0, lastError: null };
 let newsRefreshInFlight = null;
 const watchSessions = new Map();
 
-const engine = createEngine({
-  store,
-  market,
-  notify,
-  config: CONFIG,
-  gates: applyExternalGates,
-  log,
-  persist: scheduleSave,
-});
-
 const app = express();
-// Behind Vercel's (or Railway's) proxy: req.protocol must say https, or
-// the OAuth metadata would advertise http URLs.
-app.set("trust proxy", true);
 app.use(
   express.json({
     limit: "256kb",
@@ -278,66 +195,13 @@ app.use(
 );
 app.use(express.urlencoded({ extended: true }));
 
-// What clients actually asked for, newest first, so a connector that
-// fails ("trouble connecting") can be debugged from the outside and the
-// owner can see whether the assistant really called the snapshot and
-// register_watch. Shapes only: no headers' values, no query strings, no
-// codes or tokens; long digit runs (account ids in redirect URIs) masked.
-// /tick and /health are left out as noise. Logged before the handler
-// runs, because on Vercel nothing is guaranteed to run after the response.
-const REQUEST_LOG_KEY = "watch-monitor:requests";
-const requestLog = [];
-const mask = (value) => String(value ?? "").replace(/\d{6,}/g, "…").slice(0, 160);
-async function logRequest(entry) {
-  const stamped = { at: new Date().toISOString(), ...entry };
-  try {
-    if (kv) await kv.push(REQUEST_LOG_KEY, stamped, 50);
-    else requestLog.unshift(stamped), requestLog.splice(50);
-  } catch {
-    // never let the debug log cost a real request
-  }
+function htmlEscape(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
 }
-app.use(async (req, _res, next) => {
-  // Noise: the cron, health checks, and clients closing MCP sessions.
-  if (["/tick", "/health", "/debug/requests", "/favicon.ico"].includes(req.path) || req.method === "DELETE") return next();
-  const body = req.body && typeof req.body === "object" ? req.body : {};
-  await logRequest({
-    method: req.method,
-    path: req.path,
-    auth: req.get("authorization") ? "bearer" : req.query?.token ? "query" : "none",
-    ua: mask(req.get("user-agent")).slice(0, 60),
-    ...(body.method ? { rpc: body.method } : {}),
-    ...(body.params?.name ? { tool: body.params.name } : {}),
-    ...(body.params?.protocolVersion ? { protocol: body.params.protocolVersion } : {}),
-    ...(req.path === "/register"
-      ? {
-          redirect_uris: (body.redirect_uris || []).map(mask),
-          auth_method: body.token_endpoint_auth_method ?? null,
-          grant_types: body.grant_types ?? null,
-        }
-      : {}),
-    ...(req.path === "/token" ? { grant_type: body.grant_type ?? null, has_verifier: Boolean(body.code_verifier) } : {}),
-    ...(req.path === "/authorize" && req.method === "GET"
-      ? { redirect_uri: mask(req.query.redirect_uri), pkce: req.query.code_challenge_method ?? null }
-      : {}),
-  });
-  next();
-});
-app.get("/debug/requests", async (req, res) => {
-  if (rejectUnauthorized(req, res)) return;
-  try {
-    res.json(kv ? await kv.list(REQUEST_LOG_KEY) : requestLog);
-  } catch (error) {
-    res.status(503).json({ error: error.message });
-  }
-});
-
-// Clients that can only do OAuth (the Gemini app) sign in with the monitor
-// password once and get a token; a static bearer still works for the rest.
-const verifyOAuthAccess = CONFIG.authToken
-  ? installOAuth(app, { password: CONFIG.authToken, cors: setupCors })
-  : () => false;
-if (OPEN_API) installOpenApiConnect(app, { client, authorized, tokenStore: ctraderTokens });
 
 function notify(text, options = {}) {
   return notifier.enqueue(text, options);
@@ -345,9 +209,6 @@ function notify(text, options = {}) {
 
 let saveTimer = null;
 function scheduleSave(immediate = false) {
-  // On Vercel, withState() writes the snapshot once at the end of the
-  // request; there is no file to write and no process to debounce in.
-  if (SERVERLESS) return;
   if (immediate) {
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = null;
@@ -362,7 +223,161 @@ function scheduleSave(immediate = false) {
 }
 
 // ---------------------------------------------------------------------------
-// §3 Gates
+// §3 Resolution paths
+//
+// Every terminal transition funnels through resolveWatch. It is
+// idempotent by construction: store.beginResolution() is the only door,
+// and it can be walked through once. Notification is enqueued, never
+// awaited, so a slow or failing Telegram cannot hold a watch in
+// RESOLVING — but the delivery outcome is recorded against the
+// resolution so a silent non-delivery is visible in list_watches.
+
+function resolveWatch(watch, status, extra = {}, message = null, priority = "critical") {
+  if (!store.beginResolution(watch.id)) return false;
+  try {
+    const record = store.finalize(watch, status, extra);
+    if (message) {
+      const result = notify(message, { dedupeKey: `${watch.id}:${status}`, priority });
+      record.notification = { queued: result.queued, at: new Date().toISOString() };
+    }
+    scheduleSave(true);
+    return true;
+  } finally {
+    store.endResolution(watch.id);
+  }
+}
+
+function confirmWatch(watch, price, result, gates) {
+  return resolveWatch(
+    watch,
+    "CONFIRMED",
+    {
+      resolvedPrice: price,
+      signals: result.signals,
+      strength: result.strength,
+      gates: gates.summary,
+    },
+    `<b>REAL CONFIRMATION — ENTER NOW</b>\n` +
+      `<b>Symbol:</b> ${htmlEscape(watch.symbol)}\n` +
+      `<b>Direction:</b> ${htmlEscape(watch.direction.toUpperCase())}\n` +
+      `<b>Entry:</b> ${htmlEscape(formatLevel(watch.entry))} | <b>Price:</b> ${htmlEscape(formatLevel(price))}\n` +
+      `<b>SL:</b> ${htmlEscape(formatLevel(watch.sl))} | <b>TP1:</b> ${htmlEscape(formatLevel(watch.tp1))}\n` +
+      `<b>Evidence:</b> ${htmlEscape(result.signals.join(" + "))}\n` +
+      `<b>Strength:</b> ${htmlEscape(result.strength)}\n` +
+      `<b>Kill zone:</b> ${htmlEscape(gates.zone || "disabled")}`,
+  );
+}
+
+function failWatch(watch, price, reason) {
+  return resolveWatch(
+    watch,
+    "FAILED",
+    { resolvedPrice: price, reason },
+    `<b>SETUP FAILED</b>\n` +
+      `<b>Symbol:</b> ${htmlEscape(watch.symbol)} (${htmlEscape(watch.direction)})\n` +
+      `<b>Reason:</b> ${htmlEscape(reason)}\n` +
+      `<b>Price:</b> ${htmlEscape(formatLevel(price))}\n<b>Action:</b> Do not enter.`,
+  );
+}
+
+function expireWatch(watch, reason, price) {
+  return resolveWatch(
+    watch,
+    "EXPIRED",
+    { reason, resolvedPrice: price ?? null },
+    `<b>SETUP EXPIRED</b>\n` +
+      `<b>Symbol:</b> ${htmlEscape(watch.symbol)} (${htmlEscape(watch.direction)})\n` +
+      `<b>Reason:</b> ${htmlEscape(reason)}\n` +
+      (Number.isFinite(price) ? `<b>Price:</b> ${htmlEscape(formatLevel(price))}\n` : "") +
+      `<b>Action:</b> Do not enter.`,
+  );
+}
+
+function cancelWatchById(watchId, reason) {
+  const watch = store.get(watchId);
+  if (!watch) {
+    // Idempotent by design: cancelling an already-resolved watch is a
+    // reportable no-op, not an error. mcp_contract.md §7 previously
+    // warned this was unverified; it is now specified.
+    const resolved = store.resolved.get(watchId);
+    if (resolved) {
+      return { status: "ALREADY_RESOLVED", watch_id: watchId, resolution: resolved.status };
+    }
+    return null;
+  }
+  const kind = watch.kind || "SETUP";
+  const ok = resolveWatch(
+    watch,
+    "CANCELLED",
+    { reason },
+    `<b>WATCH CANCELLED</b>\n` +
+      `<b>${htmlEscape(watch.symbol)}</b> (${htmlEscape(kind)})\n` +
+      `<b>Reason:</b> ${htmlEscape(reason)}`,
+    "normal",
+  );
+  return ok
+    ? { status: "CANCELLED", watch_id: watchId, kind }
+    : { status: "ALREADY_RESOLVING", watch_id: watchId, kind };
+}
+
+// ---------------------------------------------------------------------------
+// §4 Data quality
+//
+// A watch whose feed is unreliable is not a watch that has failed and not
+// a watch that is fine. It is a watch that cannot be evaluated, and the
+// human is told so once, with a recovery message when it clears.
+
+function noteDataQuality(watch, ok, detail = null) {
+  const now = Date.now();
+  if (ok) {
+    watch.lastGoodUpdateAt = now;
+    watch.degradedSince = null;
+    if (watch.degradedNotified) {
+      watch.degradedNotified = false;
+      notify(
+        `<b>MONITORING RECOVERED</b>\n<b>${htmlEscape(watch.symbol)}</b> live data is stable again.`,
+        { dedupeKey: `${watch.id}:recovered:${Math.floor(now / 60000)}` },
+      );
+    }
+    return;
+  }
+  if (!watch.degradedSince) watch.degradedSince = now;
+  if (now - watch.degradedSince >= staleBudget(watch) && !watch.degradedNotified) {
+    watch.degradedNotified = true;
+    notify(
+      `<b>LIVE DATA DEGRADED</b>\n` +
+        `<b>${htmlEscape(watch.symbol)}</b> confirmation is paused` +
+        `${detail ? `: ${htmlEscape(detail)}` : ""}.\n` +
+        `<i>Safety checks continue whenever a usable price is available.</i>`,
+      { dedupeKey: `${watch.id}:degraded`, priority: "critical" },
+    );
+  }
+}
+
+/**
+ * Quarantine — the feed produced a price that cannot be reconciled with
+ * the levels this watch was registered against. Nothing about this watch
+ * can be evaluated safely, including its stop, so the only honest action
+ * is to stop pretending it is monitored and say so loudly.
+ */
+function quarantine(watch, detail) {
+  if (watch.lifecycle === "QUARANTINED") return;
+  watch.lifecycle = "QUARANTINED";
+  watch.lastReason = "quarantined_scale_mismatch";
+  watch.quarantine = { detail, at: new Date().toISOString() };
+  store.dirty = true;
+  notify(
+    `<b>⚠ WATCH QUARANTINED — NOT MONITORED</b>\n` +
+      `<b>${htmlEscape(watch.symbol)}</b> (${htmlEscape(watch.kind || "SETUP")})\n` +
+      `<b>Problem:</b> ${htmlEscape(detail)}\n` +
+      `<b>Action:</b> this watch is NOT being monitored. Treat any position as unwatched, ` +
+      `cancel the watch and re-run the pipeline.`,
+    { dedupeKey: `${watch.id}:quarantine`, priority: "critical" },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// §5 Gates
 
 async function fetchNewsCalendar() {
   for (const url of CONFIG.newsFeedUrls) {
@@ -389,8 +404,7 @@ async function fetchNewsCalendar() {
             timestamp,
           };
         })
-        // Only what can gate: the cache rides in the state every tick reads.
-        .filter((event) => event && CONFIG.newsImpacts.has(event.impact));
+        .filter(Boolean);
     } catch (error) {
       log(`news ${url} failed: ${error.message}`);
     } finally {
@@ -426,14 +440,6 @@ async function getNewsCalendar() {
   }
 }
 
-// The cached calendar still describes `nowMs` if the week it lists spans
-// it, with a day of slack at either end for quiet Mondays and Fridays.
-function calendarCovers(events, nowMs) {
-  if (!events?.length) return false;
-  const times = events.map((event) => event.timestamp);
-  return nowMs >= Math.min(...times) - PERIOD_MS.D1 && nowMs <= Math.max(...times) + PERIOD_MS.D1;
-}
-
 async function newsStatusForWatch(watch, nowMs = Date.now()) {
   if (manualNewsLockout.active) {
     return { blocked: true, reason: manualNewsLockout.reason || "Manual lockout", source: "manual" };
@@ -452,13 +458,10 @@ async function newsStatusForWatch(watch, nowMs = Date.now()) {
       source: "scheduled",
     };
   }
-  if (newsCache.lastError && !calendarCovers(newsCache.events, nowMs)) {
+  if (newsCache.lastError) {
     // Defaulting to fail-closed: an unknown news state during a
     // high-impact window is exactly when a confirmation is most likely to
-    // be a liquidity artefact rather than a signal. But a failed refresh
-    // does not make the week's calendar we already hold unknown — the
-    // feed is the whole week — and v6.0 blocked every confirmation for as
-    // long as the feed kept failing even with that calendar in hand.
+    // be a liquidity artefact rather than a signal.
     return CONFIG.newsFailClosed
       ? { blocked: true, reason: newsCache.lastError, source: "unavailable" }
       : { blocked: false, source: "unavailable-fail-open" };
@@ -468,9 +471,10 @@ async function newsStatusForWatch(watch, nowMs = Date.now()) {
 
 async function applyExternalGates(watch, spread) {
   const reasons = [];
-  // No session or kill-zone filter (the owner's call, 23 Oct): when to
-  // trade is the analysis's decision. The session is only reported.
   const session = killZoneStatus();
+  if (CONFIG.killZoneEnabled && !session.active) {
+    reasons.push(session.weekend ? "Weekend" : session.inLunch ? "NY Lunch" : "Outside kill zone");
+  }
   const news = await newsStatusForWatch(watch);
   if (news.blocked) reasons.push(`News: ${news.reason}`);
   return {
@@ -482,140 +486,449 @@ async function applyExternalGates(watch, spread) {
 }
 
 // ---------------------------------------------------------------------------
-// §4 Market snapshot
-//
-// One tool call instead of ~15. The skill used to call get_symbols,
-// get_spot_prices, six get_trendbars, six more for the SMT partners and
-// get_news_calendar on every run — each one a separate "Allow?" prompt
-// in the client. Prices come back already scaled, and the liquidity map
-// is computed here from the candles rather than eyeballed by the model.
+// §6 Setup watch engine
 
-const SNAPSHOT_BARS = { D1: 60, H4: 100, H1: 100, M15: 200, M5: 200, M1: 100 };
-const SMT_TIMEFRAMES = ["H1", "M15", "M5"];
+const SMT_BUNDLES = {
+  XAUUSD: [{ symbol: "XAGUSD" }, { symbol: "EURUSD", inverse: true }],
+  XAGUSD: [{ symbol: "XAUUSD" }, { symbol: "EURUSD", inverse: true }],
+  BTCUSD: [{ symbol: "ETHUSD" }],
+  ETHUSD: [{ symbol: "BTCUSD" }],
+  USTEC: [{ symbol: "US500" }, { symbol: "US30" }],
+  US30: [{ symbol: "US500" }, { symbol: "USTEC" }],
+  US500: [{ symbol: "USTEC" }, { symbol: "US30" }],
+  NAS100: [{ symbol: "US500" }],
+  SPX500: [{ symbol: "USTEC" }],
+  EURUSD: [{ symbol: "GBPUSD" }],
+  GBPUSD: [{ symbol: "EURUSD" }],
+};
 
-const round5 = (value) => Number(value.toFixed(5));
+async function tickSetupWatch(watch) {
+  const now = Date.now();
 
-function packCandles(bars, timeframe, nowMs) {
-  const series = closedSeries(bars || [], timeframe, { nowMs, staleBars: Infinity });
-  if (series.status === "NO_TIMESTAMP") return { error: "feed omitted bar timestamps" };
-  if (!bars?.length) return { error: "no candles returned" };
-  const row = (bar) => [
-    `${new Date(bar.timestampMs).toISOString().slice(0, 16)}Z`,
-    round5(bar.open),
-    round5(bar.high),
-    round5(bar.low),
-    round5(bar.close),
-  ];
-  const last = bars.at(-1);
-  return {
-    closed: series.bars.map(row),
-    forming: barIsClosed(last, periodMs(timeframe), nowMs) ? null : row(last),
-  };
-}
-
-async function marketSnapshot(args) {
-  const symbol = String(args.symbol || "").toUpperCase().replace(/[\s/\-.]/g, "");
-  if (!/^[A-Z0-9_]{3,20}$/.test(symbol)) throw new Error("symbol is malformed");
-  const requested = Array.isArray(args.timeframes) && args.timeframes.length
-    ? args.timeframes.map((tf) => String(tf).toUpperCase().replace(/_/g, ""))
-    : Object.keys(SNAPSHOT_BARS);
-  const bad = requested.filter((tf) => !PERIOD_MS[tf]);
-  if (bad.length) throw new Error(`unknown timeframe(s): ${bad.join(", ")}`);
-
-  const bundle = SMT_BUNDLES[symbol] || [];
-  const ids = await market.resolveSymbols([symbol, ...bundle.map((item) => item.symbol)]);
-  const symbolId = ids.get(symbol);
-  if (symbolId === undefined) {
-    const close = [...market.symbols.keys()].filter((name) => name.includes(symbol.slice(0, 3))).slice(0, 10);
-    throw new Error(
-      `${symbol} is not on this cTrader account (Nasdaq is USTEC, S&P is US500, gold is XAUUSD). Close matches: ${close.join(", ") || "none"}`,
-    );
+  // Expiry is checked before anything that can fail, so an unreachable
+  // upstream can never keep a watch alive past its own deadline.
+  if (watch.expiresAt && now >= watch.expiresAt) {
+    watch.lastReason = "expired";
+    expireWatch(watch, "Watch expiration reached");
+    return;
   }
-  const spot = await market.spot(symbol, symbolId, { maxAgeMs: 0 });
-  if (!spot) throw new Error("live spot price unavailable from cTrader — retry; never analyse without it");
 
-  const nowMs = Date.now();
-  // Liquidity needs D1/H1/M15/M5 even when the caller asked for less.
-  const needed = [...new Set([...requested, "D1", "H1", "M15", "M5"])];
-  const raw = Object.fromEntries(
-    await Promise.all(
-      needed.map(async (tf) => [tf, await market.history(symbol, symbolId, tf, SNAPSHOT_BARS[tf] ?? 100)]),
-    ),
-  );
+  const bundle = SMT_BUNDLES[watch.symbol] || [];
+  const wanted = [watch.symbol, ...bundle.map((item) => item.symbol)];
+  const ids = await market.resolveSymbols(wanted);
+  const mainId = ids.get(watch.symbol);
+  if (mainId === undefined) {
+    watch.lastReason = "symbol_unavailable";
+    noteDataQuality(watch, false, "symbol is unavailable from cTrader");
+    return;
+  }
+
+  const spot = await market.spot(watch.symbol, mainId);
+  if (!spot) {
+    watch.lastReason = "spot_unavailable";
+    noteDataQuality(watch, false, "live spot price unavailable");
+    return;
+  }
 
   const mid = (spot.bid + spot.ask) / 2;
-  const reference = raw.M15?.at(-1)?.close ?? raw.H1?.at(-1)?.close;
-  const scale = market.checkScale(mid, reference);
-  const closedOf = (tf) => closedSeries(raw[tf] || [], tf, { nowMs, staleBars: Infinity }).bars;
-  const liquidity = liquidityMap({
-    d1: closedOf("D1"),
-    h1: closedOf("H1"),
-    m15: closedOf("M15"),
-    price: mid,
-    nowMs,
-    equalTolerance: Math.max(priceTolerance(symbol, mid), calcATR(closedOf("H1"), 14) * 0.1),
-  });
-  liquidity.inducement = Object.fromEntries(
-    ["M15", "M5"].map((tf) => [
-      tf,
-      { buy: inducement(closedOf(tf), "buy", mid), sell: inducement(closedOf(tf), "sell", mid) },
-    ]),
-  );
 
-  const smtPartners = [];
-  for (const item of bundle) {
-    const partnerId = ids.get(item.symbol);
-    if (partnerId === undefined) {
-      smtPartners.push({ symbol: item.symbol, inverse: Boolean(item.inverse), error: "not on this account" });
-      continue;
-    }
-    const candles = {};
-    for (const tf of SMT_TIMEFRAMES) {
-      candles[tf] = packCandles(await market.history(item.symbol, partnerId, tf, SNAPSHOT_BARS[tf]), tf, nowMs);
-    }
-    smtPartners.push({ symbol: item.symbol, inverse: Boolean(item.inverse), candles });
+  // Falsify the price scale against the level the pipeline computed
+  // independently. If gold quotes come back at 0.044 against an entry of
+  // 4414.69, every comparison below is meaningless and the watch must
+  // stop, not "keep waiting for a touch that never comes".
+  const scale = market.checkScale(mid, watch.entry);
+  if (!scale.ok) {
+    quarantine(
+      watch,
+      `feed price ${formatLevel(mid)} is irreconcilable with registered entry ${formatLevel(watch.entry)}` +
+        (scale.impliedFactor ? ` (implied scale factor ${scale.impliedFactor})` : ""),
+    );
+    return;
   }
 
-  const currencies = symbolCurrencies(symbol);
-  // Only the news cache is monitor state; the candle work above runs
-  // outside the lock so a snapshot never stalls a /tick.
-  const { status: newsStatus, events } = await withState(async () => ({
-    status: await newsStatusForWatch({ symbol }, nowMs),
-    events: await getNewsCalendar(),
-  }));
-  const clock = nyClock(nowMs);
-  return {
-    symbol,
-    as_of: new Date(nowMs).toISOString(),
-    price: { bid: round5(spot.bid), ask: round5(spot.ask), mid: round5(mid), spread: round5(spot.ask - spot.bid) },
-    ...(scale.ok || !Number.isFinite(reference) ? {} : { warning: `spot ${formatLevel(mid)} disagrees with the last candle close ${formatLevel(reference)} — do not analyse, report a data problem` }),
-    session: {
-      ny_time: `${String(Math.floor(clock.minutes / 60)).padStart(2, "0")}:${String(clock.minutes % 60).padStart(2, "0")} ${clock.weekday}`,
-      ...killZoneStatus(nowMs),
-    },
-    news: {
-      ...newsStatus,
-      upcoming_24h: events
-        .filter(
-          (event) =>
-            currencies.includes(event.country) &&
-            CONFIG.newsImpacts.has(event.impact) &&
-            event.timestamp >= nowMs - CONFIG.newsAfterMs &&
-            event.timestamp <= nowMs + PERIOD_MS.D1,
-        )
-        .map((event) => ({ title: event.title, currency: event.country, at: new Date(event.timestamp).toISOString() })),
-    },
-    liquidity,
-    candle_format: "[open time UTC, open, high, low, close]; `forming` is the still-open bar, never part of `closed`",
-    candles: Object.fromEntries(requested.map((tf) => [tf, packCandles(raw[tf], tf, nowMs)])),
-    smt_partners: smtPartners,
-    rule:
-      `No liquidity taken, no trade. Reversal (Model A): trade away from the pool in liquidity.last_sweep (best when stop_hunt is true) toward the strongest untaken pool on the other side. If nothing was taken (Model B), the untaken pool is the draw — prefer higher strength, EQH/EQL, reachable distance_atr_h1: trade toward it from a POI between liquidity.inducement.<tf>.<dir>.level and its leg_origin, which price can only reach by taking that IDM. Buys from discount, sells from premium (liquidity.dealing_range). h1_imbalances are internal-range draws. register_watch needs sweep_level = the liquidity the setup expects taken (the IDM level, or the swept pool with liquidity_taken: true); the monitor reports when it is taken, and its ENTER NOW does not wait for it. ENTER NOW comes only when price returns to the zone within ${CONFIG.freshZoneMaxMs / 60000} min of last leaving it: register fresh zones (price left them minutes ago), not old ones.`,
+  const spread = spot.ask - spot.bid;
+  const tolerance = priceTolerance(watch.symbol, mid);
+  const executable = watch.direction === "buy" ? spot.ask : spot.bid;
+  const protective = watch.direction === "buy" ? spot.bid : spot.ask;
+
+  const spreadHealth = updateSpreadHealth(watch, spread, tolerance, mid, {
+    enabled: CONFIG.spreadEnabled,
+    baselineSamples: CONFIG.spreadBaselineSamples,
+    historyMax: CONFIG.spreadHistoryMax,
+    anomalyMultiplier: CONFIG.spreadAnomalyMultiplier,
+    capOverride: finiteNumber(process.env[`SPREAD_CAP_${watch.symbol}`]),
+  });
+  watch.spreadSamples = spreadHealth.spreadSamples;
+
+  // -- Safety first, in every lifecycle state -------------------------------
+  //
+  // v5 gated the entire tick on lifecycle ∈ {ARMED, TOUCHED}, so a watch
+  // that reached CONFIRMING and was held by a gate stopped checking its
+  // own stop loss, its invalidation, and its expiry — permanently. Safety
+  // now runs before evidence, on every tick, in ARMED, TOUCHED and
+  // CONFIRMING alike, and it runs even when the spread is abnormal: a bad
+  // quote must not make the service ignore an adverse move.
+  const safety = evaluateSafety(watch, { mid, executable, protective, tolerance });
+  if (safety.action === "FAIL") {
+    watch.lastReason = "risk_line_breached";
+    failWatch(watch, safety.price, safety.reason);
+    return;
+  }
+  if (safety.action === "EXPIRE") {
+    watch.lastReason = "tp1_reached";
+    expireWatch(watch, safety.reason, safety.price);
+    return;
+  }
+  if (safety.action === "TOUCH") {
+    watch.entryTouched = true;
+    watch.entryTouchedAt = new Date().toISOString();
+    watch.lifecycle = "TOUCHED";
+    watch.lastReason = "entry_touched";
+    store.dirty = true;
+    notify(
+      `<b>ENTRY TOUCHED</b>\n` +
+        `<b>${htmlEscape(watch.symbol)}</b> ${htmlEscape(watch.direction.toUpperCase())}\n` +
+        `<b>Entry:</b> ${htmlEscape(formatLevel(watch.entry))} | <b>Price:</b> ${htmlEscape(formatLevel(safety.price))}\n` +
+        `<i>Waiting for persistent live confirmation.</i>`,
+      { dedupeKey: `${watch.id}:touched` },
+    );
+  } else if (safety.action === "WAIT") {
+    watch.lastReason = "armed_waiting_for_touch";
+    noteDataQuality(watch, !spreadHealth.abnormal);
+    return;
+  }
+
+  // -- Evidence -------------------------------------------------------------
+  const [m5raw, m1raw] = await Promise.all([
+    market.bars(watch.symbol, mainId, "M5", 60),
+    market.bars(watch.symbol, mainId, "M1", 80),
+  ]);
+  const m5 = closedSeries(m5raw || [], "M5", { nowMs: now });
+  const m1 = closedSeries(m1raw || [], "M1", { nowMs: now, staleBars: 5 });
+  if (m5.status !== "OK" || m1.status !== "OK" || m5.bars.length < 20 || m1.bars.length < 20) {
+    watch.lastReason = `candles_${(m5.status !== "OK" ? m5.status : m1.status).toLowerCase()}`;
+    noteDataQuality(
+      watch,
+      false,
+      m5.status === "NO_TIMESTAMP" || m1.status === "NO_TIMESTAMP"
+        ? "candle feed omitted bar timestamps; closure cannot be verified"
+        : "insufficient or stale candle history",
+    );
+    return;
+  }
+
+  // Candle bodies and the live quote must describe the same instrument.
+  // Disagreement here means one of the two feeds is wrong and neither can
+  // be used as evidence.
+  const barVsSpot = market.checkScale(m5.bars.at(-1).close, mid);
+  if (!barVsSpot.ok) {
+    watch.lastReason = "candle_spot_divergence";
+    noteDataQuality(
+      watch,
+      false,
+      `candle close ${formatLevel(m5.bars.at(-1).close)} disagrees with live mid ${formatLevel(mid)}`,
+    );
+    return;
+  }
+
+  const partners = [];
+  for (const item of bundle) {
+    const partnerId = ids.get(item.symbol);
+    if (partnerId === undefined) continue;
+    const bars = await market.bars(item.symbol, partnerId, "M5", 45);
+    const series = closedSeries(bars || [], "M5", { nowMs: now });
+    if (series.status === "OK" && series.bars.length >= 20) {
+      partners.push({ symbol: item.symbol, bars: series.bars, inverse: item.inverse === true });
+    }
+  }
+
+  watch.generation = advanceGeneration(watch.generation || { generation: 0 }, m1.latestCloseMs);
+  const atrM5 = calcATR(m5.bars, 14);
+
+  const signals = {
+    cisd: checkCISD(m1.bars, watch.direction),
+    smt: checkSMT(m5.bars, partners, watch.direction),
+    engulfM5: classifyEngulfing(m5.bars, watch.direction, "M5"),
+    engulfM1: classifyEngulfing(m1.bars, watch.direction, "M1"),
+    wick: classifyWick(m5.bars.at(-1), atrM5, watch.direction),
+    acceptance: checkAcceptance(watch, mid, protective, atrM5, tolerance, {
+      atrFraction: CONFIG.acceptanceAtrFraction,
+      riskFraction: CONFIG.acceptanceRiskFraction,
+    }),
   };
+
+  if (spreadHealth.abnormal) {
+    // Evidence is not advanced on a bad quote — the acceptance term is
+    // derived from bid/ask and would be measuring the spread, not the
+    // market.
+    watch.lastReason = "spread_abnormal";
+    noteDataQuality(watch, false, `spread ${formatLevel(spread)} exceeds cap ${formatLevel(spreadHealth.cap)}`);
+    return;
+  }
+  noteDataQuality(watch, true);
+
+  const result = evaluateConfirmation(watch, signals, {
+    mid,
+    tolerance,
+    nowMs: now,
+    generation: watch.generation.generation,
+    hasBarTime: watch.generation.hasBarTime,
+    minHoldMs: CONFIG.minConfirmationHoldMs,
+    requireNewBar: CONFIG.requireNewBar,
+  });
+  watch.evidence = result.evidence;
+  watch.lastSignals = result.signals;
+  store.dirty = true;
+
+  if (!result.enter) {
+    // Evidence that had graduated and then decayed must walk the
+    // lifecycle backwards, visibly, rather than leaving the watch parked
+    // in CONFIRMING with nothing behind it.
+    if (watch.lifecycle === "CONFIRMING") {
+      watch.lifecycle = "TOUCHED";
+      watch.lastReason = "evidence_decayed";
+      watch.lastGateBlockReason = null;
+    } else {
+      watch.lastReason = "evidence_pending";
+    }
+    return;
+  }
+
+  watch.lifecycle = "CONFIRMING";
+  watch.lastReason = "awaiting_gates";
+
+  const gates = await applyExternalGates(watch, spread);
+  if (gates.pass) {
+    watch.lastReason = "confirming";
+    confirmWatch(watch, mid, result, gates);
+    return;
+  }
+  const reasonText = gates.reasons.join(" | ");
+  if (watch.lastGateBlockReason !== reasonText) {
+    watch.lastGateBlockReason = reasonText;
+    watch.lastReason = "gate_blocked";
+    notify(
+      `<b>TECHNICALLY CONFIRMED — WAITING ON GATE</b>\n` +
+        `<b>${htmlEscape(watch.symbol)}</b> ${htmlEscape(watch.direction.toUpperCase())}\n` +
+        `<b>Evidence:</b> ${htmlEscape(result.signals.join(" + "))}\n` +
+        `<b>Blocked by:</b> ${htmlEscape(reasonText)}`,
+      { dedupeKey: `${watch.id}:gate:${reasonText}` },
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
-// §5 Scheduler
+// §7 Trap watch engine
+//
+// A trap watch is not a trade. It monitors one falsifiable statement —
+// a body close beyond the re-entry trigger, normally carried by a
+// displacement candle — and resolves by handing the question back to the
+// pipeline. It never emits an entry, a stop or a target.
+
+function trapHeader(watch) {
+  return `<b>${htmlEscape(watch.symbol)}</b> — ${htmlEscape(watch.bias.toUpperCase())} bias · ${htmlEscape(watch.timeframe)}\n`;
+}
+
+async function tickTrapWatch(watch) {
+  const now = Date.now();
+  if (watch.expiresAt && now >= watch.expiresAt) {
+    watch.lastReason = "expired";
+    resolveWatch(
+      watch,
+      "EXPIRED",
+      { reason: "Trap watch expiration reached" },
+      `<b>TRAP WATCH EXPIRED</b>\n` +
+        trapHeader(watch) +
+        `<b>Trigger never printed:</b> ${htmlEscape(formatLevel(watch.trigger_level))}\n` +
+        `<i>Re-run the pipeline from scratch if you still want this instrument.</i>`,
+      "normal",
+    );
+    return;
+  }
+
+  const ids = await market.resolveSymbols([watch.symbol]);
+  const symbolId = ids.get(watch.symbol);
+  if (symbolId === undefined) {
+    watch.lastReason = "symbol_unavailable";
+    noteDataQuality(watch, false, "symbol is unavailable from cTrader");
+    return;
+  }
+
+  const span = periodMs(watch.timeframe);
+  const raw = await market.bars(watch.symbol, symbolId, watch.timeframe, 40);
+  const series = closedSeries(raw || [], watch.timeframe, { nowMs: now, staleBars: 3 });
+  if (series.status !== "OK" || series.bars.length < 5) {
+    watch.lastReason = `candles_${series.status.toLowerCase()}`;
+    noteDataQuality(
+      watch,
+      false,
+      series.status === "NO_TIMESTAMP"
+        ? "candle feed omitted bar timestamps; a closed body cannot be proven"
+        : "insufficient or stale candle history",
+    );
+    return;
+  }
+  const closed = series.bars;
+  const current = closed.at(-1);
+
+  const spot = await market.spot(watch.symbol, symbolId);
+  const price = spot ? (spot.bid + spot.ask) / 2 : current.close;
+
+  const scale = market.checkScale(price, watch.trigger_level);
+  if (!scale.ok) {
+    quarantine(
+      watch,
+      `feed price ${formatLevel(price)} is irreconcilable with trigger level ${formatLevel(watch.trigger_level)}`,
+    );
+    return;
+  }
+  noteDataQuality(watch, true);
+  watch.lastPrice = price;
+
+  const atr = calcATR(closed, 14);
+  const approachDistance = Math.max(
+    priceTolerance(watch.symbol, price),
+    atr * CONFIG.trapApproachAtrFraction,
+  );
+  const approaching =
+    watch.bias === "buy"
+      ? price >= watch.trigger_level - approachDistance && price < watch.trigger_level
+      : price <= watch.trigger_level + approachDistance && price > watch.trigger_level;
+  if (approaching && !watch.approachNotified) {
+    watch.approachNotified = true;
+    watch.lastReason = "approaching";
+    store.dirty = true;
+    notify(
+      `<b>TRAP TRIGGER APPROACHING</b>\n` +
+        trapHeader(watch) +
+        `<b>Price:</b> ${htmlEscape(formatLevel(price))} → <b>trigger</b> ${htmlEscape(formatLevel(watch.trigger_level))}\n` +
+        `<i>No action yet. Waiting for a ${htmlEscape(watch.timeframe)} body close beyond it.</i>`,
+      { dedupeKey: `${watch.id}:approach` },
+    );
+  }
+
+  // A bar that closed before this watch was armed is history, not a
+  // signal — the analysis that produced the trigger already saw it.
+  const closeTimeMs = current.timestampMs + span;
+  if (closeTimeMs < watch.armedAtMs) {
+    watch.lastReason = "awaiting_post_arm_candle";
+    return;
+  }
+
+  const key = barKey(current);
+  if (key === null) {
+    watch.lastReason = "unidentifiable_candle";
+    noteDataQuality(watch, false, "candle has no usable identity");
+    return;
+  }
+  if (watch.lastEvaluatedCandle === key) {
+    watch.lastReason = "awaiting_new_closed_candle";
+    return;
+  }
+  watch.lastEvaluatedCandle = key;
+  watch.lastReason = "evaluating_closed_candle";
+  store.dirty = true;
+
+  // The flip is tested first: if the read broke the other way, the
+  // trigger is no longer the relevant question. Testing them in the other
+  // order would let a single bar that closed through both levels report
+  // CONDITIONS_MET on a thesis that had already died.
+  if (
+    watch.invalidation_level !== null &&
+    bodyClosedBeyond(current, watch.invalidation_level, oppositeBias(watch.bias))
+  ) {
+    watch.lastReason = "flipped";
+    resolveWatch(
+      watch,
+      "FLIPPED",
+      { reason: "Invalidation level closed through against the bias", resolvedPrice: current.close },
+      `<b>TRAP READ FLIPPED</b>\n` +
+        trapHeader(watch) +
+        `<b>${htmlEscape(watch.timeframe)} close:</b> ${htmlEscape(formatLevel(current.close))} through ${htmlEscape(formatLevel(watch.invalidation_level))}\n` +
+        (watch.flip_note ? `<b>Opens:</b> ${htmlEscape(watch.flip_note)}\n` : "") +
+        `<b>Action:</b> the ${htmlEscape(watch.bias.toUpperCase())} read is dead. Do not enter. ` +
+        `Re-run the pipeline if you want the other side.`,
+    );
+    return;
+  }
+
+  if (!bodyClosedBeyond(current, watch.trigger_level, watch.bias)) {
+    watch.lastReason = "awaiting_trigger";
+    return;
+  }
+
+  const displacement = displacementCheck(
+    closed,
+    watch.bias,
+    CONFIG.trapDisplacementMultiple,
+    CONFIG.trapDisplacementLookback,
+  );
+  const fvg = fvgCheck(closed, watch.bias);
+  const missing = [];
+  if (watch.require_displacement && !displacement.present) missing.push("displacement");
+  if (watch.require_fvg && !fvg.present) missing.push("FVG");
+
+  if (missing.length) {
+    watch.partialCount = (watch.partialCount || 0) + 1;
+    // Bounded, not one-shot: the second and third time the level is taken
+    // without delivery is information, but the tenth is noise.
+    if (watch.partialCount <= 2) {
+      watch.lastReason = "trigger_level_taken_conditions_incomplete";
+      notify(
+        `<b>TRIGGER LEVEL TAKEN — CONDITIONS INCOMPLETE</b>\n` +
+          trapHeader(watch) +
+          `<b>${htmlEscape(watch.timeframe)} close:</b> ${htmlEscape(formatLevel(current.close))} beyond ${htmlEscape(formatLevel(watch.trigger_level))}\n` +
+          `<b>Still missing:</b> ${htmlEscape(missing.join(" + "))}\n` +
+          (displacement.body !== null
+            ? `<b>Body:</b> ${htmlEscape(formatLevel(displacement.body))} vs ${htmlEscape(formatLevel(displacement.threshold))} required\n`
+            : "") +
+          `<i>Still watching. No entry.</i>`,
+        { dedupeKey: `${watch.id}:partial:${key}` },
+      );
+    } else {
+      watch.lastReason = "still_missing_conditions";
+    }
+    return;
+  }
+
+  const session = killZoneStatus();
+  const news = await newsStatusForWatch(watch);
+  const ageHours = (now - watch.armedAtMs) / 3_600_000;
+  watch.lastReason = "conditions_met";
+  resolveWatch(
+    watch,
+    "CONDITIONS_MET",
+    {
+      reason: "Trigger close with required delivery",
+      resolvedPrice: current.close,
+      displacement,
+      fvg,
+      session,
+      news,
+      context_age_hours: Number(ageHours.toFixed(2)),
+    },
+    `<b>TRAP CONDITIONS MET — RE-RUN THE PIPELINE</b>\n` +
+      trapHeader(watch) +
+      `<b>${htmlEscape(watch.timeframe)} close:</b> ${htmlEscape(formatLevel(current.close))} beyond ${htmlEscape(formatLevel(watch.trigger_level))}\n` +
+      (displacement.present
+        ? `<b>Displacement:</b> body ${htmlEscape(formatLevel(displacement.body))} vs ${htmlEscape(formatLevel(displacement.threshold))} required\n`
+        : "") +
+      (fvg.present
+        ? `<b>FVG:</b> ${htmlEscape(formatLevel(fvg.from))} – ${htmlEscape(formatLevel(fvg.to))}\n`
+        : "") +
+      (watch.what_is_missing ? `<b>Was missing:</b> ${htmlEscape(watch.what_is_missing)}\n` : "") +
+      (watch.trigger_note ? `<b>Note:</b> ${htmlEscape(watch.trigger_note)}\n` : "") +
+      `<b>Session:</b> ${htmlEscape(session.zone || (session.inLunch ? "NY Lunch" : "outside kill zone"))} | ` +
+      `<b>News:</b> ${htmlEscape(news.blocked ? news.reason : "clear")}\n` +
+      `<b>Context age:</b> ${htmlEscape(ageHours.toFixed(1))}h` +
+      (ageHours > 8 ? ` — <b>stale, re-derive every level from live data</b>` : "") +
+      `\n<b>Action:</b> re-run the sniper pipeline on ${htmlEscape(watch.symbol)}. ` +
+      `This watch produces no entry, SL or TP.`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// §8 Scheduler
 //
 // One timer for the whole service. v5 created a setInterval per watch,
 // which meant N watches produced N uncoordinated upstream bursts, N
@@ -625,18 +938,14 @@ async function marketSnapshot(args) {
 // layer coalescing shared symbol lookups across all of them.
 
 let schedulerTimer = null;
-let schedulerRunningSince = 0;
+let schedulerRunning = false;
 
 async function runDueWatches() {
-  // A run that never finished (on Vercel: a request cut off mid-tick, its
-  // promise orphaned on a reused instance) must not silently turn every
-  // later tick on that instance into a no-op. Past 2 minutes it is dead.
-  if (schedulerRunningSince && Date.now() - schedulerRunningSince < 120_000) return;
-  const runStartedAt = Date.now();
-  schedulerRunningSince = runStartedAt;
+  if (schedulerRunning) return;
+  schedulerRunning = true;
   const now = Date.now();
   try {
-    const due = store.active().filter(
+    const due = [...store.active(), ...store.activeTraps()].filter(
       (watch) =>
         !watch.monitorRunning &&
         watch.lifecycle !== "RESOLVED" &&
@@ -644,11 +953,27 @@ async function runDueWatches() {
         watch.lifecycle !== "QUARANTINED" &&
         (watch.nextDueAt ?? 0) <= now,
     );
-    for (const watch of due) await engine.runWatch(watch);
+    for (const watch of due) {
+      watch.monitorRunning = true;
+      const cadence = watch.kind === "TRAP" ? CONFIG.trapIntervalMs : CONFIG.setupIntervalMs;
+      try {
+        if (watch.kind === "TRAP") await tickTrapWatch(watch);
+        else await tickSetupWatch(watch);
+      } catch (error) {
+        log(`watch ${watch.id} failed safely: ${error.message}`);
+        noteDataQuality(watch, false, "monitor tick failed");
+      } finally {
+        watch.monitorRunning = false;
+        watch.lastTickAt = new Date().toISOString();
+        // Scheduled from completion, not from start: a slow upstream
+        // cannot cause ticks to pile up on top of each other.
+        watch.nextDueAt = Date.now() + cadence;
+      }
+    }
     await notifier.drain();
     if (store.dirty) scheduleSave();
   } finally {
-    if (schedulerRunningSince === runStartedAt) schedulerRunningSince = 0;
+    schedulerRunning = false;
   }
 }
 
@@ -658,104 +983,13 @@ function startScheduler() {
 }
 
 // ---------------------------------------------------------------------------
-// §6 Vercel request lifecycle
-//
-// On Vercel every request may land on a fresh instance and nothing runs
-// after the response, so each request that touches monitor state takes
-// the global lock, loads the snapshot from Redis, does its work, flushes
-// Telegram, writes the snapshot back, and releases. As a long-lived
-// process this is a plain call: the state already lives in memory.
-
-const STATE_KEY = "watch-monitor:state";
-const LOCK_KEY = "watch-monitor:lock";
-// Resolved watches, newest first, capped. Kept out of STATE_KEY so the
-// snapshot every tick reads and writes holds only the live watches: the
-// Upstash free tier allows 10 GB of traffic a month.
-const RESOLVED_KEY = "watch-monitor:resolved";
-// One replay fixture per resolved setup (engine.captureReplay), 30 days.
-const REPLAY_PREFIX = "watch-monitor:replay:";
-const REPLAY_TTL_S = 30 * 86_400;
-
-async function withState(fn, { tick = false } = {}) {
-  if (!SERVERLESS) return fn();
-  if (!kv) {
-    throw new Error(
-      "Storage is not configured: add Upstash Redis to this Vercel project (Storage → Upstash), then redeploy.",
-    );
-  }
-  // A tick that finds the lock taken skips: the next one is a minute away.
-  const release = await kv.lock(LOCK_KEY, 120_000, tick ? 0 : 25_000);
-  if (!release) {
-    if (tick) return { skipped: "busy" };
-    throw new Error("monitor is busy with another request; retry in a few seconds");
-  }
-  try {
-    const parsed = await kv.get(STATE_KEY);
-    const now = Date.now();
-    // If the cron stopped for longer than MAX_TICK_GAP_MS the watches went
-    // unobserved, so the tick treats the gap exactly like a restart.
-    const gapMs = parsed?.lastTickAt ? now - parsed.lastTickAt : null;
-    const keepEvidence = !tick || gapMs === null || gapMs <= CONFIG.maxTickGapMs;
-    const recovery = store.restore(parsed, { nowMs: now, keepEvidence });
-    // A snapshot from before 6.19 still carries the resolved history: move
-    // it to its list once.
-    const legacyResolved = parsed?.resolved?.length ? parsed.resolved : [];
-    notifier.restore(recovery.outbox);
-    if (parsed?.news) newsCache = parsed.news;
-    manualNewsLockout = parsed?.lockout || { active: false, reason: null, setAt: null };
-    if (!keepEvidence && (recovery.setups || recovery.expired)) {
-      notify(
-        `<b>MONITOR GAP — TICKS STOPPED</b>\n` +
-          `<b>No /tick for:</b> ${Math.round(gapMs / 60000)} min\n` +
-          `<b>Watches:</b> ${recovery.setups} active` +
-          (recovery.expired ? ` · ${recovery.expired} expired during the gap` : "") +
-          `\n<i>Nothing was checked during the gap; watches resume from live data now. Check that the cron calling /tick is running.</i>`,
-        { priority: "critical" },
-      );
-    }
-
-    const result = await fn();
-
-    await notifier.drain();
-    const resolvedNow = store.takeResolved();
-    for (const record of [...legacyResolved, ...resolvedNow]) {
-      await kv.push(RESOLVED_KEY, record, CONFIG.resolvedLimit);
-    }
-    await kv.set(
-      STATE_KEY,
-      store.snapshot({
-        withResolved: false,
-        outbox: notifier.serialize(),
-        news: newsCache,
-        lockout: manualNewsLockout,
-        lastTickAt: tick ? Date.now() : parsed?.lastTickAt ?? null,
-      }),
-    );
-    // The candles of each setup this request resolved, for replays: best
-    // effort, after the state is saved, at most 12 s each.
-    for (const record of resolvedNow.filter((item) => item.status !== "CANCELLED")) {
-      try {
-        const fixture = await Promise.race([engine.captureReplay(record, { version: VERSION }), sleep(12_000, null, { ref: false })]);
-        if (fixture) await kv.set(`${REPLAY_PREFIX}${record.id}`, fixture, { ttlSeconds: REPLAY_TTL_S });
-        else log(`replay for ${record.id} not captured (no candles in time)`);
-      } catch (error) {
-        log(`replay for ${record.id} not captured: ${error.message}`);
-      }
-    }
-    return result;
-  } finally {
-    await release();
-  }
-}
-
-// ---------------------------------------------------------------------------
-// §7 Tool surface
+// §9 Tool surface
 
 const CUSTOM_TOOLS = [
   {
     name: "register_watch",
     description:
-      `Registers a trading setup (contract setup/1) for live validation. The monitor confirms it on live data — price reaches the zone within ${CONFIG.freshZoneMaxMs / 60000} min of last leaving it (a fresh return; a later return gets no ENTER NOW, only its outcome is recorded), then live acceptance beyond the entry plus at least one of CISD (M1), SMT divergence (M5), an M5 / M1 engulfing or an M5 rejection, held over a new closed M1 candle — and sends ENTER NOW on Telegram with the registered SL and TPs, only when R:R to TP1 at market is ≥ 1, news and spread are clear and the quote is fresh (no session filter). Then it follows the trade: TP alerts, SL to breakeven after TP1, CLOSE NOW where price turns back, and close part + SL to breakeven where an M5–H4 zone in the way holds. The answer carries \`monitor_line\`, the monitor's own one-line statement of what it will check with this setup's prices — print it verbatim — and \`warnings\`. A malformed setup is refused with the broken rule. Never places an order.`,
+      "Registers a trading setup for live monitoring. The monitor tracks live price, safety levels, market evidence, and independent entry gates before sending a Telegram confirmation. Never places an order.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -774,94 +1008,64 @@ const CUSTOM_TOOLS = [
         conviction: { type: "string" },
         session: { type: "string" },
         season: { type: "string" },
-        liquidity: { type: "string", description: "e.g. IDM 4405.9 → target PDH 4431.2" },
-        sweep_level: {
-          type: "number",
-          description:
-            "REQUIRED. The liquidity whose stops the setup expects taken: the IDM / sell-side low for a buy, the IDM / buy-side high for a sell. Must sit between sl and tp1. The monitor reports when it is taken; ENTER NOW does not wait for it.",
-        },
-        entry_zone_low: {
-          type: "number",
-          description:
-            "The prepared zone's lower edge: the PD array (FVG / OB / breaker) where price must react. Send it with entry_zone_high whenever the analysis has a zone. Price reaching it is the entry touch, then the monitor waits for the live confirmation. The entry must lie inside the zone and the SL beyond it.",
-        },
-        entry_zone_high: {
-          type: "number",
-          description: "The prepared entry zone's upper edge. Goes together with entry_zone_low.",
-        },
-        liquidity_taken: {
-          type: "boolean",
-          description:
-            "true if sweep_level was already swept before registering (reversal off a fresh sweep); the monitor verifies it on the last ~5h of M5. Default false: only a sweep after registration counts.",
-        },
+        liquidity: { oneOf: [{ type: "string" }, { type: "object" }, { type: "array" }] },
         expiration_minutes: { type: "number" },
-        contract: {
-          type: "string",
-          enum: [CONTRACT],
-          description: "The setup contract version the analysis wrote this for. Optional; any other value is refused.",
-        },
-        snapshot_as_of: {
-          type: "string",
-          description: "The as_of of the get_market_snapshot the analysis used (ISO UTC). Optional; an analysis older than 20 min is flagged.",
-        },
       },
-      required: ["symbol", "direction", "entry", "sl", "tp1", "sweep_level"],
+      required: ["symbol", "direction", "entry", "sl", "tp1"],
     },
-    // Monitor state only, never the account; a repeat call returns the
-    // existing watch. Clients that honour hints can run it unprompted.
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   {
-    name: "get_market_snapshot",
+    name: "register_trap_watch",
     description:
-      "Everything the ICT sniper analysis needs for one symbol in ONE call: live bid/ask, OHLC candles for D1/H4/H1/M15/M5/M1, candles of the SMT partner symbols, the kill-zone status and the news gate. Prices are real prices, already divided by 100,000. Use this instead of separate get_symbols / get_spot_prices / get_trendbars / get_news_calendar calls. Read-only.",
+      "Registers a TRAP_NOT_CONFIRMED read for live monitoring. There is no entry, stop or target: the monitor watches closed candles on the chosen timeframe and sends one Telegram message when the missing setup conditions actually print (body close beyond trigger_level, by default carried by a displacement candle), and one if invalidation_level breaks first instead. It never produces an entry — the human re-runs the analysis pipeline on that notification.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
       properties: {
-        symbol: { type: "string", description: "For example XAUUSD. Separators like / or - are ignored." },
-        timeframes: {
-          type: "array",
-          items: { type: "string", enum: Object.keys(PERIOD_MS) },
-          description: "Optional subset. Default D1, H4, H1, M15, M5, M1.",
-        },
+        setup_id: { type: "string" },
+        symbol: { type: "string" },
+        bias: { type: "string", enum: ["buy", "sell"] },
+        timeframe: { type: "string", enum: TRAP_TIMEFRAMES },
+        trigger_level: { type: "number" },
+        invalidation_level: { type: "number" },
+        require_displacement: { type: "boolean" },
+        require_fvg: { type: "boolean" },
+        trap_sub_type: { type: "string" },
+        trap_active: { type: "string" },
+        trap_score: { type: "string" },
+        collection_grade: { type: "string" },
+        what_is_missing: { type: "string" },
+        dol: { type: "string" },
+        trigger_note: { type: "string" },
+        flip_note: { type: "string" },
+        session: { type: "string" },
+        expiration_minutes: { type: "number" },
       },
-      required: ["symbol"],
+      required: ["symbol", "bias", "trigger_level"],
     },
-    annotations: { readOnlyHint: true, openWorldHint: true },
   },
   {
     name: "list_watches",
     description:
-      "Returns active setup watches (each with `waiting_for`: the condition it waits on, with prices), quarantined watches, bounded recent outcomes with their real status, entry model and zone, and the monitor's own health (thresholds in force, restart recovery, undelivered notifications, feed quality). With `watch_id`: that one watch, active or recently resolved, in full with its decision `history`; add `replay: true` for the candles it was decided on (a test/replay.mjs fixture, kept 30 days; audits only, the analysis does not need it).",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        watch_id: { type: "string", description: "Optional: one watch, active or recently resolved, in full with its decision history." },
-        replay: { type: "boolean", description: "With watch_id: also return the recorded candles of a resolved watch, as a replay fixture." },
-      },
-    },
-    annotations: { readOnlyHint: true, openWorldHint: false },
+      "Returns active setup watches, active trap watches, quarantined watches, bounded recent outcomes with their real status and evidence, and the monitor's own health (restart recovery, undelivered notifications, feed quality).",
+    inputSchema: { type: "object", additionalProperties: false, properties: {} },
   },
   {
     name: "cancel_watch",
     description:
-      "Cancels an active setup watch by id. Idempotent: cancelling an already-resolved watch reports ALREADY_RESOLVED rather than failing.",
+      "Cancels an active setup watch or trap watch by id. Idempotent: cancelling an already-resolved watch reports ALREADY_RESOLVED rather than failing.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
       properties: { watch_id: { type: "string" }, reason: { type: "string" } },
       required: ["watch_id"],
     },
-    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   },
   {
     name: "get_news_calendar",
     description:
       "Returns the cached scheduled high-impact economic events and current manual news lockout state.",
     inputSchema: { type: "object", additionalProperties: false, properties: {} },
-    annotations: { readOnlyHint: true, openWorldHint: true },
   },
   {
     name: "set_news_lockout",
@@ -873,13 +1077,11 @@ const CUSTOM_TOOLS = [
       properties: { reason: { type: "string" } },
       required: ["reason"],
     },
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   {
     name: "clear_news_lockout",
     description: "Removes the manual breaking-news lockout.",
     inputSchema: { type: "object", additionalProperties: false, properties: {} },
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
 ];
 const CUSTOM_TOOL_NAMES = new Set(CUSTOM_TOOLS.map((tool) => tool.name));
@@ -897,48 +1099,87 @@ const MARKET_DATA_TOOL_ALLOWLIST = new Set([
   "get_trendbars",
 ]);
 
-// Everything that survives the allowlist is a read, so it is labelled one.
 function filterToMarketData(tools) {
-  return (Array.isArray(tools) ? tools : [])
-    .filter((tool) => MARKET_DATA_TOOL_ALLOWLIST.has(tool?.name))
-    .map((tool) => ({ ...tool, annotations: { ...tool.annotations, readOnlyHint: true } }));
+  return (Array.isArray(tools) ? tools : []).filter((tool) =>
+    MARKET_DATA_TOOL_ALLOWLIST.has(tool?.name),
+  );
 }
 
-// Newest first: what this request resolved, then the stored history.
-async function recentResolved() {
-  const stored = SERVERLESS && kv ? await kv.list(RESOLVED_KEY) : [];
-  const seen = new Set();
-  return [...store.recent(), ...stored].filter((record) => !seen.has(record.id) && seen.add(record.id));
+function createSetupWatch(args) {
+  const input = validateWatchInput(args);
+  const dedupeKey = watchKey(input);
+  const existing = store.findByDedupeKey("SETUP", dedupeKey);
+  if (existing) return { watch: existing, duplicate: true };
+  const now = Date.now();
+  const watch = store.add({
+    id: `${input.symbol}_${now}_${randomUUID().slice(0, 8)}`,
+    kind: "SETUP",
+    lifecycle: "ARMED",
+    status: "ARMED",
+    dedupeKey,
+    ...input,
+    entryTouched: false,
+    entryTouchedAt: null,
+    evidence: {},
+    generation: { lastBarTimeMs: null, generation: 0, hasBarTime: false },
+    spreadSamples: [],
+    lastGoodUpdateAt: null,
+    degradedSince: null,
+    degradedNotified: false,
+    lastGateBlockReason: null,
+    createdAt: new Date(now).toISOString(),
+    armedAtMs: now,
+    expiresAt: input.expiration_minutes ? now + input.expiration_minutes * 60_000 : null,
+    lastReason: "armed",
+    monitorRunning: false,
+    nextDueAt: now,
+  });
+  scheduleSave(true);
+  void runDueWatches();
+  return { watch, duplicate: false };
+}
+
+function createTrapWatch(args) {
+  const input = validateTrapWatchInput(args, { trapExpiryMinutes: CONFIG.trapExpiryMinutes });
+  const dedupeKey = trapWatchKey(input);
+  const existing = store.findByDedupeKey("TRAP", dedupeKey);
+  if (existing) return { watch: existing, duplicate: true };
+  const now = Date.now();
+  const watch = store.add({
+    id: `TRAP_${input.symbol}_${now}_${randomUUID().slice(0, 8)}`,
+    kind: "TRAP",
+    lifecycle: "ARMED",
+    status: "ARMED",
+    dedupeKey,
+    ...input,
+    armedAtMs: now,
+    lastEvaluatedCandle: null,
+    approachNotified: false,
+    partialCount: 0,
+    lastPrice: null,
+    lastGoodUpdateAt: null,
+    degradedSince: null,
+    degradedNotified: false,
+    createdAt: new Date(now).toISOString(),
+    expiresAt: input.expiration_minutes ? now + input.expiration_minutes * 60_000 : null,
+    lastReason: "armed",
+    monitorRunning: false,
+    nextDueAt: now,
+  });
+  scheduleSave(true);
+  void runDueWatches();
+  return { watch, duplicate: false };
 }
 
 function textResult(payload) {
-  return { content: [{ type: "text", text: JSON.stringify(payload) }] };
+  return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
 }
 
 function monitorHealth() {
   return {
-    schema: "watch-monitor/6.1",
-    version: VERSION,
-    // The thresholds actually in force: env overrides included.
-    confirmation: {
-      contract: CONTRACT,
-      rules: RULES,
-      min_hold_ms: CONFIG.minConfirmationHoldMs,
-      require_new_m1_candle: CONFIG.requireNewBar,
-      acceptance_atr_fraction: CONFIG.acceptanceAtrFraction,
-      acceptance_risk_fraction: CONFIG.acceptanceRiskFraction,
-      evidence_fade_atr_fraction: CONFIG.evidenceFadeAtrFraction,
-      min_rr_at_entry: CONFIG.minRrAtEntry,
-      fresh_zone_max_min: CONFIG.freshZoneMaxMs / 60000,
-      max_quote_age_ms: CONFIG.maxQuoteAgeMs,
-      news_window_min: { before: CONFIG.newsBeforeMs / 60000, after: CONFIG.newsAfterMs / 60000 },
-      news_impacts: [...CONFIG.newsImpacts],
-      exit_arm_r: CONFIG.exitArmR,
-      fast_mode: { interval_ms: CONFIG.fastIntervalMs, window_ms: CONFIG.fastWindowMs },
-    },
+    schema: "watch-monitor/6.0",
     recovered_at: store.recoveredAt,
-    storage: SERVERLESS ? (kv ? "redis" : "MISSING — add Upstash Redis") : "file",
-    state_persisted: SERVERLESS ? Boolean(kv) : Boolean(CONFIG.statePath),
+    state_persisted: Boolean(CONFIG.statePath),
     last_saved_at: store.lastSavedAt,
     last_save_error: store.lastSaveError,
     notifications: notifier.snapshot(),
@@ -946,48 +1187,75 @@ function monitorHealth() {
     market_data: market.snapshot(),
     capacity: {
       setups: `${store.setups.size}/${CONFIG.maxSetupWatches}`,
+      traps: `${store.traps.size}/${CONFIG.maxTrapWatches}`,
     },
   };
 }
 
 async function handleCustomTool(name, args = {}) {
   if (name === "register_watch") {
-    const events = await getNewsCalendar().catch(() => []);
-    const { watch, duplicate, warnings, plan } = engine.register(args, { events });
-    // As a long-lived process the first check runs now; on Vercel the next
-    // /tick (at most a minute away) runs it.
-    if (!SERVERLESS && !duplicate) void runDueWatches();
+    const { watch, duplicate } = createSetupWatch(args);
+    if (!duplicate) {
+      notify(
+        `<b>WATCH ACTIVE</b>\n` +
+          `<b>${htmlEscape(watch.symbol)}</b> — ${htmlEscape(watch.direction.toUpperCase())}\n` +
+          `<b>Entry:</b> ${htmlEscape(formatLevel(watch.entry))} | <b>SL:</b> ${htmlEscape(formatLevel(watch.sl))} | <b>TP1:</b> ${htmlEscape(formatLevel(watch.tp1))}\n` +
+          `<i>Waiting for entry touch and persistent confirmation.</i>`,
+        { dedupeKey: `${watch.id}:armed` },
+      );
+    }
     return textResult({
       status: duplicate ? "ALREADY_WATCHING" : "WATCHING",
       watch_id: watch.id,
       lifecycle: watch.lifecycle,
-      contract: watch.contract || CONTRACT,
-      rules: watch.rules || RULES,
-      expires_at: watch.expiresAt ? new Date(watch.expiresAt).toISOString() : null,
-      monitor_line: plan.summary,
-      plan,
-      warnings,
       message: duplicate
         ? "This setup is already being monitored."
-        : SERVERLESS
-          ? "Monitoring started; the next /tick (at most one minute away) runs the first check."
-          : `Monitoring started; first check runs immediately and then every ${CONFIG.setupIntervalMs / 1000}s.`,
+        : `Monitoring started; first check runs immediately and then every ${CONFIG.setupIntervalMs / 1000}s.`,
     });
   }
 
-  if (name === "get_market_snapshot") {
-    return textResult(await marketSnapshot(args));
+  if (name === "register_trap_watch") {
+    const { watch, duplicate } = createTrapWatch(args);
+    if (!duplicate) {
+      notify(
+        `<b>TRAP WATCH ARMED</b>\n` +
+          trapHeader(watch) +
+          `<b>Status:</b> TRAP NOT CONFIRMED` +
+          (watch.trap_score ? ` — ${htmlEscape(watch.trap_score)}` : "") +
+          (watch.collection_grade ? ` · collection ${htmlEscape(watch.collection_grade)}` : "") +
+          `\n` +
+          (watch.what_is_missing ? `<b>Missing:</b> ${htmlEscape(watch.what_is_missing)}\n` : "") +
+          `<b>Trigger:</b> ${htmlEscape(watch.timeframe)} body close ` +
+          `${watch.bias === "buy" ? "&gt;" : "&lt;"} ${htmlEscape(formatLevel(watch.trigger_level))}` +
+          (watch.require_displacement ? " + displacement" : "") +
+          (watch.require_fvg ? " + FVG" : "") +
+          `\n` +
+          (watch.invalidation_level !== null
+            ? `<b>Flip level:</b> ${htmlEscape(formatLevel(watch.invalidation_level))}\n`
+            : "") +
+          `<i>No entry exists yet. You get one message when the conditions print.</i>`,
+        { dedupeKey: `${watch.id}:armed` },
+      );
+    }
+    return textResult({
+      status: duplicate ? "ALREADY_WATCHING" : "TRAP_WATCHING",
+      watch_id: watch.id,
+      lifecycle: watch.lifecycle,
+      kind: "TRAP",
+      timeframe: watch.timeframe,
+      trigger_level: watch.trigger_level,
+      invalidation_level: watch.invalidation_level,
+      message: duplicate
+        ? "This trap read is already being monitored."
+        : `Trap monitoring started; closed ${watch.timeframe} candles are checked every ${CONFIG.trapIntervalMs / 1000}s. No entry will be produced — a notification means re-run the pipeline.`,
+    });
   }
 
   if (name === "cancel_watch") {
     const watchId = String(args.watch_id || "").trim();
     if (!watchId) throw new Error("watch_id is required");
     const reason = args.reason ? String(args.reason).slice(0, 300) : "Cancelled by request";
-    let result = engine.cancelWatchById(watchId, reason);
-    if (!result) {
-      const resolved = (await recentResolved()).find((record) => record.id === watchId);
-      if (resolved) result = { status: "ALREADY_RESOLVED", watch_id: watchId, resolution: resolved.status };
-    }
+    const result = cancelWatchById(watchId, reason);
     if (!result) {
       return textResult({
         status: "NOT_FOUND",
@@ -999,26 +1267,13 @@ async function handleCustomTool(name, args = {}) {
   }
 
   if (name === "list_watches") {
-    const nowMs = Date.now();
-    const shown = (watch) => ({ ...publicWatch(watch), waiting_for: waitingFor(watch, CONFIG, nowMs) });
-    const recent = await recentResolved();
-    if (args.watch_id) {
-      const watchId = String(args.watch_id).trim();
-      const active = store.get(watchId);
-      const found = active ? shown(active) : recent.find((record) => record.id === watchId);
-      if (!found) return textResult({ status: "NOT_FOUND", watch_id: watchId });
-      const replay = args.replay === true && SERVERLESS && kv ? await kv.get(`${REPLAY_PREFIX}${watchId}`) : undefined;
-      return textResult(args.replay === true ? { watch: found, replay: replay ?? null } : { watch: found });
-    }
     return textResult({
-      active: store.active().map(shown),
-      quarantined: store
-        .active()
+      active: store.active().map(publicWatch),
+      active_trap_watches: store.activeTraps().map(publicWatch),
+      quarantined: [...store.active(), ...store.activeTraps()]
         .filter((watch) => watch.lifecycle === "QUARANTINED")
-        .map(shown),
-      // Each record's decision trail is one list_watches { watch_id } away:
-      // inlined for every record, it would swamp the analysis's context.
-      recent: recent.map(({ history: _history, ...record }) => record),
+        .map(publicWatch),
+      recent: store.recent(),
       monitor_health: monitorHealth(),
     });
   }
@@ -1059,43 +1314,27 @@ async function handleCustomTool(name, args = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// §8 HTTP / MCP surface
+// §10 HTTP / MCP surface
 
-// `?token=` is for what cannot set a header: a phone browser opening
-// /test-telegram, a cron service calling /tick, an MCP client with no auth
-// option. It lands in access logs, the price of that convenience.
 function parseAuthToken(req) {
   const authorization = String(req.get("authorization") || "");
   if (authorization.startsWith("Bearer ")) return authorization.slice(7).trim();
-  return String(req.get("x-api-key") || req.query?.token || "");
-}
-
-function tokenMatches(provided, expectedToken) {
-  if (!expectedToken) return false;
-  const given = Buffer.from(provided);
-  const expected = Buffer.from(expectedToken);
-  return given.length === expected.length && timingSafeEqual(given, expected);
+  return String(req.get("x-api-key") || "");
 }
 
 function authorized(req) {
   if (!CONFIG.authToken) return true;
-  const token = parseAuthToken(req);
-  return tokenMatches(token, CONFIG.authToken) || verifyOAuthAccess(token);
+  const provided = Buffer.from(parseAuthToken(req));
+  const expected = Buffer.from(CONFIG.authToken);
+  if (provided.length !== expected.length) return false;
+  return timingSafeEqual(provided, expected);
 }
 
 function rejectUnauthorized(req, res) {
   if (authorized(req)) return false;
-  // Where an OAuth client starts (MCP authorization spec).
-  res.set(
-    "WWW-Authenticate",
-    `Bearer resource_metadata="${req.protocol}://${req.get("host")}/.well-known/oauth-protected-resource${req.path === "/" ? "" : req.path}"`,
-  );
   res.status(401).json({
     error: "Unauthorized",
-    // Which of the two it was is what someone fixing a URL by hand needs.
-    message: parseAuthToken(req)
-      ? "The token does not match WATCH_MONITOR_AUTH_TOKEN."
-      : "No token was sent: add ?token=<WATCH_MONITOR_AUTH_TOKEN> or an Authorization: Bearer header.",
+    message: "A valid monitor authorization token is required.",
   });
   return true;
 }
@@ -1107,7 +1346,7 @@ function setupCors(res) {
     "Access-Control-Allow-Headers",
     "Content-Type, Accept, Authorization, X-Api-Key, Mcp-Session-Id, MCP-Protocol-Version",
   );
-  res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id, WWW-Authenticate");
+  res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
 }
 
 let upstreamToolsCache = { tools: null, fetchedAt: 0, lastError: null };
@@ -1128,17 +1367,8 @@ async function getUpstreamTools(force = false) {
   }
 }
 
-// The monitor's own tools never wait on cTrader: a slow cold start or a
-// bad CTRADER_MCP_TOKEN must not stop a client from connecting (the
-// Gemini app gives up on a slow or failed tools/list). The raw cTrader
-// reads are only the snapshot's fallback; they join the list when the
-// upstream answers in time, and get_market_snapshot reports its own
-// upstream errors.
 async function mergedToolList() {
-  const upstream = await Promise.race([
-    getUpstreamTools(),
-    new Promise((resolve) => setTimeout(() => resolve(upstreamToolsCache.tools || []), 4000)),
-  ]);
+  const upstream = await getUpstreamTools();
   const native = filterToMarketData(
     upstream.filter((tool) => !CUSTOM_TOOL_NAMES.has(tool?.name)),
   );
@@ -1150,16 +1380,10 @@ function jsonRpcError(res, id, code, message) {
 }
 
 async function handleMcpRequest(req, res) {
-  setupCors(res);
   if (rejectUnauthorized(req, res)) return;
+  setupCors(res);
 
   if (req.method === "GET") {
-    if (SERVERLESS) {
-      // Spec-compliant "no SSE stream here": an idle stream would hold a
-      // Vercel function open, and bill it, until maxDuration.
-      res.status(405).set("Allow", "POST, OPTIONS").end();
-      return;
-    }
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache, no-transform");
     res.setHeader("Connection", "keep-alive");
@@ -1185,7 +1409,7 @@ async function handleMcpRequest(req, res) {
       result: {
         protocolVersion: body.params?.protocolVersion || CONFIG.protocolVersion,
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: "cTrader + Watch Monitor MCP", version: VERSION },
+        serverInfo: { name: "cTrader + Watch Monitor MCP", version: "6.0.0" },
       },
     });
     return;
@@ -1207,10 +1431,17 @@ async function handleMcpRequest(req, res) {
 
   if (method === "tools/list") {
     const tools = await mergedToolList();
-    // Not silent: an unreachable cTrader shows in the request log and in
-    // /health, and the snapshot fails with the reason when it is called.
-    if (upstreamToolsCache.lastError) {
-      await logRequest({ rpc: "tools/list", upstream_error: upstreamToolsCache.lastError, tools: tools.length });
+    if (tools.length === CUSTOM_TOOLS.length && upstreamToolsCache.lastError) {
+      // Fail loudly. A list containing only the monitor tools means the
+      // native market-data side is unreachable, and returning it silently
+      // is what hid this class of bug in the 4.x build.
+      jsonRpcError(
+        res,
+        id,
+        -32603,
+        `Native cTrader tools unavailable: ${upstreamToolsCache.lastError}`,
+      );
+      return;
     }
     res.json({ jsonrpc: "2.0", id, result: { tools } });
     return;
@@ -1221,11 +1452,8 @@ async function handleMcpRequest(req, res) {
     const args = body.params?.arguments || {};
     if (CUSTOM_TOOL_NAMES.has(name)) {
       try {
-        // The snapshot takes the state lock itself, for its news part only.
-        const run = () => handleCustomTool(name, args);
-        res.json({ jsonrpc: "2.0", id, result: await (name === "get_market_snapshot" ? run() : withState(run)) });
+        res.json({ jsonrpc: "2.0", id, result: await handleCustomTool(name, args) });
       } catch (error) {
-        await logRequest({ rpc: "tools/call", tool: name, error: error.message.slice(0, 200) });
         jsonRpcError(res, id, -32602, error.message);
       }
       return;
@@ -1255,71 +1483,44 @@ for (const path of ["/icmarkets/mcp", "/mcp", "/watch-mcp"]) {
     setupCors(res);
     res.status(204).end();
   });
-  // A client ending its session: there is no server-side session to end.
-  app.delete(path, (_req, res) => {
-    setupCors(res);
-    res.status(405).set("Allow", "GET, POST, OPTIONS").end();
-  });
   app.get(path, (req, res) => void handleMcpRequest(req, res));
   app.post(path, (req, res) => void handleMcpRequest(req, res));
 }
 
-app.get("/", (_req, res) => res.redirect("/health"));
-
-app.get("/health", async (req, res) => {
+app.get("/health", (req, res) => {
   const detailed = authorized(req) && Boolean(CONFIG.authToken);
-  // On Vercel, read the snapshot without the lock and without loading it
-  // into the shared store: a concurrent request on this instance may be
-  // mid-tick on that store.
-  let saved = null;
-  if (SERVERLESS && kv) {
-    try {
-      saved = (await kv.get(STATE_KEY)) || {};
-    } catch (error) {
-      res.status(503).json({ status: "storage_error", error: error.message });
-      return;
-    }
-  }
-  const setups = saved ? saved.setups || [] : store.active();
-  const lastTickAt = saved?.lastTickAt ? new Date(saved.lastTickAt).toISOString() : null;
-  // Watches waiting and no tick for 3 minutes: the cron has stopped and
-  // nothing is being checked. 503, so a free uptime monitor can alert.
-  const stale = SERVERLESS && setups.length > 0 && (!saved?.lastTickAt || Date.now() - saved.lastTickAt > 180_000);
   const base = {
-    status: SERVERLESS && !kv ? "storage_missing" : stale ? "stale" : "ok",
+    status: "ok",
     service: "watch-monitor-mcp",
-    version: VERSION,
-    runtime: SERVERLESS ? "vercel" : "node",
-    watches: setups.length,
-    last_tick_at: SERVERLESS ? lastTickAt : undefined,
+    version: "6.0.0",
+    watches: store.setups.size,
+    trap_watches: store.traps.size,
     uptime_seconds: Math.floor(process.uptime()),
   };
   if (!detailed && CONFIG.authToken) {
-    res.status(stale ? 503 : 200).json(base);
+    res.json(base);
     return;
   }
-  let resolvedCount = store.resolved.size;
-  if (SERVERLESS && kv) resolvedCount = await kv.len(RESOLVED_KEY).catch(() => null);
-  res.status(stale ? 503 : 200).json({
+  res.json({
     ...base,
-    resolved_recent: resolvedCount,
-    quarantined: setups.filter((watch) => watch.lifecycle === "QUARANTINED").length,
-    scheduler_tick_ms: SERVERLESS ? "external cron → /tick" : CONFIG.tickMs,
+    resolved_recent: store.resolved.size,
+    quarantined: [...store.setups.values(), ...store.traps.values()].filter(
+      (watch) => watch.lifecycle === "QUARANTINED",
+    ).length,
+    scheduler_tick_ms: CONFIG.tickMs,
     setup_interval_seconds: CONFIG.setupIntervalMs / 1000,
-    market_source: OPEN_API ? "ctrader-open-api" : "ctrader-mcp",
-    // Open API tokens may live only in Redis until this instance connects;
-    // market_data.environment and last_error say whether it did.
-    ctrader_token_configured: OPEN_API ? undefined : Boolean(CONFIG.upstreamToken),
-    upstream: OPEN_API ? `wss://${client.host}:5036` : CONFIG.upstreamUrl,
+    trap_interval_seconds: CONFIG.trapIntervalMs / 1000,
+    ctrader_token_configured: Boolean(CONFIG.upstreamToken),
+    upstream: CONFIG.upstreamUrl,
     upstream_tools_cached: upstreamToolsCache.tools ? upstreamToolsCache.tools.length : 0,
     upstream_tools_last_error: upstreamToolsCache.lastError,
     custom_tools: CUSTOM_TOOLS.length,
     local_auth_configured: Boolean(CONFIG.authToken),
     news_filter_enabled: CONFIG.newsEnabled,
     news_fail_closed: CONFIG.newsFailClosed,
+    kill_zone_filter_enabled: CONFIG.killZoneEnabled,
     spread_check_enabled: CONFIG.spreadEnabled,
     ...monitorHealth(),
-    capacity: { setups: `${setups.length}/${CONFIG.maxSetupWatches}` },
   });
 });
 
@@ -1331,7 +1532,7 @@ app.get("/test-telegram", async (req, res) => {
 
 app.get("/test-news", async (req, res) => {
   if (rejectUnauthorized(req, res)) return;
-  const events = await withState(() => getNewsCalendar());
+  const events = await getNewsCalendar();
   res.json({
     ok: !newsCache.lastError,
     events,
@@ -1340,81 +1541,43 @@ app.get("/test-news", async (req, res) => {
   });
 });
 
-// REST mirror of the registration tool, for non-MCP callers. It shares
-// the exact same code path — including notification and dedup — so the
-// two surfaces cannot drift apart.
+// REST mirrors of the two registration tools, for non-MCP callers. They
+// share the exact same code path — including notification and dedup — so
+// the two surfaces cannot drift apart.
 app.post("/register_watch", async (req, res) => {
   if (rejectUnauthorized(req, res)) return;
   try {
-    const result = await withState(() => handleCustomTool("register_watch", req.body || {}));
+    const result = await handleCustomTool("register_watch", req.body || {});
     res.json(JSON.parse(result.content[0].text));
   } catch (error) {
     res.status(400).json({ error: error.message });
   }
 });
 
-// One scheduler pass. On Vercel this IS the scheduler: point a once-a-minute
-// cron at it (cron-job.org on the Hobby plan with ?token=, or vercel.json
-// crons on Pro, which send CRON_SECRET as a bearer).
-app.all("/tick", async (req, res) => {
-  if (!authorized(req) && !tokenMatches(parseAuthToken(req), CONFIG.cronSecret)) {
-    res.status(401).json({ error: "Unauthorized" });
-    return;
-  }
+app.post("/register_trap_watch", async (req, res) => {
+  if (rejectUnauthorized(req, res)) return;
   try {
-    const result = await withState(runTick, { tick: true });
-    res.json({ ok: true, ...result });
-    if (SERVERLESS && result.hot && CONFIG.fastWindowMs > 0) waitUntil(fastChecks());
+    const result = await handleCustomTool("register_trap_watch", req.body || {});
+    res.json(JSON.parse(result.content[0].text));
   } catch (error) {
-    log(`tick failed: ${error.message}`);
-    res.status(503).json({ ok: false, error: error.message });
+    res.status(400).json({ error: error.message });
   }
 });
 
-async function runTick() {
-  await runDueWatches();
-  // A confirmed setup held by a gate or an open trade makes the watch
-  // hot: the gate's release, a target or the stop can come between two
-  // minutes, and fast mode checks every FAST_MODE_INTERVAL_MS meanwhile.
-  return {
-    watches: store.setups.size,
-    hot: store.active().some((watch) => watch.lifecycle === "CONFIRMING" || watch.lifecycle === "IN_TRADE"),
-  };
-}
-
-// Fast mode. The cron must be answered within its 30 s timeout, so the
-// extra checks run after the response (waitUntil keeps the function
-// alive), each a full locked tick of its own: the lock is never held
-// across the waits, so a register_watch in between is not blocked.
-async function fastChecks() {
-  const until = Date.now() + CONFIG.fastWindowMs;
-  while (Date.now() + CONFIG.fastIntervalMs <= until) {
-    await sleep(CONFIG.fastIntervalMs);
-    try {
-      if (!(await withState(runTick, { tick: true })).hot) return;
-    } catch (error) {
-      log(`fast check failed: ${error.message}`);
-      return;
-    }
-  }
-}
-
 // ---------------------------------------------------------------------------
-// §9 Boot and shutdown
+// §11 Boot and shutdown
 
-const sessionCleanup = SERVERLESS
-  ? null
-  : setInterval(
-      () => {
-        const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-        for (const [sessionId, session] of watchSessions) {
-          if (session.createdAt < cutoff) watchSessions.delete(sessionId);
-        }
-      },
-      60 * 60 * 1000,
-    );
+const sessionCleanup = setInterval(
+  () => {
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    for (const [sessionId, session] of watchSessions) {
+      if (session.createdAt < cutoff) watchSessions.delete(sessionId);
+    }
+  },
+  60 * 60 * 1000,
+);
 
-const heartbeat = process.env.SERVER_URL && !SERVERLESS
+const heartbeat = process.env.SERVER_URL
   ? setInterval(
       () => {
         fetch(`${process.env.SERVER_URL.replace(/\/$/, "")}/health`).catch(() => {});
@@ -1431,20 +1594,20 @@ function boot() {
   }
   const recovery = store.load();
   notifier.restore(recovery.outbox);
-  if (recovery.setups || recovery.expired) {
+  if (recovery.setups || recovery.traps || recovery.expired) {
     const offlineFor = recovery.savedAt
       ? `${Math.round((Date.now() - Date.parse(recovery.savedAt)) / 60000)} min`
       : "unknown";
     log(
-      `recovered ${recovery.setups} setup watch(es), expired ${recovery.expired}`,
+      `recovered ${recovery.setups} setup watch(es), ${recovery.traps} trap watch(es), expired ${recovery.expired}`,
     );
     notify(
       `<b>MONITOR RESTARTED</b>\n` +
-        `<b>Recovered:</b> ${recovery.setups} setup watch(es)\n` +
+        `<b>Recovered:</b> ${recovery.setups} setup · ${recovery.traps} trap\n` +
         (recovery.expired ? `<b>Expired while offline:</b> ${recovery.expired}\n` : "") +
         `<b>Gap:</b> ${htmlEscape(offlineFor)}\n` +
-        `<i>Watches resume from live candles. Anything that happened during the gap was not seen — ` +
-        `re-check any position manually.</i>`,
+        `<i>Evidence was discarded and must re-accumulate under live observation. ` +
+        `Anything that happened during the gap was not seen — re-check any position manually.</i>`,
       { priority: "critical" },
     );
   }
@@ -1452,15 +1615,10 @@ function boot() {
   void runDueWatches();
 }
 
-// Vercel imports the default export and serves it itself; anywhere else
-// this is a normal server. SERVERLESS=true without VERCEL runs the Vercel
-// code path on a local port, which is how test/smoke.mjs exercises it.
-const server = process.env.VERCEL
-  ? null
-  : app.listen(CONFIG.port, "0.0.0.0", () => {
-      log(`listening on ${CONFIG.port}; ${SERVERLESS ? "serverless mode, /tick drives the scheduler" : `tick=${CONFIG.tickMs}ms`}; upstream=${CONFIG.upstreamUrl}`);
-      if (!SERVERLESS) boot();
-    });
+const server = app.listen(CONFIG.port, "0.0.0.0", () => {
+  log(`listening on ${CONFIG.port}; tick=${CONFIG.tickMs}ms; upstream=${CONFIG.upstreamUrl}`);
+  boot();
+});
 
 let shuttingDown = false;
 function shutdown() {
@@ -1468,10 +1626,10 @@ function shutdown() {
   shuttingDown = true;
   log("shutting down; flushing state");
   if (schedulerTimer) clearInterval(schedulerTimer);
-  if (sessionCleanup) clearInterval(sessionCleanup);
+  clearInterval(sessionCleanup);
   if (heartbeat) clearInterval(heartbeat);
   scheduleSave(true);
-  if (server) server.close(() => process.exit(0));
+  server.close(() => process.exit(0));
   // Never hang a redeploy on a lingering keep-alive stream.
   setTimeout(() => process.exit(0), 5000).unref();
 }
@@ -1486,5 +1644,4 @@ process.on("unhandledRejection", (reason) => {
   log(`unhandled rejection: ${reason?.stack || reason}`);
 });
 
-export default app;
 export { app, store, market, notifier, CONFIG, handleCustomTool, asArray };

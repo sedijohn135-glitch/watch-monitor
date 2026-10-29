@@ -1,21 +1,16 @@
 {
   "name": "watch-monitor-mcp",
-  "version": "6.21.0",
+  "version": "6.0.0",
   "private": true,
   "type": "module",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node --test test/adversarial.test.mjs test/engine.test.mjs",
-    "replay": "node test/replay.mjs",
-    "smoke": "node test/smoke.mjs"
+    "test": "node --test test/"
   },
   "dependencies": {
-    "@vercel/functions": "3.9.11",
     "dotenv": "^16.4.5",
     "express": "^4.19.2"
   },
-  "engines": {
-    "node": "22.x"
-  }
+  "engines": { "node": ">=20" }
 }
