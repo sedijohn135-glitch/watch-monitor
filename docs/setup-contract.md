@@ -4,7 +4,7 @@ What the analysis (Gemini, skill `ict-sniper-v11`) sends to `register_watch`,
 what the monitor checks for it, and what it promises back. The code is the
 authority: `lib/core.mjs validateWatchInput`, `lib/engine.mjs`
 (`register`, `validationPlan`, `tickSetupWatch`). This file describes
-monitor 6.20.1, confirmation rules `v6.0-acceptance`.
+monitor 6.21.0, confirmation rules `v6.0-acceptance+fresh-zone`.
 
 Every watch stores the contract and rule versions it was armed under
 (`contract`, `rules`), so a later rule change can tell old watches from new.
@@ -56,10 +56,10 @@ A malformed setup is refused with the broken rule, never repaired:
   "watch_id": "XAUUSD_1793198887317_1ee06516",
   "lifecycle": "ARMED",
   "contract": "setup/1",
-  "rules": "v6.0-acceptance",
+  "rules": "v6.0-acceptance+fresh-zone",
   "expires_at": "2026-10-28T18:48:07.317Z",
-  "monitor_line": "Touch bid ≥ 4044.88 → ENTER NOW after live acceptance (≤ 4044.03 at most) + one of …",
-  "plan": { "touch": "…", "confirmation": "…", "blocks": ["…"], "invalidation": "…",
+  "monitor_line": "Touch bid ≥ 4044.88 within 35 min of price leaving the zone → ENTER NOW after live acceptance (≤ 4044.03 at most) + one of …",
+  "plan": { "touch": "…", "fresh_zone": "…", "confirmation": "…", "blocks": ["…"], "invalidation": "…",
             "tp1_first": "…", "expiry": "…", "sweep": "…", "after_entry": "…", "summary": "…" },
   "warnings": ["…"],
   "message": "Monitoring started; the next /tick (at most one minute away) runs the first check."
@@ -105,7 +105,28 @@ setup waits on a gate), safety first.
 - Until the touch, every closed M1 bar since registration is checked too, so
   a wick between two ticks counts. The message then says "a wick between two
   checks".
-- Sends `ENTRY TOUCHED`.
+- Sends `ENTRY TOUCHED`, with how long price had been away from the zone.
+
+**Fresh zone** (6.21, `FRESH_ZONE_MAX_MIN`, default 35; 0 turns it off)
+
+- At the touch the monitor measures how long price had been away from the
+  zone: from the close of the last M5 bar that reached the touch level by the
+  time the watch was armed, to the touch. The touch is the first visit since
+  arming, so this is the time since price last left the zone.
+- Back within 35 min (an immediate rebalance): the setup goes on to
+  confirmation as before.
+- Later, or no M5 bar at the level in the last 5 h: `⏳ LATE RETURN — NO
+  ENTRY` instead of `ENTRY TOUCHED`. No evidence is read and no ENTER NOW is
+  ever sent for this setup. The safety checks keep running, so the record
+  ends as `SETUP FAILED` or `SETUP EXPIRED` with "after a late return to the
+  zone, no ENTER NOW" in its reason: how a late return ends is the evidence
+  for the rule.
+- Why: in 6 months of BTC data, returns to an M5 zone after more than 35 min
+  reached TP1 26% of the time (−0.37R a trade) against 41% (about 0R)
+  within 35 min; the three live setups of 28–29 Oct that came back late
+  lost or broke even (`docs/requirements.md` §8).
+- A setup registered while price is at its zone measures from the M5 bar
+  before arming: it counts as fresh if it is touched soon.
 
 **Liquidity**
 
@@ -180,7 +201,7 @@ characters.
   the first tick after a close sees the new bar.
 - **Timeframes:**
   - M1: touch fold, CISD, M1 engulfing, reversal context;
-  - M5: ATR, SMT, engulfing, rejection, sweep, trade management, obstacles;
+  - M5: ATR, SMT, engulfing, rejection, sweep, fresh zone, trade management, obstacles;
   - M15–H4: obstacles.
 - **Quote.**
   - The Open API pushes quotes. In a quiet market the last one can be up to
@@ -209,7 +230,7 @@ characters.
   - A new optional field that changes nothing for existing callers does not
     bump it.
   - The monitor refuses a contract it does not read, rather than guessing.
-- **`rules`** (`v6.0-acceptance`; `v6.0-acceptance/strict-engulfing` only in 6.20.0, reverted in 6.20.1) names the confirmation rules. Changing
+- **`rules`** (`v6.0-acceptance+fresh-zone` since 6.21; `v6.0-acceptance` before; `v6.0-acceptance/strict-engulfing` only in 6.20.0, reverted in 6.20.1) names the confirmation rules. Changing
   them changes this name and `docs/requirements.md` together.
   - Watches already armed keep the name they were armed under, so the audit
     trail says which rules decided.

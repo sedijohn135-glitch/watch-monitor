@@ -23,6 +23,7 @@ export const TEST_CONFIG = Object.freeze({
   acceptanceRiskFraction: 0.35,
   evidenceFadeAtrFraction: 0.25,
   minRrAtEntry: 1,
+  freshZoneMaxMs: 35 * 60_000,
   maxQuoteAgeMs: 30_000,
   enterStaleMs: 60_000,
   defaultExpiryMinutes: 720,

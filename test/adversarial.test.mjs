@@ -30,6 +30,7 @@ import {
   manageTrade,
   obstacles,
   zoneVerdict,
+  zoneAge,
   evaluateSafety,
   inducement,
   killZoneStatus,
@@ -1052,6 +1053,29 @@ test("TOUCH — with a prepared zone, reaching the zone is the touch", () => {
   assert.equal(at(81600), "WAIT");
   assert.equal(at(81680), "TOUCH");
   assert.equal(evaluateSafety({ ...watch, entry_zone_low: null }, { mid: 81680, executable: 81680, protective: 81685, tolerance: 8 }).action, "WAIT", "without a zone, the entry price");
+});
+
+// ---------------------------------------------------------------------------
+// Fresh zone (6.21): how long price was away from the zone before the touch.
+
+test("ZONE AGE — from the close of the last M5 bar at the zone by the time the watch was armed, to the touch", () => {
+  // 0: at the zone (high 104.2), 1–3: away, 4: back at the zone. Armed during bar 3.
+  const bars = m5Bars([[103, 104.2, 102.5, 103], [103, 103.5, 102, 102.4], [102.4, 103, 102, 102.8], [102.8, 103.6, 102.6, 103.5], [103.5, 104.4, 103.4, 104]]);
+  const sell = { direction: "sell", entry: 105, entry_zone_low: 104, entry_zone_high: 106, armedAtMs: T0 + 3 * 300_000 + 60_000 };
+  const touch = T0 + 4 * 300_000 + 120_000;
+  const sinceBar0 = touch - (T0 + 300_000);
+  assert.equal(zoneAge(bars.slice(0, 4), sell, touch), sinceBar0, "bar 4 still forming");
+  assert.equal(zoneAge(bars, sell, T0 + 5 * 300_000 + 6_000), T0 + 5 * 300_000 + 6_000 - (T0 + 300_000), "bar 4 (the touch, after arming) is never the departure");
+  assert.equal(zoneAge(bars.slice(1), sell, touch), null, "no bar at the zone before arming inside the history");
+  assert.equal(zoneAge(bars.slice(0, 4), sell, touch, 0.6), touch - (T0 + 2 * 300_000), "within the tolerance bar 1 (high 103.5) was at the zone");
+  // Armed with price still at the zone: the bar before arming is the last visit.
+  const atArm = { ...sell, armedAtMs: T0 + 300_000 + 30_000 };
+  assert.equal(zoneAge(bars, atArm, T0 + 300_000 + 90_000), 90_000, "touched 90 s after bar 0 closed");
+  const buy = { direction: "buy", entry: 101, entry_zone_low: 100, entry_zone_high: 102, armedAtMs: T0 + 3 * 300_000 };
+  const up = m5Bars([[103, 103.5, 101.8, 103], [103, 104, 102.9, 103.8], [103.8, 104.2, 103.5, 104], [104, 104.1, 101.9, 102.1]]);
+  const later = T0 + 4 * 300_000 + 6_000;
+  assert.equal(zoneAge(up, buy, later), later - (T0 + 300_000), "a buy: the low reaching the zone high");
+  assert.equal(zoneAge(up, { ...buy, entry_zone_low: null, entry_zone_high: null, entry: 101.85 }, later), later - (T0 + 300_000), "no zone: the entry price");
 });
 
 // ---------------------------------------------------------------------------

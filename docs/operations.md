@@ -1,7 +1,7 @@
 # Operations
 
 How the deployed monitor runs, what can stop it, how to notice and how to
-recover. Monitor 6.20.0 on Vercel (Hobby), state in Upstash Redis.
+recover. Monitor 6.21.0 on Vercel (Hobby), state in Upstash Redis.
 
 ## 1. Architecture
 
@@ -129,6 +129,10 @@ The state is compatible both ways between 6.18.x and 6.19:
 - **6.20 → 6.19.** Same state. The replay keys stay in Redis unread until
   they expire. A watch armed under 6.20 keeps its `rules` label, but 6.19
   reads its engulfing and obstacle exits the 6.19 way.
+- **6.21 → 6.20.1.** Same state. `zoneAgeMs` is carried unread, so a watch
+  held back as a late return (`stale_zone`) reads evidence again under 6.20.1
+  and can send ENTER NOW. To keep 6.21 but turn the rule off, set
+  `FRESH_ZONE_MAX_MIN=0` in Vercel instead.
 
 **Never bump `SCHEMA_VERSION` or the schema string without a migration.**
 A mismatch starts an empty store, and the next save erases every active
@@ -150,6 +154,12 @@ watch.
 ## 8. Configuration
 
 Environment variables are listed in the README.
+
+**New in 6.21:**
+
+- `FRESH_ZONE_MAX_MIN` (35): ENTER NOW only when price comes back to the
+  zone within this many minutes of leaving it; `0` turns the rule off.
+  `monitor_health.confirmation.fresh_zone_max_min` shows the value in force.
 
 **New in 6.19:**
 

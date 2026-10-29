@@ -1,6 +1,6 @@
 # Requirements, diagnosis and decisions
 
-Status as of 28 Oct 2026, monitor v6.18.1 → v6.19.0 → v6.20.0. This file tells which
+Status as of 29 Oct 2026, monitor v6.18.1 → v6.19.0 → v6.20.1 → v6.21.0. This file tells which
 rules are the system's own, where each comes from, what the deployed code
 does, and what is still open. Each requirement has an ID.
 
@@ -139,17 +139,22 @@ Recommendation: keep the v6.0 confirmation for at least 20 entered setups before
 5. **`MIN_CONFIRMATION_HOLD_MS` = 5000 in Vercel** (verified). The v6.0 value is 60 000, and 50 000 is the coded Vercel default. With once-a-minute ticks the difference is at most one tick: the new-M1-candle rule already spaces graduation a bar apart, and the 28 Oct replay enters at 15:06:06 with 5, 50 or 60 s alike. Keep it, or delete the variable in Vercel → Settings → Environment Variables to return to 50 s. The owner's decision.
 6. **A-9 engulfing.** Kept as v6.0 (owner, 28 Oct): the strict reading would have blocked the live 20:02 sniper entry (§7 E7).
 7. **B-2 fast mode bound.** Fast mode only for the first 20 min of a gate hold, and none in a trade. TP / SL alerts would then come with the once-a-minute tick, up to ~45 s later; CLOSE NOW decisions, read on M5 closes, would not be delayed. Worth it only if the Vercel usage page shows provisioned memory above about half of 360 GB-h.
+8. **Secure at +0.5R** (§8). At +0.5R: close half and move the SL to the entry. On 6 months of BTC setups, full losses fall from 55–59% of trades to 31–36% and 64–69% end in profit, at the same or slightly better R per trade. It changes "SL to breakeven only after TP1" (G2), so it is the owner's call.
+9. **Obstacle breakeven** (§8). On the one live setup that reached TP1 (28 Oct XAU sell), the held M15 demand moved the SL to breakeven at +0.03R and the trade was stopped there; TP1 printed three hours later (+2.03R). One case: decide with item 8.
 
 ## 6. Verification of 6.19 and 6.20
 
 | Check | Command | Result |
 |---|---|---|
-| Unit tests, v6.0 evidence functions and validation, the v6.0 engulfing pinned | `npm test` (`test/adversarial.test.mjs`, 66) | pass |
+| Unit tests, v6.0 evidence functions and validation, the v6.0 engulfing pinned, the zone's age (6.21) | `npm test` (`test/adversarial.test.mjs`, 67) | pass |
 | Lifecycle tests on a fake clock (`test/harness.mjs`): long, short, touch without acceptance, acceptance without a technical signal, fade, SL before confirmation, same-tick race, wick through the SL, TP1 before the touch, expiry, news, R:R chase, stale quote, stale candles, abnormal spread, quarantine, no quote, wick-only touch, restart, duplicate, two watches, cancel, plan, contract, TP1 → breakeven, Telegram order, LATE prefix | `npm test` (`test/engine.test.mjs`, 29) | pass |
-| Historical replay, 28 Oct XAUUSD buy (`test/fixtures/xauusd-2026-10-28-buy.json`, the live 20:02 sniper entry: ENTER NOW 20:34:06, R:R 1.29, as live) | `npm test` (1) | pass |
+| Historical replay, 28 Oct XAUUSD buy (`test/fixtures/xauusd-2026-10-28-buy.json`, the live 20:02 entry: 6.21 answers LATE RETURN at 20:30:06, 45 min after price left the zone; with the rule off, ENTER NOW 20:34:06, R:R 1.29, as live) | `npm test` (1) | pass |
+| Historical replays, 29 Oct BTCUSD sells 04:12 and 06:00 (production captures; live: −1R and breakeven): LATE RETURN, 162 and 195 min | `npm test` (2) | pass |
+| Fresh zone: a late return gets no ENTER NOW and its outcome says so; a fresh one enters and says how fresh; `FRESH_ZONE_MAX_MIN=0` restores v6.0 | `npm test` (3) | pass |
 | Replay capture: a resolved setup's candles, replayed, give the same ENTER NOW | `npm test` (1) | pass |
 | Historical replay, 28 Oct XAUUSD sell (`test/fixtures/xauusd-2026-10-28-sell.json`, real cTrader candles) | `npm test` (1), `npm run replay -- test/fixtures/xauusd-2026-10-28-sell.json` | pass |
 | End to end: HTTP, OAuth, MCP tools, Redis, `/tick`, fake Telegram, restart, replay capture | `npm run smoke` | 86 checks pass |
+| Lifecycle tests (`test/engine.test.mjs`) in total | `npm test` | 36 pass |
 
 Replay against what happened live:
 
@@ -260,7 +265,10 @@ The sign flips with the timeframes counted, so there is no usable signal yet.
 - Held instead, TP1 4028.09 printed in the 18:30 FOMC M5 bar. That bar's high
   was 4050.52, $0.33 under the 4050.85 stop on the bid; the ask is higher by
   the spread.
-- Undecidable.
+- Undecidable on M5. **Decided on M1 (29 Oct, from the 20:02 setup's
+  capture):** the low 4024.66 came in the 18:33 bar (high 4047.11), the
+  4050.52 high in the 18:34 bar. TP1 first: +2.03R from the live entry, with a
+  0.66R drawdown before it (§8).
 
 **E7 — the live 28 Oct 20:02 buy, after the 6.19 deploy.**
 - Gemini registered it with `contract: "setup/1"` and `snapshot_as_of`, so
@@ -275,8 +283,12 @@ The sign flips with the timeframes counted, so there is no usable signal yet.
 - The live trade went the owner's way: in profit at the daily break (best
   4070.90; the owner's screenshot). Owner: "6.19 gave a sniper entry —
   don't break what works". The strict engulfing was reverted in 6.20.1.
-- Regression test: `test/fixtures/xauusd-2026-10-28-buy.json` pins the
-  20:34 entry.
+- **Then the trade hit its SL at 00:33 (−1R)**: the owner's profit came from
+  closing by hand. Price had last been at the zone at 19:40; the 20:30 touch
+  came 45 min later, so 6.21 answers it with LATE RETURN and no ENTER NOW
+  (§8).
+- Regression test: `test/fixtures/xauusd-2026-10-28-buy.json` pins the late
+  return, and the 20:34 entry with the rule off.
 
 **E6 — where the losses came from.**
 - #2 and #5 would have hit their registered stops before TP1 under any
@@ -307,3 +319,113 @@ and it produced the 20:02 sniper entry.
   owner and for replays.
 
 **Kept, owner 28 Oct:** no zone-invalidation rule in the monitor.
+
+## 8. Why ENTER NOW lost — evidence and the fresh-zone rule (29 Oct)
+
+The owner, 29 Oct: ENTER NOW must be followed by profit, without the SL or a
+big drawdown; silence must mean the setup fails; silence while price goes to
+TP is a miss.
+
+### Live record
+
+`list_watches`, 22–29 Oct, every rule version: **10 ENTER NOWs, none reached
+TP1 under the monitor's management.** 7 hit the SL (−1R), 1 ended at
+breakeven, 2 were closed by the obstacle rule (+0.02R, +0.24R).
+
+Under `v6.0-acceptance` (28–29 Oct), four entries:
+
+| Setup | ENTER NOW | Best | Outcome |
+|---|---|---|---|
+| XAU sell 14:48 | 15:16 at 4043.33, R:R 2.03 | +2.48R | the held M15 demand moved the SL to breakeven; held, TP1 at 18:33 (M1 verified: 4024.66 before the 4050.52 high), MAE 0.66R |
+| XAU buy 20:02 | 20:34 at 4062.02, R:R 1.30 | +0.39R | SL at 00:33, −1R (the owner closed in profit by hand) |
+| BTC sell 04:12 | 04:51 at 80049.54, R:R 3.23 | +0.17R | SL at 05:05, −1R |
+| BTC sell 06:00 | 09:14 at 80123.50, R:R 1.48 | +0.14R | breakeven 09:21 (obstacle); neither TP1 nor SL by 11:05 |
+
+The replays (`test/fixtures`, production captures) reproduce each live ENTER
+NOW. Confirmation rules tried on them — CISD on M1 and on M5 as the skill
+defines it (a close beyond the open of the run of candles that delivered price
+to the extreme), with an M5 close back out of the zone, M1 / M5 structure
+shifts — stay silent on BTC 04:12, but on XAU 20:02 all of them still enter on
+a later re-test (22:04, 23:10) and lose. None separates the four.
+
+### BTC study, 6 months
+
+- **Data.** Coinbase BTC-USD M1, 29 Apr–29 Oct 2026, 263,094 bars (ETH-USD
+  for SMT). Against IC Markets BTCUSD on 29 Oct the closes are 9.7 lower on
+  average (sd 6.1): the same structure. No gold M1 history was reachable
+  (Yahoo and Dukascopy 429, Stooq reset), so nothing below is measured on gold.
+- **Setups.** Every M5 FVG left by a displacement candle (body ≥ 1.5 × ATR14),
+  traded in the displacement's direction on the return into it. SL beyond the
+  displacement's origin + max(½ ATR, 2 × spread); TP1 2R from the zone's CE;
+  8 h life; spread 5. 2,053 setups, split in two halves (A: 29 Apr–29 Jul,
+  B: 29 Jul–29 Oct) so that a result has to hold in both.
+- **Outcome.** TP1 or SL first from the entry price; R per trade.
+
+Entry triggers on the same setups:
+
+| Trigger | A: entries, TP1 first, R/trade | B |
+|---|---|---|
+| Limit at the zone, no confirmation | 806, 41%, −0.03 | 804, 43%, +0.02 |
+| v6.0 (approximation) | 492, 43%, −0.09 | 466, 45%, −0.03 |
+| CISD M1 | 463, 40%, −0.10 | 431, 44%, −0.00 |
+| CISD M1 + an M5 close back out of the zone | 371, 41%, −0.10 | 344, 45%, −0.01 |
+| CISD M5 | 286, 39%, −0.15 | 272, 46%, +0.00 |
+
+**No confirmation raises the expectancy.** Each one trades win rate for a
+later, worse price, and misses winners in proportion (v6.0: 121 / 131 silent
+setups went to TP1 against 193 / 207 to the SL). The executor sequence (raid →
+M5 displacement → fresh M5 FVG → first return) at M15 / H1 FVG zones gives
+18–27 entries a half whose results change sign between halves: no evidence.
+
+The zone's age at the first return (limit entries, both halves):
+
+| Price away from the zone | n | TP1 first | R/trade |
+|---|---|---|---|
+| 0–5 min | 843 | 40% | −0.05 |
+| 5–30 min | 575 | 42% | +0.01 |
+| 30–35 min | 16 | 38% | −0.09 |
+| more than 35 min | 114 | 26% | −0.37 |
+
+Both halves agree (30–60 min: A 27%, −0.40R, n 30; B 25%, −0.40R, n 48). A
+late return mostly breaks the zone. The four live setups above came back 30,
+45, 162 and 195 min after price left their zones; the one at 30 min is the
+only one that reached TP1.
+
+The live engine (`test/harness.mjs`) on the same 2,053 setups, M1 and ETH M5,
+hold 5 s (`node test/study-btc.mjs btc-m1.json eth-m1.json`):
+
+| | ENTER NOW | TP1 first | R/trade | silent → SL | silent → TP1 |
+|---|---|---|---|---|---|
+| 6.20.1 | 965 | 44.5% | −0.045 | 403 | 249 |
+| 6.21, fresh ≤ 35 min | 896 | 45.7% | −0.022 | 451 | 269 |
+
+The 69 entries the rule removes made −24R; both halves improve (A −46.5R →
+−32.0R, B +2.7R → +12.3R). These setups are registered when their zone
+forms, so few come back late; Gemini's are often hours old (3 of the 4
+above).
+
+Other findings:
+
+- **Context.** A liquidity sweep in the four M5 bars before the displacement:
+  +0.13R (A, n 89) and +0.11R (B, n 120) against −0.10R and −0.05R without —
+  the ICT 2022 sequence. For the analysis. H1 / H4 / D1 trend, premium /
+  discount, session and the previous day change sign between halves: no edge.
+- **Management** (§5 item 8). Half closed at +0.5R with the SL to the entry:
+  31–36% full losses instead of 55–59%, 64–69% of trades end in profit, R per
+  trade the same or slightly better (+0.00 to +0.06).
+
+### What 6.21 changes
+
+- **Fresh zone** (`FRESH_ZONE_MAX_MIN`, 35; 0 turns it off). ENTER NOW only
+  when price comes back to the zone within 35 min of last leaving it. Later →
+  `⏳ LATE RETURN — NO ENTRY`, no evidence is read, and the outcome is recorded
+  with "after a late return to the zone, no ENTER NOW" (`docs/setup-contract.md`).
+- The v6.0 confirmation, the gates and the trade management are unchanged.
+
+### What it cannot do
+
+It does not make ENTER NOW a prediction. On the synthetic setups the
+expectancy stays near 0 with or without it: no rule tried here creates an
+edge; this one removes a group that measurably loses. The edge has to come
+from the setups. The four truths together — every ENTER NOW a winner, every
+silence a loser — are not reachable by any confirmation rule measured here.

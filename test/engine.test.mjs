@@ -21,8 +21,8 @@ const T0 = Date.UTC(2026, 9, 28, 15, 0, 0); // Wednesday 11:00 New York
 const at = (minute, second = 6) => T0 + minute * MIN + second * 1000;
 
 // A buy into the zone 4413–4415: price dips into it at 15:00, an M1 bullish
-// engulfing closes at 15:02. ATR M5 is about 1, so acceptance needs mid ≥
-// entry + 0.5 = 4415.0.
+// engulfing closes at 15:02. ATR M5 is about 1.2 (the 14:40 visit to the
+// zone widens one bar), so acceptance needs mid ≥ entry + ½ ATR = 4415.09.
 const BUY = {
   symbol: "XAUUSD",
   direction: "buy",
@@ -47,8 +47,17 @@ const BUY_ROWS = [
   [4417.2, 4417.6, 4416.8, 4417.4],
   [4417.4, 4417.8, 4417.0, 4417.6],
 ];
-const buySeries = (rows = BUY_ROWS) => ({
-  "XAUUSD:M1": [...flat(T0 - 150 * MIN, 150, 4418), ...tape(T0, rows)],
+// Quiet at 4418 before 15:00, except one bar at 14:40 that reached `level`:
+// the zone was last traded 15 min before the 15:00 touch, a fresh return.
+const history = (level, visitAt = T0 - 20 * MIN) => {
+  const bars = flat(T0 - 150 * MIN, 150, 4418);
+  const visit = bars.find((bar) => bar.timestampMs === visitAt);
+  if (level < 4418) visit.low = level;
+  else visit.high = level;
+  return bars;
+};
+const buySeries = (rows = BUY_ROWS, visitAt) => ({
+  "XAUUSD:M1": [...history(4414.9, visitAt), ...tape(T0, rows)],
   "XAGUSD:M5": [],
 });
 
@@ -75,8 +84,8 @@ const SELL_ROWS = [
   [4419.2, 4419.5, 4418.6, 4419.0],
 ];
 
-function buyHarness(rows) {
-  const h = createHarness({ start: T0 - 30_000, series: buySeries(rows) });
+function buyHarness(rows, visitAt) {
+  const h = createHarness({ start: T0 - 30_000, series: buySeries(rows, visitAt) });
   const { watch } = h.register(BUY);
   return { h, id: watch.id };
 }
@@ -115,7 +124,7 @@ test("LONG — touch, then live acceptance and an engulfing held across a new M1
     ["WATCH ACTIVE", "ENTRY TOUCHED", "🟢 REAL CONFIRMATION — ENTER NOW"],
   );
   const enter = h.texts(/REAL CONFIRMATION/)[0];
-  assert.match(enter.text, /Live acceptance: mid 4415\.45, needed ≥ 4415\.00/);
+  assert.match(enter.text, /Live acceptance: mid 4415\.45, needed ≥ 4415\.09/);
   assert.match(enter.text, /Price pattern: M1 engulfing \(soft\) 15:01 UTC/);
   assert.match(enter.text, /Nothing was bought or sold/);
   assert.match(enter.text, /⏱ 15:03:06 UTC/);
@@ -130,7 +139,7 @@ test("LONG — touch, then live acceptance and an engulfing held across a new M1
 test("SHORT — the mirror: a spike into the zone, a bearish engulfing, ENTER NOW at the bid", async () => {
   const h = createHarness({
     start: T0 - 30_000,
-    series: { "XAUUSD:M1": [...flat(T0 - 150 * MIN, 150, 4418), ...tape(T0, SELL_ROWS)] },
+    series: { "XAUUSD:M1": [...history(4421.0), ...tape(T0, SELL_ROWS)] },
   });
   const { watch } = h.register(SELL);
   for (const [minute, bid] of [[0, 4421.7], [1, 4420.4], [2, 4419.8], [3, 4419.5]]) {
@@ -153,7 +162,7 @@ test("A touch is not a confirmation: price sitting in the zone without acceptanc
   const watch = h.watch(id);
   assert.equal(watch.lifecycle, "TOUCHED");
   assert.equal(h.texts(/REAL CONFIRMATION/).length, 0);
-  assert.match(waitingFor(watch, TEST_CONFIG, h.clock.now), /live acceptance: mid ≥ 4415\.00/);
+  assert.match(waitingFor(watch, TEST_CONFIG, h.clock.now), /live acceptance: mid ≥ 4415\.09/);
 });
 
 test("Acceptance without a technical signal never enters", async () => {
@@ -396,11 +405,12 @@ test("Registration answers with what the monitor will check, in this setup's pri
   const h = createHarness({ start: T0, series: buySeries() });
   const { plan, warnings } = h.register({ ...BUY, snapshot_as_of: new Date(T0 - 45 * MIN).toISOString(), score: 9 });
   assert.equal(plan.contract, "setup/1");
-  assert.equal(plan.rules, "v6.0-acceptance");
+  assert.equal(plan.rules, "v6.0-acceptance+fresh-zone");
+  assert.match(plan.fresh_zone, /^the touch must come within 35 min of price last leaving the zone/);
   assert.match(plan.touch, /^ask ≤ 4415\.10 \(zone high 4415\.00/);
   assert.match(plan.invalidation, /^bid ≤ 4405\.00/);
   assert.match(plan.sweep, /not wait/);
-  assert.match(plan.summary, /Touch ask ≤ 4415\.10 → ENTER NOW after live acceptance/);
+  assert.match(plan.summary, /Touch ask ≤ 4415\.10 within 35 min of price leaving the zone → ENTER NOW after live acceptance/);
   assert.ok(warnings.some((warning) => /ignored fields .*score/.test(warning)));
   assert.ok(warnings.some((warning) => /45 min old/.test(warning)));
 });
@@ -541,20 +551,76 @@ test("REPLAY CAPTURE — a resolved setup leaves its candles, and replaying them
   assert.match(enter.text, /M1 engulfing \(soft\) 15:01 UTC/);
 });
 
-test("REPLAY 28 Oct XAUUSD buy (20:02): the live sniper entry — ENTER NOW at 20:34 on the 20:32 M1 engulfing, as live", async () => {
+test("REPLAY 28 Oct XAUUSD buy (20:02): back at the zone 45 min after leaving it — LATE RETURN, no ENTER NOW (live: −1R)", async () => {
   const fixture = JSON.parse(readFileSync(new URL("./fixtures/xauusd-2026-10-28-buy.json", import.meta.url), "utf8"));
   const { watch, messages } = await replay(fixture);
   const when = (pattern) => {
     const found = messages.find((message) => pattern.test(message.text));
     return found && new Date(found.at).toISOString().slice(11, 19);
   };
-  // Live (6.19): "M1 engulfing (soft) 20:32" and acceptance gave ENTER NOW
-  // at 20:34:07 at 4062.02, R:R 1.30 — the owner's sniper entry, in profit.
-  // A stricter engulfing (tried in 6.20.0) blocked it; this pins v6.0.
-  assert.equal(when(/ENTRY TOUCHED/), "20:30:06");
-  assert.equal(when(/REAL CONFIRMATION/), "20:34:06");
-  const enter = messages.find((message) => /REAL CONFIRMATION/.test(message.text));
+  // Live (6.19): ENTER NOW at 20:34:07 at 4062.02 on "M1 engulfing (soft)
+  // 20:32" — in profit to +0.39R, then the SL at 00:33 (−1R). Price had last
+  // been at the zone at 19:40 (the 19:40 M5 bar closed 19:45): the 20:30
+  // touch was a late return, so 6.21 sends no ENTER NOW.
+  assert.equal(when(/LATE RETURN — NO ENTRY/), "20:30:06");
+  assert.match(messages.find((message) => /LATE RETURN/.test(message.text)).text, /back 45 min after price left it/);
+  assert.equal(when(/REAL CONFIRMATION/), undefined);
+  assert.equal(watch.lastReason, "stale_zone");
+  assert.ok(watch.history.some((event) => event.type === "stale_zone" && event.zone_age_min === 45));
+  // The same tape with the rule off is the v6.0 entry, unchanged.
+  const off = await replay(fixture, { config: { ...TEST_CONFIG, freshZoneMaxMs: 0 } });
+  const enter = off.messages.find((message) => /REAL CONFIRMATION/.test(message.text));
+  assert.equal(new Date(enter.at).toISOString().slice(11, 19), "20:34:06");
   assert.match(enter.text, /M1 engulfing \(soft\) 20:32 UTC/);
-  assert.equal(watch.trade.rr_at_entry, 1.29);
-  assert.equal(watch.lifecycle, "IN_TRADE");
+});
+
+// ---------------------------------------------------------------------------
+// Fresh zone (6.21)
+
+test("REPLAY 29 Oct BTCUSD sell 04:12 (live: ENTER NOW 04:51, −1R): back 162 min after price left the zone — no ENTER NOW", async () => {
+  const fixture = JSON.parse(readFileSync(new URL("./fixtures/btcusd-2026-10-29-0412-sell.json", import.meta.url), "utf8"));
+  const { watch, messages } = await replay(fixture);
+  const late = messages.find((message) => /LATE RETURN — NO ENTRY/.test(message.text));
+  assert.equal(new Date(late.at).toISOString().slice(11, 19), "04:47:06");
+  assert.match(late.text, /back 162 min after price left it/, "the zone was last traded by the 02:00 M5 bar");
+  assert.equal(messages.filter((message) => /REAL CONFIRMATION/.test(message.text)).length, 0);
+  assert.ok(watch.history.some((event) => event.type === "stale_zone" && event.zone_age_min === 162));
+});
+
+test("REPLAY 29 Oct BTCUSD sell 06:00 (live: ENTER NOW 09:14, out at breakeven): back 195 min after price left the zone — no ENTER NOW", async () => {
+  const fixture = JSON.parse(readFileSync(new URL("./fixtures/btcusd-2026-10-29-0600-sell.json", import.meta.url), "utf8"));
+  const { messages } = await replay(fixture);
+  assert.match(messages.find((message) => /LATE RETURN — NO ENTRY/.test(message.text)).text, /back 195 min after price left it/);
+  assert.equal(messages.filter((message) => /REAL CONFIRMATION/.test(message.text)).length, 0);
+});
+
+test("FRESH ZONE — a return to the zone 60 min after price left it: LATE RETURN, no ENTER NOW, and its outcome says so", async () => {
+  const { h, id } = buyHarness(BUY_ROWS, T0 - 65 * MIN);
+  await runBuy(h);
+  assert.equal(h.texts(/REAL CONFIRMATION/).length, 0, "the evidence that would have entered is not read");
+  assert.equal(h.texts(/ENTRY TOUCHED/).length, 0, "one message at the touch: the late return");
+  assert.match(h.texts(/LATE RETURN — NO ENTRY/)[0].text, /back 60 min after price left it/);
+  assert.equal(h.watch(id).lastReason, "stale_zone");
+  assert.match(waitingFor(h.watch(id), TEST_CONFIG, h.clock.now), /^nothing — late return to the zone/);
+  h.quote("XAUUSD", 4404.9); // the stop
+  await h.tickAt(at(4));
+  const record = h.watch(id);
+  assert.equal(record.status, "FAILED");
+  assert.match(record.reason, /after a late return to the zone, no ENTER NOW/);
+});
+
+test("FRESH ZONE — 15 min away is fresh: ENTER NOW, and it says how fresh", async () => {
+  const { h, id } = buyHarness();
+  await runBuy(h);
+  assert.equal(h.watch(id).lifecycle, "IN_TRADE");
+  assert.match(h.texts(/ENTRY TOUCHED/)[0].text, /Fresh return: back 15 min after price left it/);
+  assert.match(h.texts(/REAL CONFIRMATION/)[0].text, /back 15 min after price left it \(fresh\)/);
+});
+
+test("FRESH ZONE — FRESH_ZONE_MAX_MIN=0 turns the rule off: a late return confirms as in v6.0", async () => {
+  const h = createHarness({ start: T0 - 30_000, series: buySeries(BUY_ROWS, T0 - 65 * MIN), config: { ...TEST_CONFIG, freshZoneMaxMs: 0 } });
+  const { watch } = h.register(BUY);
+  await runBuy(h);
+  assert.equal(h.watch(watch.id).lifecycle, "IN_TRADE");
+  assert.equal(h.texts(/LATE RETURN/).length, 0);
 });

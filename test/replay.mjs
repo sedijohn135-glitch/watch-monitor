@@ -43,7 +43,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   for (const message of messages) {
     const [title, ...rest] = plain(message.text).split("\n");
     console.log(`${new Date(message.at).toISOString().slice(11, 19)}  ${title}`);
-    for (const line of rest.filter((item) => /^(✅|▫️|SELL|BUY|Zone|Price|Reason|At:|Result|Close at|R:R)/.test(item))) {
+    for (const line of rest.filter((item) => /^(✅|▫️|SELL|BUY|Zone|Price|Reason|At:|Result|Close at|R:R|Late return|Fresh return)/.test(item))) {
       console.log(`          ${line}`);
     }
   }

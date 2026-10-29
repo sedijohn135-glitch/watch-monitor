@@ -138,6 +138,9 @@ const CONFIG = {
   // A setup registered without its own expiry stops being a setup after
   // this long; 0 disables.
   defaultExpiryMinutes: num(process.env.WATCH_DEFAULT_EXPIRY_MIN, 720, 0),
+  // ENTER NOW only on a return to the zone within this long of price last
+  // leaving it (an immediate rebalance); 0 turns the rule off.
+  freshZoneMaxMs: num(process.env.FRESH_ZONE_MAX_MIN, 35, 0) * 60_000,
 
   spreadEnabled: process.env.SPREAD_CHECK_ENABLED !== "false",
   spreadBaselineSamples: num(process.env.SPREAD_BASELINE_SAMPLES, 5, 3),
@@ -184,7 +187,7 @@ const CONFIG = {
 // wall-clock constant: on Vercel a tick only arrives once a minute.
 const SERVERLESS = Boolean(process.env.VERCEL) || process.env.SERVERLESS === "true";
 CONFIG.staleBudgetMs = Math.max(SERVERLESS ? 180_000 : 120_000, CONFIG.setupIntervalMs * 8);
-const VERSION = "6.20.1";
+const VERSION = "6.21.0";
 
 function log(message, ...args) {
   console.error(`[watch-monitor] ${message}`, ...args);
@@ -607,7 +610,7 @@ async function marketSnapshot(args) {
     candles: Object.fromEntries(requested.map((tf) => [tf, packCandles(raw[tf], tf, nowMs)])),
     smt_partners: smtPartners,
     rule:
-      "No liquidity taken, no trade. Reversal (Model A): trade away from the pool in liquidity.last_sweep (best when stop_hunt is true) toward the strongest untaken pool on the other side. If nothing was taken (Model B), the untaken pool is the draw — prefer higher strength, EQH/EQL, reachable distance_atr_h1: trade toward it from a POI between liquidity.inducement.<tf>.<dir>.level and its leg_origin, which price can only reach by taking that IDM. Buys from discount, sells from premium (liquidity.dealing_range). h1_imbalances are internal-range draws. register_watch needs sweep_level = the liquidity the setup expects taken (the IDM level, or the swept pool with liquidity_taken: true); the monitor reports when it is taken, and its ENTER NOW does not wait for it.",
+      `No liquidity taken, no trade. Reversal (Model A): trade away from the pool in liquidity.last_sweep (best when stop_hunt is true) toward the strongest untaken pool on the other side. If nothing was taken (Model B), the untaken pool is the draw — prefer higher strength, EQH/EQL, reachable distance_atr_h1: trade toward it from a POI between liquidity.inducement.<tf>.<dir>.level and its leg_origin, which price can only reach by taking that IDM. Buys from discount, sells from premium (liquidity.dealing_range). h1_imbalances are internal-range draws. register_watch needs sweep_level = the liquidity the setup expects taken (the IDM level, or the swept pool with liquidity_taken: true); the monitor reports when it is taken, and its ENTER NOW does not wait for it. ENTER NOW comes only when price returns to the zone within ${CONFIG.freshZoneMaxMs / 60000} min of last leaving it: register fresh zones (an immediate rebalance), not old ones.`,
   };
 }
 
@@ -752,7 +755,7 @@ const CUSTOM_TOOLS = [
   {
     name: "register_watch",
     description:
-      "Registers a trading setup (contract setup/1) for live validation. The monitor confirms it on live data — price reaches the zone, then live acceptance beyond the entry plus at least one of CISD (M1), SMT divergence (M5), an M5 / M1 engulfing or an M5 rejection, held over a new closed M1 candle — and sends ENTER NOW on Telegram with the registered SL and TPs, only when R:R to TP1 at market is ≥ 1, news and spread are clear and the quote is fresh (no session filter). Then it follows the trade: TP alerts, SL to breakeven after TP1, CLOSE NOW where price turns back, and close part + SL to breakeven where an M5–H4 zone in the way holds. The answer carries `monitor_line`, the monitor's own one-line statement of what it will check with this setup's prices — print it verbatim — and `warnings`. A malformed setup is refused with the broken rule. Never places an order.",
+      `Registers a trading setup (contract setup/1) for live validation. The monitor confirms it on live data — price reaches the zone within ${CONFIG.freshZoneMaxMs / 60000} min of last leaving it (an immediate rebalance; a later return gets no ENTER NOW, only its outcome is recorded), then live acceptance beyond the entry plus at least one of CISD (M1), SMT divergence (M5), an M5 / M1 engulfing or an M5 rejection, held over a new closed M1 candle — and sends ENTER NOW on Telegram with the registered SL and TPs, only when R:R to TP1 at market is ≥ 1, news and spread are clear and the quote is fresh (no session filter). Then it follows the trade: TP alerts, SL to breakeven after TP1, CLOSE NOW where price turns back, and close part + SL to breakeven where an M5–H4 zone in the way holds. The answer carries \`monitor_line\`, the monitor's own one-line statement of what it will check with this setup's prices — print it verbatim — and \`warnings\`. A malformed setup is refused with the broken rule. Never places an order.`,
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -926,6 +929,7 @@ function monitorHealth() {
       acceptance_risk_fraction: CONFIG.acceptanceRiskFraction,
       evidence_fade_atr_fraction: CONFIG.evidenceFadeAtrFraction,
       min_rr_at_entry: CONFIG.minRrAtEntry,
+      fresh_zone_max_min: CONFIG.freshZoneMaxMs / 60000,
       max_quote_age_ms: CONFIG.maxQuoteAgeMs,
       news_window_min: { before: CONFIG.newsBeforeMs / 60000, after: CONFIG.newsAfterMs / 60000 },
       news_impacts: [...CONFIG.newsImpacts],
