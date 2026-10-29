@@ -421,6 +421,11 @@ Other findings:
   `⏳ LATE RETURN — NO ENTRY`, no evidence is read, and the outcome is recorded
   with "after a late return to the zone, no ENTER NOW" (`docs/setup-contract.md`).
 - The v6.0 confirmation, the gates and the trade management are unchanged.
+- **Skill 6.21** (a zip for the owner to install; this session does not touch
+  Gemini): a FRESHNESS line — minutes since price last left the zone, ≤ 25 to
+  register, otherwise a fresher array or NO TRADE; the monitor's late-return
+  rule in §7; what the scores rest on; ENTER NOW described as "the setup is
+  live", with the measured ~45% TP1 rate, never as a guarantee.
 
 ### What it cannot do
 
