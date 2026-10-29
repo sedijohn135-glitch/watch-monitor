@@ -113,7 +113,7 @@ setup waits on a gate), safety first.
   zone: from the close of the last M5 bar that reached the touch level by the
   time the watch was armed, to the touch. The touch is the first visit since
   arming, so this is the time since price last left the zone.
-- Back within 35 min (an immediate rebalance): the setup goes on to
+- Back within 35 min (a fresh return): the setup goes on to
   confirmation as before.
 - Later, or no M5 bar at the level in the last 5 h: `⏳ LATE RETURN — NO
   ENTRY` instead of `ENTRY TOUCHED`. No evidence is read and no ENTER NOW is

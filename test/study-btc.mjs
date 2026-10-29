@@ -72,7 +72,7 @@ function makeSetups(m5) {
       args: {
         symbol: "BTCUSD", direction: sell ? "sell" : "buy", entry, sl, tp1: tp(2), tp2: tp(3), tp3: tp(4),
         entry_zone_low: zl, entry_zone_high: zh, sweep_level: sell ? zl : zh, expiration_minutes: 480,
-        setup_model: "synthetic M5 FVG immediate rebalance", conviction: "A",
+        setup_model: "synthetic M5 FVG, first return", conviction: "A",
       },
     });
   }
