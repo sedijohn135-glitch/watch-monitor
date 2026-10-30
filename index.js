@@ -165,12 +165,16 @@ const client = new CTraderMcpClient({
 });
 const market = new MarketData({ client, config: CONFIG, log });
 const ENTER_NOW = "<b>REAL CONFIRMATION — ENTER NOW</b>";
+const TRAP_MET = "<b>TRAP CONDITIONS MET — RE-RUN THE PIPELINE</b>";
 const notifier = new Notifier({
   token: process.env.TELEGRAM_BOT_TOKEN,
   chatId: process.env.TELEGRAM_CHAT_ID,
   // TELEGRAM_ENTER_NOW_ONLY=true: Telegram gets the confirmation and nothing
-  // else; every other event stays readable in list_watches.
-  only: bool(process.env.TELEGRAM_ENTER_NOW_ONLY, false) ? ENTER_NOW : null,
+  // else (TELEGRAM_TRAP_MET=true adds the trap's re-run call); every other
+  // event stays readable in list_watches.
+  only: bool(process.env.TELEGRAM_ENTER_NOW_ONLY, false)
+    ? [ENTER_NOW, ...(bool(process.env.TELEGRAM_TRAP_MET, false) ? [TRAP_MET] : [])]
+    : null,
   log,
 });
 const store = new WatchStore({
@@ -911,7 +915,7 @@ async function tickTrapWatch(watch) {
       news,
       context_age_hours: Number(ageHours.toFixed(2)),
     },
-    `<b>TRAP CONDITIONS MET — RE-RUN THE PIPELINE</b>\n` +
+    `${TRAP_MET}\n` +
       trapHeader(watch) +
       `<b>${htmlEscape(watch.timeframe)} close:</b> ${htmlEscape(formatLevel(current.close))} beyond ${htmlEscape(formatLevel(watch.trigger_level))}\n` +
       (displacement.present

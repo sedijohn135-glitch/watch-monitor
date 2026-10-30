@@ -52,6 +52,7 @@ npm start
 | `STATE_FILE` | `./data/watch-state.json` | put this on a persistent volume |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | — | notifications |
 | `TELEGRAM_ENTER_NOW_ONLY` | `false` | `true` → Telegram gets only REAL CONFIRMATION — ENTER NOW; the rest stays in `list_watches` |
+| `TELEGRAM_TRAP_MET` | `false` | with the above, also send TRAP CONDITIONS MET (the call to re-run the analysis) |
 | `SCHEDULER_TICK_MS` | `2500` | how often the scheduler looks for due watches |
 | `WATCH_INTERVAL_MS` | `10000` | per-setup-watch cadence |
 | `TRAP_WATCH_INTERVAL_MS` | `30000` | per-trap-watch cadence |

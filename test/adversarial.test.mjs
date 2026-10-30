@@ -365,12 +365,16 @@ test("17b — a duplicate alert is enqueued once", () => {
   assert.equal(notifier.enqueue("x", { dedupeKey: "k" }).queued, false);
 });
 
-test("17c — TELEGRAM_ENTER_NOW_ONLY sends the confirmation and nothing else", () => {
-  const only = "<b>REAL CONFIRMATION — ENTER NOW</b>";
-  const notifier = new Notifier({ token: "t", chatId: "c", log: () => {}, only });
+test("17c — a Telegram allow-list sends only the listed messages", () => {
+  const enterNow = "<b>REAL CONFIRMATION — ENTER NOW</b>";
+  const trapMet = "<b>TRAP CONDITIONS MET — RE-RUN THE PIPELINE</b>";
+  const notifier = new Notifier({ token: "t", chatId: "c", log: () => {}, only: [enterNow] });
   notifier.deliver = async () => ({ ok: true });
-  assert.equal(notifier.enqueue("<b>TRAP CONDITIONS MET — RE-RUN THE PIPELINE</b>").queued, false);
-  assert.equal(notifier.enqueue(`${only}\n<b>Symbol:</b> XAUUSD`).queued, true);
+  assert.equal(notifier.enqueue(`${trapMet}\n<b>Symbol:</b> XAUUSD`).queued, false);
+  assert.equal(notifier.enqueue(`${enterNow}\n<b>Symbol:</b> XAUUSD`).queued, true);
+  notifier.only.push(trapMet);
+  assert.equal(notifier.enqueue(`${trapMet}\n<b>Symbol:</b> XAUUSD`).queued, true);
+  assert.equal(notifier.enqueue("<b>TRAP TRIGGER APPROACHING</b>").queued, false);
 });
 
 // ---------------------------------------------------------------------------
