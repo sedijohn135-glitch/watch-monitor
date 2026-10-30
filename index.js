@@ -75,6 +75,7 @@ const CONFIG = {
   port: num(process.env.PORT, 8080),
   upstreamUrl: process.env.CTRADER_MCP_URL || "https://mcp.ctrader.com/trading/mcp",
   upstreamToken: process.env.CTRADER_MCP_TOKEN || "",
+  ctraderEnvironment: String(process.env.CTRADER_ENVIRONMENT || "").trim().toLowerCase(),
   mcpTimeoutMs: num(process.env.MCP_TIMEOUT_MS, 15000, 5000),
   protocolVersion: process.env.MCP_PROTOCOL_VERSION || "2024-11-05",
 
@@ -162,6 +163,7 @@ const client = new CTraderMcpClient({
   timeoutMs: CONFIG.mcpTimeoutMs,
   protocolVersion: CONFIG.protocolVersion,
   log,
+  environment: CONFIG.ctraderEnvironment,
 });
 const market = new MarketData({ client, config: CONFIG, log });
 const notifier = new Notifier({
