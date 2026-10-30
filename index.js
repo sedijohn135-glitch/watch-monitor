@@ -990,6 +990,7 @@ const CUSTOM_TOOLS = [
     name: "register_watch",
     description:
       "Registers a trading setup for live monitoring. The monitor tracks live price, safety levels, market evidence, and independent entry gates before sending a Telegram confirmation. Never places an order.",
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -1018,6 +1019,7 @@ const CUSTOM_TOOLS = [
     name: "register_trap_watch",
     description:
       "Registers a TRAP_NOT_CONFIRMED read for live monitoring. There is no entry, stop or target: the monitor watches closed candles on the chosen timeframe and sends one Telegram message when the missing setup conditions actually print (body close beyond trigger_level, by default carried by a displacement candle), and one if invalidation_level breaks first instead. It never produces an entry — the human re-runs the analysis pipeline on that notification.",
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -1048,12 +1050,14 @@ const CUSTOM_TOOLS = [
     name: "list_watches",
     description:
       "Returns active setup watches, active trap watches, quarantined watches, bounded recent outcomes with their real status and evidence, and the monitor's own health (restart recovery, undelivered notifications, feed quality).",
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     inputSchema: { type: "object", additionalProperties: false, properties: {} },
   },
   {
     name: "cancel_watch",
     description:
       "Cancels an active setup watch or trap watch by id. Idempotent: cancelling an already-resolved watch reports ALREADY_RESOLVED rather than failing.",
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -1065,12 +1069,14 @@ const CUSTOM_TOOLS = [
     name: "get_news_calendar",
     description:
       "Returns the cached scheduled high-impact economic events and current manual news lockout state.",
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     inputSchema: { type: "object", additionalProperties: false, properties: {} },
   },
   {
     name: "set_news_lockout",
     description:
       "Blocks new confirmations while a human or upstream workflow reports unscheduled breaking news.",
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -1081,6 +1087,7 @@ const CUSTOM_TOOLS = [
   {
     name: "clear_news_lockout",
     description: "Removes the manual breaking-news lockout.",
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     inputSchema: { type: "object", additionalProperties: false, properties: {} },
   },
 ];
@@ -1099,10 +1106,15 @@ const MARKET_DATA_TOOL_ALLOWLIST = new Set([
   "get_trendbars",
 ]);
 
+// Everything that survives the allowlist is a read. Labelled so (MCP tool
+// annotations), a client such as the Gemini app can run it without asking.
 function filterToMarketData(tools) {
-  return (Array.isArray(tools) ? tools : []).filter((tool) =>
-    MARKET_DATA_TOOL_ALLOWLIST.has(tool?.name),
-  );
+  return (Array.isArray(tools) ? tools : [])
+    .filter((tool) => MARKET_DATA_TOOL_ALLOWLIST.has(tool?.name))
+    .map((tool) => ({
+      ...tool,
+      annotations: { ...tool.annotations, readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    }));
 }
 
 function createSetupWatch(args) {
