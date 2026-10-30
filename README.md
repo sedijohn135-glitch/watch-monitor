@@ -51,6 +51,7 @@ npm start
 | `WATCH_MONITOR_AUTH_TOKEN` | — | **set this.** Unset leaves the endpoint open; the service warns loudly at boot |
 | `STATE_FILE` | `./data/watch-state.json` | put this on a persistent volume |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | — | notifications |
+| `TELEGRAM_ENTER_NOW_ONLY` | `false` | `true` → Telegram gets only REAL CONFIRMATION — ENTER NOW; the rest stays in `list_watches` |
 | `SCHEDULER_TICK_MS` | `2500` | how often the scheduler looks for due watches |
 | `WATCH_INTERVAL_MS` | `10000` | per-setup-watch cadence |
 | `TRAP_WATCH_INTERVAL_MS` | `30000` | per-trap-watch cadence |

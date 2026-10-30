@@ -164,9 +164,13 @@ const client = new CTraderMcpClient({
   log,
 });
 const market = new MarketData({ client, config: CONFIG, log });
+const ENTER_NOW = "<b>REAL CONFIRMATION — ENTER NOW</b>";
 const notifier = new Notifier({
   token: process.env.TELEGRAM_BOT_TOKEN,
   chatId: process.env.TELEGRAM_CHAT_ID,
+  // TELEGRAM_ENTER_NOW_ONLY=true: Telegram gets the confirmation and nothing
+  // else; every other event stays readable in list_watches.
+  only: bool(process.env.TELEGRAM_ENTER_NOW_ONLY, false) ? ENTER_NOW : null,
   log,
 });
 const store = new WatchStore({
@@ -257,7 +261,7 @@ function confirmWatch(watch, price, result, gates) {
       strength: result.strength,
       gates: gates.summary,
     },
-    `<b>REAL CONFIRMATION — ENTER NOW</b>\n` +
+    `${ENTER_NOW}\n` +
       `<b>Symbol:</b> ${htmlEscape(watch.symbol)}\n` +
       `<b>Direction:</b> ${htmlEscape(watch.direction.toUpperCase())}\n` +
       `<b>Entry:</b> ${htmlEscape(formatLevel(watch.entry))} | <b>Price:</b> ${htmlEscape(formatLevel(price))}\n` +

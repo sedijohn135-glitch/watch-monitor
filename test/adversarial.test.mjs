@@ -365,6 +365,14 @@ test("17b — a duplicate alert is enqueued once", () => {
   assert.equal(notifier.enqueue("x", { dedupeKey: "k" }).queued, false);
 });
 
+test("17c — TELEGRAM_ENTER_NOW_ONLY sends the confirmation and nothing else", () => {
+  const only = "<b>REAL CONFIRMATION — ENTER NOW</b>";
+  const notifier = new Notifier({ token: "t", chatId: "c", log: () => {}, only });
+  notifier.deliver = async () => ({ ok: true });
+  assert.equal(notifier.enqueue("<b>TRAP CONDITIONS MET — RE-RUN THE PIPELINE</b>").queued, false);
+  assert.equal(notifier.enqueue(`${only}\n<b>Symbol:</b> XAUUSD`).queued, true);
+});
+
 // ---------------------------------------------------------------------------
 // 19. The skill changes a setup while the old watch is still active.
 
